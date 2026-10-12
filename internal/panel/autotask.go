@@ -621,6 +621,15 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
+	// 企业上下文门控（企业版 / 企业切换会话）：行为事件会被上游静默丢弃或
+	// 直接 403，执行任何成长任务都是零收益白跑（含真实对话配额）——直接拒绝
+	// 并给出修复路径，不再让用户对着「已上报但进度 0/x」猜原因
+	// （见 auth.IsEnterpriseSession）。
+	if a.IsEnterpriseSession() {
+		writeErr(w, http.StatusUnprocessableEntity,
+			"该账号为企业版/企业切换会话（token_source=enterprise_switch），无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份重新登录")
+		return
+	}
 	uid := a.UID // 上游账号 id：动作、日志与任务锁继续按它走
 	var body struct {
 		TaskCode string `json:"task_code"`
