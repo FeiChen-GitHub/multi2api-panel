@@ -4,11 +4,51 @@ package pool
 import (
 	"sort"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
 // expiringVirtualSlots 快过期账号在新会话候选集中的虚拟实例权重。
 // 3:1 是温和偏好，不是固定比例：账号组成变化会自然改变最终占比。
 const expiringVirtualSlots = 3
+
+// AvailableKeysForProviderModelRealm 返回候选账号主键：先按 provider + realm 过滤，
+// 再做模型健康判定（healthyForModel，含 6004 模型豁免）与在途占满判定。
+// provider=="" 不过滤 provider；realm=="" 不过滤 realm；model=="" 退化为账号级 healthy。
+// 结果按主键排序，保证调用方看到稳定顺序。
+//
+// 这是多 provider 路由的选号入口：调用方（handler / session）拿到主键后，
+// 用 AuthByKey / PickByKey 系列取号，不再依赖上游 uid。
+func (p *Pool) AvailableKeysForProviderModelRealm(provider auth.Provider, model, realm string) []auth.AccountKey {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	keys := make([]auth.AccountKey, 0, len(p.byKey))
+	for key, e := range p.byKey {
+		if e == nil || e.a == nil {
+			continue
+		}
+		if provider != "" && e.a.Provider() != provider {
+			continue
+		}
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if model == "" {
+			if !e.healthy(now) {
+				continue
+			}
+		} else if !e.healthyForModel(now, model) {
+			continue
+		}
+		if p.inFlightFull(e) {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	return keys
+}
 
 // AvailableUIDsForRealm 同 AvailableUIDs，但仅返回 Realm()==realm 的账号。
 // realm=="" 退化为 AvailableUIDs（现状语义）。
