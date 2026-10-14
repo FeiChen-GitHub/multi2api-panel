@@ -583,6 +583,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	provider, realm, bareModel := resolveModel(peek.Model)
 	upClient := h.clientFor(provider)
 	isTrae := provider == auth.ProviderTrae
+	// Trae 通道路由（DESIGN §4.5/§6.6）：Work 专属模型走 Work 通道，其余 SOLO；
+	// SOLO 撞权益不足时同一请求内降级到 Work（只在首字节前，见下方 fallback）。
+	chatChannel := upstream.ChannelSOLO
+	if isTrae {
+		chatChannel = upstream.TraeChannelForModel(bareModel)
+	}
+	workFallbackTried := false
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -857,7 +864,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
 		attemptStarted := time.Now()
-		rc, status, respBody, terr := upClient.ChatStream(r.Context(), acct, body, clientIP, chatMeta, upstream.ChannelSOLO)
+		rc, status, respBody, terr := upClient.ChatStream(r.Context(), acct, body, clientIP, chatMeta, chatChannel)
 		// 分类信封一次成型：upstream 已在错误路径返回 *upstream.Error（Kind +
 		// Retry-After 头解析）。传输层错误（非 *Error）走抖动换号分支；防御分支
 		// （terr 为 nil 但 status>=400，如 ErrNone 兜底）回落本地 Classify，双保险。
@@ -908,6 +915,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			} else {
 				kind = h.classifyFor(provider, status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+			}
+			// Trae：SOLO 撞权益/配额不足（1005/4008）→ 同一账号降级到 Work 通道重试一次
+			// （trae2api 的 executeWorkRequest 语义）。此时响应首字节尚未写出，可以安全切换；
+			// 通道切换不计入换号预算（DESIGN §4.6），所以把该账号从 tried 里放回。
+			if isTrae && kind == upstream.ErrHardCredit &&
+				chatChannel == upstream.ChannelSOLO && !workFallbackTried {
+				workFallbackTried = true
+				chatChannel = upstream.ChannelWork
+				delete(tried, acct.Key())
+				log.Printf("INFO: [server] trae SOLO 权益不足 → 降级 Work 通道 acct=%s model=%s: %s",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, logfmt.Truncate(string(respBody), 160))
+				fail(acct.UID)
+				continue
 			}
 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append

@@ -157,6 +157,10 @@ func TraeClassify(status int, body string) ErrKind {
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 TraeClassify）、err 为 nil；
 // 只有传输层失败才返回 err。ch 目前只影响日志/后续 Work 通道分流，SOLO 走同一端点。
 func (c *TraeClient) ChatStream(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta, ch Channel) (io.ReadCloser, int, []byte, error) {
+	// Work 通道走独立端点与原生 payload（trae_work.go）；SOLO 走 llm_utils_chat。
+	if ch == ChannelWork {
+		return c.chatStreamWork(ctx, a, body)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.AgentHost+TraeEpChat, bytes.NewReader(TraePrepareBody(body)))
 	if err != nil {
 		return nil, 0, nil, err

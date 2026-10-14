@@ -212,3 +212,81 @@ func keysOf(m map[string]map[string]any) []string {
 	}
 	return out
 }
+
+// Work 专属模型必须走 Work 通道（api5-normal + create_agent_task）。
+func TestChatTraeWorkModelRoutesToWorkChannel(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	var soloHits, workHits int
+	tc := upstream.NewTraeClient()
+	tc.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case upstream.TraeEpCreateAgentTask:
+			workHits++
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(traeSOLOFixture))}, nil
+		case upstream.TraeEpChat:
+			soloHits++
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(traeSOLOFixture))}, nil
+		default:
+			return &http.Response{StatusCode: 404, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("nope"))}, nil
+		}
+	})}
+	tc.StreamHTTP = tc.HTTP
+
+	traeAuth, err := auth.Parse([]byte(`{"provider":"trae","auth":{"accessToken":"trae-at","expiresAt":9999999999},"account":{"uid":"trae1"}}`))
+	if err != nil {
+		t.Fatalf("parse trae auth: %v", err)
+	}
+	p := testPoolWith(traeAuth)
+	h := NewHandler(Config{Pool: p, Upstream: up, Dispatcher: upstream.NewDispatcher(upstream.NewWBClient(up), tc)})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"trae:cn:DeepSeek-V4-Flash-Official","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if workHits != 1 || soloHits != 0 {
+		t.Fatalf("workHits=%d soloHits=%d, want 1/0", workHits, soloHits)
+	}
+}
+
+// SOLO 撞权益不足（1005）时，同一请求内降级到 Work 通道重试一次。
+func TestChatTraeFallsBackToWorkOnPlanLimit(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	var soloHits, workHits int
+	tc := upstream.NewTraeClient()
+	tc.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case upstream.TraeEpChat:
+			soloHits++
+			return &http.Response{
+				StatusCode: 400,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"code":1005,"message":"plan limit"}`)),
+			}, nil
+		case upstream.TraeEpCreateAgentTask:
+			workHits++
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(traeSOLOFixture))}, nil
+		default:
+			return &http.Response{StatusCode: 404, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("nope"))}, nil
+		}
+	})}
+	tc.StreamHTTP = tc.HTTP
+
+	traeAuth, err := auth.Parse([]byte(`{"provider":"trae","auth":{"accessToken":"trae-at","expiresAt":9999999999},"account":{"uid":"trae1"}}`))
+	if err != nil {
+		t.Fatalf("parse trae auth: %v", err)
+	}
+	p := testPoolWith(traeAuth)
+	h := NewHandler(Config{Pool: p, Upstream: up, Dispatcher: upstream.NewDispatcher(upstream.NewWBClient(up), tc)})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"trae:cn:glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s (fallback should succeed on Work channel)", rec.Code, rec.Body.String())
+	}
+	if soloHits != 1 || workHits != 1 {
+		t.Fatalf("soloHits=%d workHits=%d, want 1/1", soloHits, workHits)
+	}
+}
