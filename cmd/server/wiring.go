@@ -18,7 +18,7 @@ import (
 // 权重细节，已有绑定的快路径仍直接返回原账号，不做迁移。
 func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
 	return func(model string) []string {
-		realm, bare := server.ResolveModel(model)
+		_, realm, bare := server.ResolveModel(model)
 		return p.WeightedAvailableUIDsForModelRealm(bare, realm)
 	}
 }

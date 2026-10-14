@@ -1,26 +1,47 @@
 package server
 
-import "strings"
+import (
+	"strings"
 
-// resolveModel 解析模型名协议（PLAN D6）：
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+)
+
+// providerAlias 把模型名第一段映射成规范化 provider；未识别返回 ok=false。
+func providerAlias(seg string) (auth.Provider, bool) {
+	switch seg {
+	case "wb", "workbuddy":
+		return auth.ProviderWorkBuddy, true
+	case "trae":
+		return auth.ProviderTrae, true
+	default:
+		return "", false
+	}
+}
+
+// resolveModel 解析 [provider:][realm:]model（多 provider 路由协议，DESIGN §3.1）。
 //
-//	分布式前缀： "[realm:]model"
+// 过渡语义（provider 必填切换之前）：第一段不是已知 provider 时按 WorkBuddy 处理，
+// 老的 "cn:xxx" / 裸名调用继续可用。段序固定 provider 在前、realm 在后；
+// realm 缺省 cn；未知前缀整体当裸模型名（例如 "global:trae:x" 的 provider 段是
+// "global"，不识别的 provider → 走裸名回落，而不是把 trae 当 provider）。
 //
-// 取第一个 ":"，前段恰为 "cn"/"global" 才剥离；否则视为裸名，realm=cn、bare=原串。
-// 大小写敏感（前缀必须是精确的小写枚举）。bare 即出站/选号/账本使用的裸模型名。
-//
-// 导出为 ResolveModel（cmd/server/main.go 粘性闭包需要），包内简写 resolveModel。
-func resolveModel(model string) (realm, bare string) {
-	idx := strings.IndexByte(model, ':')
+// 导出为 ResolveModel（cmd/server/main.go 粘性闭包需要）。
+func resolveModel(model string) (provider auth.Provider, realm, bare string) {
+	provider, realm, rest := auth.ProviderWorkBuddy, "cn", model
+	idx := strings.IndexByte(rest, ':')
 	if idx < 0 {
-		return "cn", model
+		return provider, realm, rest
 	}
-	prefix := model[:idx]
-	if prefix != "cn" && prefix != "global" {
-		return "cn", model
+	if p, ok := providerAlias(rest[:idx]); ok {
+		provider, rest = p, rest[idx+1:]
 	}
-	return prefix, model[idx+1:]
+	if i := strings.IndexByte(rest, ':'); i >= 0 {
+		if seg := rest[:i]; seg == "cn" || seg == "global" {
+			realm, rest = seg, rest[i+1:]
+		}
+	}
+	return provider, realm, rest
 }
 
 // ResolveModel 是 resolveModel 的导出面（跨包调用）。
-func ResolveModel(model string) (realm, bare string) { return resolveModel(model) }
+func ResolveModel(model string) (auth.Provider, string, string) { return resolveModel(model) }

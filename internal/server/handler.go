@@ -546,10 +546,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 在提示词/模型名改写之前取（那些改写不动 tools / messages[].tool_calls 子树）。
 	declaredTools := upstream.ToolNameAllowlist(body)
 
-	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
-	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
-	// 裸名 → ("cn", 原串)，CN 现状零回归。
-	realm, bareModel := resolveModel(peek.Model)
+	// 路由协议解析（DESIGN §3.1）：model 名可带 "[provider:][realm:]" 前缀。
+	// 剥出 provider + realm + bareModel；bareModel 用于选号/粘性/出站 body 重写
+	// （前缀是网关侧路由协议，上游只认裸名）。过渡期裸名 → (workbuddy, cn, 原串)。
+	provider, realm, bareModel := resolveModel(peek.Model)
+	upClient := h.clientFor(provider)
+	isTrae := provider == auth.ProviderTrae
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -768,7 +770,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			acct = h.cfg.Pool.PickExcludingForProviderRealm(tried, bareModel, realm, provider)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -802,7 +804,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// token 临近过期 → 先 refresh（失败冷却换号）
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
-			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
+			if err := upClient.RefreshToken(r.Context(), acct); err != nil {
 				lastErr = err
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
@@ -824,7 +826,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
 		attemptStarted := time.Now()
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+		rc, status, respBody, terr := upClient.ChatStream(r.Context(), acct, body, clientIP, chatMeta, upstream.ChannelSOLO)
 		// 分类信封一次成型：upstream 已在错误路径返回 *upstream.Error（Kind +
 		// Retry-After 头解析）。传输层错误（非 *Error）走抖动换号分支；防御分支
 		// （terr 为 nil 但 status>=400，如 ErrNone 兜底）回落本地 Classify，双保险。
@@ -873,7 +875,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if uerr != nil {
 				kind = uerr.Kind
 			} else {
-				kind = upstream.Classify(status, string(respBody))
+				kind = h.classifyFor(provider, status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			}
 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
@@ -977,6 +979,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 上游「200 已开流 + 一帧 error」是真实形态（6004 限流、内容拦截、审核），
 		// 此前在读第一帧之前就 NoteSuccess + 清 11102 负缓存 + 绑粘性 → 被限流的号
 		// 记成健康、粘性把会话钉死在它身上，后续每一轮都打同一个限流号。
+		if isTrae {
+			// Trae 成功路径（SOLO 原生流）：格式归一化与错误处置都在 serveTraeSuccess 内，
+			// 不落入下方 WorkBuddy 专属的 StreamHint / markup repair / 统计路径。
+			h.serveTraeSuccess(w, r, acct, rc, bareModel, peek.Stream, st, sessKey)
+			return
+		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
