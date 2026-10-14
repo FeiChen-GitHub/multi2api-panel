@@ -3,6 +3,7 @@
 package auth
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,30 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
+
+// Provider 上游服务提供商。空值语义 = ProviderWorkBuddy（旧凭证文件零回归）。
+type Provider string
+
+const (
+	ProviderWorkBuddy Provider = "workbuddy"
+	ProviderTrae      Provider = "trae"
+)
+
+// AccountKey 池内账号主键：本项目自生成的 UUIDv4，与上游 uid 解耦。
+// 形态为 8-4-4-4-12 的十六进制串（无 "/"），可安全用作面板路由参数与 map 键。
+// 随 auth 文件持久化（account_key 键），保证重启/重载后稳定。
+type AccountKey string
+
+// NewAccountKey 生成一个新的 UUIDv4 主键（crypto/rand，无第三方依赖）。
+func NewAccountKey() (AccountKey, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("account key rand: %w", err)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return AccountKey(fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])), nil
+}
 
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
 type Auth struct {
@@ -33,6 +59,14 @@ type Auth struct {
 	// 命名注记：Go 不允许字段与方法同名，持久化字段用未导出 realm，计算访问器用
 	// 导出的 Realm()（跨包调用全部走方法）。Parse/SaveAtomic/login 在包内读写字段。
 	realm        string
+	// provider 上游 provider（"workbuddy" / "trae"），落盘于顶层 provider 键。
+	// 空 = 缺省：Provider() 回落 ProviderWorkBuddy。
+	// 与 realm 同构（私有字段 + 导出访问器，Go 不允许字段与方法同名），
+	// 区别是 provider 加载后不可变，访问器无需加锁。
+	provider     Provider
+	// key 池内主键（UUIDv4，落盘于顶层 account_key 键）。空 = 尚未生成，
+	// 由 LoadDir / 登录导入路径生成并落盘；业务判定用 Key()。
+	key          AccountKey
 	UID          string
 	EnterpriseID string
 	Nickname     string
@@ -166,6 +200,28 @@ func (a *Auth) RealmStored() string {
 	return a.realm
 }
 
+// Provider 返回账号所属上游；空值回落 ProviderWorkBuddy（旧文件零回归）。
+// provider 加载后不可变，故不加锁（realm 需要锁是因为 BackfillRealm/RefreshToken 会改写它）。
+func (a *Auth) Provider() Provider {
+	if a == nil || a.provider == "" {
+		return ProviderWorkBuddy
+	}
+	return a.provider
+}
+
+// ProviderStored 直读持久化的 provider（可能为空 = 未 backfill 的旧文件）。
+// 供 LoadDir 判断是否需要迁移；业务判定一律用 Provider()。
+func (a *Auth) ProviderStored() Provider { return a.provider }
+
+// Key 返回池内主键（UUIDv4）。尚未生成时返回空串——生成与落盘由 LoadDir /
+// 登录导入路径负责，Parse 保持只读。key 加载后不变，故不加锁。
+func (a *Auth) Key() AccountKey {
+	if a == nil {
+		return ""
+	}
+	return a.key
+}
+
 // BackfillRealmFor 显式写入 realm 标识（包外登录路径使用：panel login 已知用户选了
 // global，直接落盘 realm=global，不依赖 domain 后缀推断）。realm 需为 cn/global，
 // 非法值报错（防写脏）。返回是否发生变更。
@@ -255,6 +311,10 @@ func Parse(raw []byte) (*Auth, error) {
 			} `json:"account"`
 			// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
 			DeviceToken string `json:"device_token"`
+			// Provider 顶层 provider（本项目自有元数据，非上游输出）；缺失 = 旧文件。
+			Provider string `json:"provider"`
+			// AccountKey 顶层 account_key（本项目自生成的池内主键，UUIDv4）。
+			AccountKey string `json:"account_key"`
 		}
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -269,6 +329,8 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
 			DeviceToken:  n.DeviceToken,
+			provider:     Provider(strings.TrimSpace(n.Provider)),
+			key:          AccountKey(strings.TrimSpace(n.AccountKey)),
 		}
 	} else {
 		var f struct {
@@ -281,6 +343,8 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
 			DeviceToken  string `json:"device_token"`
+			Provider     string `json:"provider"`
+			AccountKey   string `json:"account_key"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -295,6 +359,8 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
 			DeviceToken:  f.DeviceToken,
+			provider:     Provider(strings.TrimSpace(f.Provider)),
+			key:          AccountKey(strings.TrimSpace(f.AccountKey)),
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -334,6 +400,18 @@ func (a *Auth) SaveAtomic() error {
 	if a.DeviceToken != "" {
 		doc["device_token"] = a.DeviceToken
 	}
+	// provider 总是写回（空值归一化为 workbuddy）：把 provider 维度显式化，
+	// 让 LoadDir 的 backfill 一次收敛，之后不再依赖文件名前缀推断。
+	prov := a.provider
+	if prov == "" {
+		prov = ProviderWorkBuddy
+	}
+	doc["provider"] = string(prov)
+	// account_key 非空才写回：键由 LoadDir / 登录导入路径生成，Parse 保持只读，
+	// 不在这里凭空造键（否则未挂 FilePath 的临时对象也会被写脏）。
+	if a.key != "" {
+		doc["account_key"] = string(a.key)
+	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
@@ -354,15 +432,34 @@ func (a *Auth) SaveAtomic() error {
 	return os.Rename(tmp, a.FilePath)
 }
 
-// LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
-// 顺带做 realm 标识存量迁移：对空 realm 的 auth 自动 backfill（原始 domain 推断）并 SaveAtomic
-// 落盘，一次性把旧文件补上 realm 键。单个文件写失败不阻断启动（log WARN 继续），
-// 避免历史 auth 目录个别文件不可写时整个服务起不来。
-func LoadDir(dir string) ([]*Auth, error) {
-	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
-	if err != nil {
-		return nil, err
+// providerFromFile 从文件名前缀推断 provider，仅在文件内容缺 provider 键时使用。
+// 文件名只作为存量迁移的提示，内容始终优先（写完 backfill 后不再依赖它）。
+func providerFromFile(path string) Provider {
+	if strings.HasPrefix(filepath.Base(path), "trae-") {
+		return ProviderTrae
 	}
+	return ProviderWorkBuddy
+}
+
+// LoadDir 扫描并解析 dir 下 workbuddy*.json 与 trae*.json；解析失败的文件静默跳过
+// （启动日志由调用方统计）。provider 以文件内容的 provider 键为准，缺键时按文件名
+// 前缀回落（trae-* → Trae，其余 → WorkBuddy）。
+//
+// 顺带做存量迁移：缺 provider / 空 realm 的 auth 自动 backfill（provider 按文件名、
+// realm 按原始 domain 推断）并 SaveAtomic 落盘，一次性把旧文件补齐。provider 与 realm
+// 合并成一次写。单个文件写失败不阻断启动（log WARN 继续），避免历史 auth 目录
+// 个别文件不可写时整个服务起不来。
+func LoadDir(dir string) ([]*Auth, error) {
+	var files []string
+	for _, pat := range []string{"workbuddy*.json", "trae*.json"} {
+		m, err := filepath.Glob(filepath.Join(dir, pat))
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, m...)
+	}
+	// 稳定顺序：重复 UID 的「后载入者胜出」行为依赖它（见下方 seenUID WARN）。
+	sort.Strings(files)
 	// seenUID 重复 UID 检测：同 UID 出现在多个文件时（双 realm 同名 UID 概率近零）
 	// 打 WARN 告警含两文件路径，由「后载入者胜出」保持现状行为（不改变加载结果）。
 	seenUID := make(map[string]string, len(files))
@@ -382,13 +479,41 @@ func LoadDir(dir string) ([]*Auth, error) {
 				logfmt.Label(a.UID, a.Nickname), prev, f)
 		}
 		seenUID[a.UID] = f
+
+		// provider 存量迁移：内容缺 provider 键时按文件名前缀回落。
+		providerChanged := false
+		if a.ProviderStored() == "" {
+			a.provider = providerFromFile(f)
+			providerChanged = true
+		}
+		// realm 存量迁移：空 realm 按原始 domain 推断（不变更已有标识）。
+		realmChanged := false
+		realmMsg := ""
 		if a.RealmStored() == "" {
 			if changed, r := a.BackfillRealm(); changed {
-				if err := a.SaveAtomic(); err != nil {
-					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(a.UID, a.Nickname), err)
-				} else if r == "global" {
-					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(a.UID, a.Nickname), a.Domain)
+				realmChanged = true
+				if r == "global" {
+					realmMsg = fmt.Sprintf("auth %s 存量迁移: 补 realm=global（domain=%s）",
+						logfmt.Label(a.UID, a.Nickname), a.Domain)
 				}
+			}
+		}
+		// 主键存量迁移：缺 account_key 时生成 UUIDv4。生成后必须落盘，否则重启会换键、
+		// state.json 与 Redis 里的引用全部失配。
+		keyChanged := false
+		if a.Key() == "" {
+			if k, err := NewAccountKey(); err != nil {
+				log.Printf("WARN: auth %s account key gen: %v", logfmt.Label(a.UID, a.Nickname), err)
+			} else {
+				a.key = k
+				keyChanged = true
+			}
+		}
+		if providerChanged || realmChanged || keyChanged {
+			if err := a.SaveAtomic(); err != nil {
+				log.Printf("WARN: auth %s backfill save: %v", logfmt.Label(a.UID, a.Nickname), err)
+			} else if realmMsg != "" {
+				log.Printf("%s", realmMsg)
 			}
 		}
 		out = append(out, a)
