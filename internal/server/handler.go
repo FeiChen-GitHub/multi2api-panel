@@ -32,6 +32,9 @@ import (
 type Config struct {
 	Pool      *pool.Pool
 	Upstream  *upstream.Client
+	// Dispatcher 多 provider 分发器（可选）。nil 时 clientFor 退化为 WorkBuddy
+	// 客户端，测试与裸用场景行为不变。
+	Dispatcher *upstream.Dispatcher
 	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
 	MaxRotate int    // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
@@ -121,6 +124,17 @@ type Handler struct {
 }
 
 // NewHandler 构建 handler。
+// clientFor 返回处理该 provider 的上游客户端。Dispatcher 未注入、或该 provider
+// 尚未接入（For 返回 nil）时退化为 WorkBuddy 客户端 —— 保持测试/裸用场景的既有行为。
+func (h *Handler) clientFor(provider auth.Provider) upstream.ChatClient {
+	if h.cfg.Dispatcher != nil {
+		if c := h.cfg.Dispatcher.For(provider); c != nil {
+			return c
+		}
+	}
+	return upstream.NewWBClient(h.cfg.Upstream)
+}
+
 func NewHandler(cfg Config) *Handler {
 	if cfg.MaxRotate <= 0 {
 		cfg.MaxRotate = 3

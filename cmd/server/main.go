@@ -133,6 +133,10 @@ func main() {
 
 	up := upstream.New()
 
+	// 多 provider 分发器：WorkBuddy 现有客户端 + Trae SOLO 客户端（phase 1 只支持 CN）。
+	// resolveModel / handler 侧接入 provider 路由后即生效；未接入前不影响既有行为。
+	dispatcher := upstream.NewDispatcher(upstream.NewWBClient(up), upstream.NewTraeClient())
+
 	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测
 	// 时用它判收费——否则「没学过」恒等于「放行」，高价新模型会把触底号一笔打穿
 	// （kimi-k3-1 实案：全池无观测 → 保底全放行 → 两笔打穿并硬冷却到次日 04:00）。
@@ -294,6 +298,7 @@ func main() {
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
+		Dispatcher:   dispatcher,
 		APIKey:       cfg.APIKey,
 		Session:      sessRouter,
 		StickyCount:  sessCount,
