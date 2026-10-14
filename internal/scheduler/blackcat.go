@@ -6,6 +6,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
@@ -34,6 +35,9 @@ func (s *Scheduler) RunBlackcatNow() {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
 			continue
+		}
+		if a.Provider() != auth.ProviderWorkBuddy {
+			continue // 夜猫子是 WorkBuddy 专属成长任务
 		}
 		if a.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用

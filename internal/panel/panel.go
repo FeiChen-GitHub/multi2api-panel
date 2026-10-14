@@ -35,6 +35,8 @@ import (
 type Config struct {
 	Pool      *pool.Pool
 	Upstream  *upstream.Client
+	// Dispatcher 多 provider 分发器（可选）。nil 时 clientFor 退化为 WorkBuddy 客户端。
+	Dispatcher *upstream.Dispatcher
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	AuthDir   string               // OAuth 登录完成后凭证落盘目录
 	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
@@ -513,6 +515,11 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	a := p.cfg.Pool.AuthByUID(uid)
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	// provider 分发（DESIGN §11.1）：Trae 走 ChatClient.Checkin，不套 WorkBuddy 的门控与端点。
+	if a.Provider() == auth.ProviderTrae {
+		p.checkinTrae(w, a)
 		return
 	}
 	checkinMsg := ""

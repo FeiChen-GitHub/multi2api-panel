@@ -26,10 +26,24 @@ func (p *Panel) accountByUID(w http.ResponseWriter, uid string) *auth.Auth {
 	return a
 }
 
+// wbTaskAccount 取账号并确认它属于 WorkBuddy —— 成长任务是 WorkBuddy 专属体系，
+// Trae 上游没有对应端点（DESIGN §11.1）。非 wb 账号明确报错而不是打错上游。
+func (p *Panel) wbTaskAccount(w http.ResponseWriter, uid string) *auth.Auth {
+	a := p.accountByUID(w, uid)
+	if a == nil {
+		return nil
+	}
+	if a.Provider() != auth.ProviderWorkBuddy {
+		writeErr(w, http.StatusBadRequest, "该 provider 无成长任务体系")
+		return nil
+	}
+	return a
+}
+
 // accountTasks 查询单账号全量任务（进度/状态/可领取）。
 func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
+	a := p.wbTaskAccount(w, uid)
 	if a == nil {
 		return
 	}
@@ -58,7 +72,7 @@ func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 // accountTaskAccept 接受任务（报名；幂等）。
 func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
+	a := p.wbTaskAccount(w, uid)
 	if a == nil {
 		return
 	}
@@ -85,7 +99,7 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 // 批量提交会分片（上游对 task_codes 数组长度无公开上限，保守每批 20 个）。
 func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
+	a := p.wbTaskAccount(w, uid)
 	if a == nil {
 		return
 	}
@@ -152,7 +166,7 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 // accountTaskClaim 领取任务奖励（未达标时上游返回业务错误，原样透出给前端提示）。
 func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
+	a := p.wbTaskAccount(w, uid)
 	if a == nil {
 		return
 	}

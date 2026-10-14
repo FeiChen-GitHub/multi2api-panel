@@ -56,6 +56,9 @@ func (s *Scheduler) RunTravelNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
+		if a.Provider() != auth.ProviderWorkBuddy {
+			continue // 猫猫旅行是 WorkBuddy 专属任务，Trae 无此体系
+		}
 		if a.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}

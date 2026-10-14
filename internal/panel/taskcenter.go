@@ -73,6 +73,10 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			}
 			it := &items[i]
 			it.UID, it.Nickname = uid, a.Nickname
+			// 成长任务体系是 WorkBuddy 专属（Trae 上游没有对应端点）。
+			if a.Provider() != auth.ProviderWorkBuddy {
+				return
+			}
 			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
 			if a.IsGlobal() {
 				return
@@ -218,6 +222,10 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 		go func(a *auth.Auth) {
 			defer wg.Done()
 			one := queueAccount{a: a}
+			// 成长任务体系是 WorkBuddy 专属（Trae 上游没有对应端点）。
+			if a.Provider() != auth.ProviderWorkBuddy {
+				return
+			}
 			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
 			if a.IsGlobal() {
 				return

@@ -177,6 +177,7 @@ func main() {
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
+		Dispatcher:     dispatcher,
 		CheckinHours:   cfg.Schedule.CheckinHours,
 		TravelHours:    cfg.Schedule.TravelHours,
 		ActivityHours:  cfg.Schedule.ActivityHours,
@@ -271,6 +272,7 @@ func main() {
 		Usage:       rec,
 		RequestLog:  requestLog,
 		Upstream:    up,
+		Dispatcher:  dispatcher,
 		Scheduler:   sch,
 		AuthDir:     cfg.AuthDir,
 		APIKey:      cfg.APIKey,

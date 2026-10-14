@@ -24,6 +24,8 @@ import (
 type Config struct {
 	Pool           *pool.Pool
 	Upstream       *upstream.Client
+	// Dispatcher 多 provider 分发器（可选）。nil 时 clientFor 退化为 WorkBuddy 客户端。
+	Dispatcher *upstream.Dispatcher
 	CheckinHours   []int // 默认 [9, 21]
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
@@ -450,51 +452,108 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 func (s *Scheduler) RunCheckinNow() {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
+	sawWorkBuddy := false
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshTokenValue() == "" {
+		if a == nil {
 			continue
 		}
-		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
-		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
-		// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
-		if a.IsGlobal() {
+		// 按 provider 分发（DESIGN §11.1）：Trae 走 ChatClient.Checkin，
+		// 不再被 WorkBuddy 的 realm/企业版门控误杀。
+		if a.Provider() == auth.ProviderTrae {
+			s.checkinTrae(st, a)
 			continue
 		}
-		// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
-		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
-		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
-		// credit_floor 判定与面板额度展示的唯一数据源）。
-		if !a.IsEnterprise() {
-			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
-				// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
-				if upstream.IsAlreadyCheckin(err) {
-					s.cfg.Pool.NoteCheckinDone(st.UID)
-					log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
-				} else {
-					log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-				}
-				// 其余业务错误也继续走余额查询
-			} else {
-				// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
-				// 重复触发时出现），成功也落一行。
-				s.cfg.Pool.NoteCheckinDone(st.UID)
-				log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
-			}
-		}
-		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
-		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
-		if err != nil {
-			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+		// WorkBuddy 侧仍要求 refreshToken（keepalive/刷新依赖它）。
+		if a.RefreshTokenValue() == "" {
 			continue
 		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
-		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
+		sawWorkBuddy = true
+		s.checkinWorkBuddy(st, a, expiringSoon)
 	}
-	s.RunStreakBonusNow()
+	// 连登管家是 WorkBuddy 专属（Trae 无该体系）：一个 wb 号都没有时不要跑。
+	if sawWorkBuddy {
+		s.RunStreakBonusNow()
+	}
+}
+
+// clientFor 返回处理该 provider 的上游客户端；Dispatcher 未注入或未接入时
+// 退化为 WorkBuddy 客户端（测试/裸用场景行为不变）。
+func (s *Scheduler) clientFor(provider auth.Provider) upstream.ChatClient {
+	if s.cfg.Dispatcher != nil {
+		if c := s.cfg.Dispatcher.For(provider); c != nil {
+			return c
+		}
+	}
+	return upstream.NewWBClient(s.cfg.Upstream)
+}
+
+// checkinWorkBuddy 单账号 WorkBuddy 签到 + 余额刷新（原 RunCheckinNow 的循环体）。
+func (s *Scheduler) checkinWorkBuddy(st pool.Status, a *auth.Auth, expiringSoon time.Duration) {
+	// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
+	// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
+	// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
+	if a.IsGlobal() {
+		return
+	}
+	// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
+	// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 return**——
+	// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
+	// credit_floor 判定与面板额度展示的唯一数据源）。
+	if !a.IsEnterprise() {
+		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
+			if upstream.IsAlreadyCheckin(err) {
+				s.cfg.Pool.NoteCheckinDone(st.UID)
+				log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
+			} else {
+				log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+			}
+			// 其余业务错误也继续走余额查询
+		} else {
+			// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
+			// 重复触发时出现），成功也落一行。
+			s.cfg.Pool.NoteCheckinDone(st.UID)
+			log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
+		}
+	}
+	// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
+	remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
+	if err != nil {
+		log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+		return
+	}
+	s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
+	s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
+}
+
+// checkinTrae 单账号 Trae 签到 + 额度刷新（phase 1 只支持 cn）。
+// 签到拥挤（9074）是可重试的，不是账号故障：只记日志、不罚号。
+func (s *Scheduler) checkinTrae(st pool.Status, a *auth.Auth) {
+	if a.AccessTokenValue() == "" {
+		return
+	}
+	if a.Realm() != "cn" {
+		return // Trae phase 1 只有 cn
+	}
+	ctx := context.Background()
+	client := s.clientFor(auth.ProviderTrae)
+	if err := client.Checkin(ctx, a); err != nil {
+		log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+	} else {
+		s.cfg.Pool.NoteCheckinDone(st.UID)
+		log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
+	}
+	remain, total, err := client.QueryCredits(ctx, a)
+	if err != nil {
+		log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+		return
+	}
+	s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
+	s.cfg.Pool.SetCredits(st.UID, remain, total)
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
@@ -521,6 +580,9 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
 			continue
+		}
+		if a.Provider() != auth.ProviderWorkBuddy {
+			continue // 活跃上报点亮的是 WorkBuddy 连登/growth，Trae 无此体系
 		}
 		// 企业版跳过活跃上报：/v2/report 本身返回 200（不报错），但它唯一的作用是
 		// 点亮 growth 连登天数 / 解锁 first_buddy 领养——这两者对企业号都是 403
@@ -587,7 +649,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+		if err := s.clientFor(a.Provider()).RefreshToken(context.Background(), a); err != nil {
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
@@ -626,6 +688,17 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
+			if a.Provider() == auth.ProviderTrae {
+				// Trae 额度来源是 ide_user_ent_usage（账号级），没有 wb 的到期分桶。
+				remain, total, err := s.clientFor(auth.ProviderTrae).QueryCredits(context.Background(), a)
+				if err != nil {
+					log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
+					return
+				}
+				s.cfg.Pool.ReenableIfCredits(uid, remain, total)
+				s.cfg.Pool.SetCredits(uid, remain, total)
+				return
+			}
 			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)

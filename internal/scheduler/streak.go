@@ -26,6 +26,9 @@ func (s *Scheduler) RunStreakBonusNow() {
 		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
+		if a.Provider() != auth.ProviderWorkBuddy {
+			continue // 连登/礼包是 WorkBuddy 专属体系，Trae 无此端点
+		}
 		if a.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
