@@ -77,6 +77,15 @@ type Auth struct {
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+
+	// Trae 专属字段（provider==ProviderTrae 时有效）。字段名与落盘位置对照
+	// trae2api/internal/auth/auth.go：都放在嵌套形 auth 对象内。
+	//   ApiHost   ExchangeToken/GetUserInfo 的 host（如 https://api.trae.com.cn）
+	//   MachineID x-machine-id 头
+	//   DeviceID  x-device-id 头（签到要求每账号唯一 16 位数字）
+	ApiHost   string
+	MachineID string
+	DeviceID  string
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -338,6 +347,9 @@ func Parse(raw []byte) (*Auth, error) {
 				ExpiresAt    int64  `json:"expiresAt"`
 				Domain       string `json:"domain"`
 				Realm        string `json:"realm"`
+				ApiHost      string `json:"apiHost"`
+				MachineID    string `json:"machineId"`
+				DeviceID     string `json:"deviceId"`
 			} `json:"auth"`
 			Account struct {
 				UID          string `json:"uid"`
@@ -366,6 +378,9 @@ func Parse(raw []byte) (*Auth, error) {
 			DeviceToken:  n.DeviceToken,
 			provider:     Provider(strings.TrimSpace(n.Provider)),
 			key:          AccountKey(strings.TrimSpace(n.AccountKey)),
+			ApiHost:      n.Auth.ApiHost,
+			MachineID:    n.Auth.MachineID,
+			DeviceID:     n.Auth.DeviceID,
 		}
 	} else {
 		var f struct {
@@ -380,6 +395,9 @@ func Parse(raw []byte) (*Auth, error) {
 			DeviceToken  string `json:"device_token"`
 			Provider     string `json:"provider"`
 			AccountKey   string `json:"account_key"`
+			ApiHost      string `json:"apiHost"`
+			MachineID    string `json:"machineId"`
+			DeviceID     string `json:"deviceId"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -396,6 +414,9 @@ func Parse(raw []byte) (*Auth, error) {
 			DeviceToken:  f.DeviceToken,
 			provider:     Provider(strings.TrimSpace(f.Provider)),
 			key:          AccountKey(strings.TrimSpace(f.AccountKey)),
+			ApiHost:      f.ApiHost,
+			MachineID:    f.MachineID,
+			DeviceID:     f.DeviceID,
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -434,6 +455,19 @@ func (a *Auth) SaveAtomic() error {
 	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
 	if a.DeviceToken != "" {
 		doc["device_token"] = a.DeviceToken
+	}
+	// Trae 专属字段同样非空才写回（放在 auth 对象内，与 trae2api 输出一致）：
+	// WorkBuddy 凭证不会被塞进空键。
+	if authDoc, ok := doc["auth"].(map[string]any); ok {
+		if a.ApiHost != "" {
+			authDoc["apiHost"] = a.ApiHost
+		}
+		if a.MachineID != "" {
+			authDoc["machineId"] = a.MachineID
+		}
+		if a.DeviceID != "" {
+			authDoc["deviceId"] = a.DeviceID
+		}
 	}
 	// provider 总是写回（空值归一化为 workbuddy）：把 provider 维度显式化，
 	// 让 LoadDir 的 backfill 一次收敛，之后不再依赖文件名前缀推断。
