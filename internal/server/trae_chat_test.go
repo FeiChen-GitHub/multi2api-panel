@@ -145,3 +145,70 @@ func TestChatBareModelStillRoutesWorkBuddy(t *testing.T) {
 		t.Fatalf("wbCalls=%d traeCalls=%d, want 1/0", wbCalls, traeCalls)
 	}
 }
+
+// /v1/models 要带 provider 前缀列出 Trae 模型（含 channel：Official 走 work）。
+func TestModelsIncludesTraeEntries(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	tc := upstream.NewTraeClient()
+	tc.AgentHost = "https://trae.fake"
+	tc.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != upstream.TraeEpModels {
+			return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader("nope")), Header: http.Header{}}, nil
+		}
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{"config_info_list":[` +
+				`{"config_name":"glm-5.2","display_config":{"display_name":"GLM 5.2"}},` +
+				`{"config_name":"DeepSeek-V4-Flash-Official","display_config":{"display_name":"Flash"}}]}`)),
+		}, nil
+	})}
+	tc.StreamHTTP = tc.HTTP
+
+	traeAuth, err := auth.Parse([]byte(`{"provider":"trae","auth":{"accessToken":"trae-at","expiresAt":9999999999},"account":{"uid":"trae1"}}`))
+	if err != nil {
+		t.Fatalf("parse trae auth: %v", err)
+	}
+	p := testPoolWith(traeAuth)
+	h := NewHandler(Config{Pool: p, Upstream: up, Dispatcher: upstream.NewDispatcher(upstream.NewWBClient(up), tc)})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v (%s)", err, rec.Body.String())
+	}
+	byID := map[string]map[string]any{}
+	for _, m := range resp.Data {
+		if id, ok := m["id"].(string); ok {
+			byID[id] = m
+		}
+	}
+	solo, ok := byID["trae:glm-5.2"]
+	if !ok {
+		t.Fatalf("trae:glm-5.2 missing; ids=%v", keysOf(byID))
+	}
+	if solo["owned_by"] != "trae" || solo["channel"] != "solo" {
+		t.Fatalf("trae:glm-5.2 = %v", solo)
+	}
+	work, ok := byID["trae:DeepSeek-V4-Flash-Official"]
+	if !ok {
+		t.Fatalf("trae work model missing; ids=%v", keysOf(byID))
+	}
+	if work["channel"] != "work" {
+		t.Fatalf("work model channel = %v, want work", work["channel"])
+	}
+}
+
+func keysOf(m map[string]map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}

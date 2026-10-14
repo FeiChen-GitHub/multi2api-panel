@@ -33,6 +33,12 @@ type ChatClient interface {
 	QueryCredits(ctx context.Context, a *auth.Auth) (remain, total int64, err error)
 }
 
+// ModelLister 可选能力：按 provider 拉模型列表（供 /v1/models 按 provider 分组）。
+// 只有 TraeClient 实现（WorkBuddy 走既有的 fetchDynamicModels/四级查找链）。
+type ModelLister interface {
+	FetchModels(ctx context.Context, a *auth.Auth) ([]ModelInfo, error)
+}
+
 // WBClient 把现有 WorkBuddy 客户端适配成 ChatClient：纯薄封装，行为与现状完全一致。
 type WBClient struct{ *Client }
 

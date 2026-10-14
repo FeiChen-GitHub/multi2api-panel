@@ -375,7 +375,7 @@ func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	for _, mi := range h.fetchDynamicModels() {
 		entry := map[string]any{
-			"id":       "cn:" + mi.ID,
+			"id":       "wb:" + mi.ID,
 			"object":   "model",
 			"created":  1753600000,
 			"owned_by": "workbuddy",
@@ -418,7 +418,7 @@ func (h *Handler) modelList() []map[string]any {
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
 			entry := map[string]any{
-				"id":       "global:" + id,
+				"id":       "wb:global:" + id,
 				"object":   "model",
 				"created":  1753600000,
 				"owned_by": "workbuddy",
@@ -440,6 +440,37 @@ func (h *Handler) modelList() []map[string]any {
 				}
 			}
 			out = append(out, entry)
+		}
+	}
+	// Trae 模型名单：池里有 cn 的 Trae 账号时才列出（纯动态 + 静态兜底，
+	// 与 trae2api 的 modelList 同口径）；id 统一带 "trae:" 前缀，channel 取自模型名。
+	if keys := h.cfg.Pool.AvailableKeysForProviderModelRealm(auth.ProviderTrae, "", "cn"); len(keys) > 0 {
+		acct := h.cfg.Pool.AuthByKey(keys[0])
+		if acct != nil {
+			if ml, ok := h.clientFor(auth.ProviderTrae).(upstream.ModelLister); ok {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				infos, err := ml.FetchModels(ctx, acct)
+				cancel()
+				if err != nil {
+					log.Printf("WARN: [server] trae models fetch: %v", err)
+				}
+				for _, mi := range infos {
+					entry := map[string]any{
+						"id":       "trae:" + mi.ID,
+						"object":   "model",
+						"created":  1753600000,
+						"owned_by": "trae",
+						"channel":  string(upstream.TraeChannelForModel(mi.ID)),
+					}
+					if mi.ContextWindow > 0 {
+						entry["context_length"] = mi.ContextWindow
+					}
+					if mi.Name != "" {
+						entry["name"] = mi.Name
+					}
+					out = append(out, entry)
+				}
+			}
 		}
 	}
 	return out
