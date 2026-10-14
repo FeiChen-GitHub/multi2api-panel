@@ -135,7 +135,12 @@ func (p *Pool) load() {
 // 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
 func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 	now := time.Now()
-	for uid, s := range accounts {
+	for rawKey, s := range accounts {
+		key := auth.AccountKey(rawKey)
+		uid := s.UID
+		if uid == "" {
+			uid = rawKey // 旧格式：map 键就是 uid
+		}
 		// err_total 优先；旧文件的 err_count（连续错误）作一次性迁移源映射进来（二者取较大者，
 		// 尽最大可能保留历史观测信号——旧语义下 err_count 也真实发生过错误，不应丢）。
 		errTotal := s.ErrTotal
@@ -213,8 +218,8 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
 			}
 		}
-		e.key = auth.AccountKey(uid)
-		p.byKey[e.key] = e
+		e.key = key
+		p.byKey[key] = e
 		p.byUID[uid] = e
 	}
 }
@@ -287,8 +292,18 @@ func (p *Pool) notePersistFail(err error) {
 func (p *Pool) stateOverviewLocked() stateFile {
 	now := time.Now()
 	sf := stateFile{Accounts: map[string]stateAccount{}}
-	for uid, e := range p.byUID {
+	// 写侧按 AccountKey 作键（跨 provider 同 uid 不再互相覆盖），uid 存记录内。
+	for key, e := range p.byKey {
+		uid := ""
+		if e.a != nil {
+			uid = e.a.UID
+		}
+		mapKey := string(key)
+		if mapKey == "" {
+			mapKey = uid // 防御：理论上不该出现，兜回旧行为
+		}
 		s := stateAccount{
+			UID:                      uid,
 			Credits:                  e.credits,
 			CreditsTotal:             e.creditsTotal,
 			Disabled:                 e.disabled,
@@ -344,7 +359,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				s.ModelCosts[m] = stateModelCost{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
 			}
 		}
-		sf.Accounts[uid] = s
+		sf.Accounts[mapKey] = s
 	}
 	return sf
 }

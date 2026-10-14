@@ -422,10 +422,21 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 	if a == nil {
 		return
 	}
-	key, _, err := a.EnsureKey()
+	key, generated, err := a.EnsureKey()
 	if err != nil || key == "" {
 		log.Printf("WARN: pool: account %s ensure key failed: %v", a.UID, err)
 		return
+	}
+	// 调用方给的是没有持久化主键的新对象（测试构造 / 重新登录），而池里已有同一账号的
+	// 既有状态（state.json 恢复出的 placeholder：同 provider、无 token）时，以既有主键为准，
+	// 否则新生成的随机键会让历史 credits/冷却失配（重载场景）。
+	// 注意条件含 provider + placeholder：跨 provider 撞 uid 的真实账号不会被并进来。
+	if generated {
+		if prev := p.byUID[a.UID]; prev != nil && prev.key != "" &&
+			prev.a != nil && prev.a.AccessTokenValue() == "" && prev.a.Provider() == a.Provider() {
+			key = prev.key
+			a.SetKey(key)
+		}
 	}
 	e, ok := p.byKey[key]
 	if !ok {

@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -43,8 +44,14 @@ func TestAuthByKeyUnknownReturnsNil(t *testing.T) {
 // 跨 provider 相同 uid 必须共存而不是互相覆盖 —— 这正是引入 AccountKey 的目的。
 func TestSameUIDAcrossProvidersCoexist(t *testing.T) {
 	p := New("")
-	wb := &auth.Auth{UID: "dup", Nickname: "wb"}
-	tr := &auth.Auth{UID: "dup", Nickname: "trae"}
+	wb, err := auth.Parse([]byte(`{"provider":"workbuddy","auth":{"accessToken":"wb-at"},"account":{"uid":"dup","nickname":"wb"}}`))
+	if err != nil {
+		t.Fatalf("parse wb: %v", err)
+	}
+	tr, err := auth.Parse([]byte(`{"provider":"trae","auth":{"accessToken":"tr-at"},"account":{"uid":"dup","nickname":"trae"}}`))
+	if err != nil {
+		t.Fatalf("parse trae: %v", err)
+	}
 	p.Add(wb)
 	p.Add(tr)
 
@@ -93,5 +100,85 @@ func TestSyncToDirMigratesUIDKeyedState(t *testing.T) {
 	}
 	if got := p.AuthByKey(st.Key); got == nil || got.UID != "u1" {
 		t.Fatalf("AuthByKey(%q) = %+v, want uid=u1", st.Key, got)
+	}
+}
+
+// 写入侧必须按 AccountKey 作键，并把 uid 放进记录里；否则跨 provider 同 uid 会互相覆盖。
+func TestStateSaveKeysByAccountKey(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	t.Cleanup(p.Close)
+
+	a := &auth.Auth{UID: "u1", Nickname: "n1"}
+	p.Add(a)
+	p.SetCredits("u1", 321, 0)
+	p.Flush()
+
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	var sf struct {
+		Accounts map[string]struct {
+			UID     string `json:"uid"`
+			Credits int64  `json:"credits"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(raw, &sf); err != nil {
+		t.Fatalf("unmarshal state: %v", err)
+	}
+	if len(sf.Accounts) != 1 {
+		t.Fatalf("accounts len = %d, want 1", len(sf.Accounts))
+	}
+	key := string(a.Key())
+	got, ok := sf.Accounts[key]
+	if !ok {
+		t.Fatalf("state is not keyed by AccountKey %q (accounts=%v)", key, func() []string {
+			out := make([]string, 0, len(sf.Accounts))
+			for k := range sf.Accounts {
+				out = append(out, k)
+			}
+			return out
+		}())
+	}
+	if got.UID != "u1" {
+		t.Fatalf("state[%s].uid = %q, want u1", key, got.UID)
+	}
+	if got.Credits != 321 {
+		t.Fatalf("state[%s].credits = %d, want 321", key, got.Credits)
+	}
+}
+
+// 新格式 state（AccountKey 为键 + 记录内带 uid）必须能被加载、按主键命中，且 uid 正确。
+func TestStateLoadRestoresAccountKeyKeyedState(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	const key = "11111111-2222-4333-8444-555555555555"
+	body := `{"accounts":{"` + key + `":{"uid":"u1","credits":555}}}`
+	if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(fp)
+	t.Cleanup(p.Close)
+
+	a, err := auth.Parse([]byte(`{"account_key":"` + key + `","auth":{"accessToken":"at"},"account":{"uid":"u1"}}`))
+	if err != nil {
+		t.Fatalf("parse auth: %v", err)
+	}
+	p.SyncToDir([]*auth.Auth{a})
+
+	st, ok := p.StatusByKey(auth.AccountKey(key))
+	if !ok {
+		t.Fatal("StatusByKey not found after loading AccountKey-keyed state")
+	}
+	if st.UID != "u1" {
+		t.Fatalf("restored uid = %q, want u1 (uid must come from the record, not the map key)", st.UID)
+	}
+	if st.Credits != 555 {
+		t.Fatalf("restored credits = %d, want 555", st.Credits)
+	}
+	if got := p.AuthByKey(auth.AccountKey(key)); got == nil || got.UID != "u1" {
+		t.Fatalf("AuthByKey(%s) = %+v, want uid=u1", key, got)
 	}
 }

@@ -424,6 +424,8 @@ func (e *entry) fallbackKind(now time.Time) string {
 
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
+	// UID 上游账号号；写侧按 AccountKey 作键、uid 存这里（旧文件无此字段，回落为 map 键）。
+	UID          string    `json:"uid,omitempty"`
 	Credits      int64     `json:"credits"`
 	CreditsTotal int64     `json:"credits_total,omitempty"`
 	Disabled     bool      `json:"disabled"`

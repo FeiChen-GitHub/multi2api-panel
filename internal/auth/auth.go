@@ -245,6 +245,18 @@ func (a *Auth) EnsureKey() (AccountKey, bool, error) {
 	return k, true, nil
 }
 
+// SetKey 显式写入池内主键（池在「沿用已有账号主键」时调用：调用方给的是没有
+// 持久化主键的新对象，而池里已有同一账号的既有状态，必须以既有主键为准）。
+// 空键忽略；只改内存，不落盘。
+func (a *Auth) SetKey(k AccountKey) {
+	if a == nil || k == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.key = k
+}
+
 // BackfillRealmFor 显式写入 realm 标识（包外登录路径使用：panel login 已知用户选了
 // global，直接落盘 realm=global，不依赖 domain 后缀推断）。realm 需为 cn/global，
 // 非法值报错（防写脏）。返回是否发生变更。
