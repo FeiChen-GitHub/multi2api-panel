@@ -61,7 +61,10 @@ type TokenUsageDelta struct {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID          string `json:"uid"`
+	UID string `json:"uid"`
+	// Key 池内主键（UUIDv4）：面板路由参数与跨 provider 唯一标识用。
+	// UID 仍是上游账号号（展示/日志/凭证文件名），两者可能在不同 provider 间重复。
+	Key          auth.AccountKey `json:"key"`
 	Nickname     string `json:"nickname,omitempty"`
 	Credits      int64  `json:"credits"`
 	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
@@ -181,6 +184,9 @@ type modelCostEntry struct {
 }
 type entry struct {
 	a            *auth.Auth
+	// key 池内主键（auth.AccountKey，UUIDv4）。与 a.Key() 一致，但 placeholder
+	// entry（由 state.json 恢复、尚无真实凭证）也有键，所以单独存一份便于删除/迁移。
+	key          auth.AccountKey
 	credits      int64
 	creditsTotal int64 // 积分总额度（UserResource 聚合；0 = 未知）
 	// creditsExpiring 配置窗口内即将过期的可用积分子集，是 credits 的一部分。

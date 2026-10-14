@@ -129,7 +129,9 @@ func (p *Pool) load() {
 	p.applyAccountsLocked(sf.Accounts)
 }
 
-// applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
+// applyAccountsLocked 用持久化账号状态覆盖/插入索引（placeholder 凭证，Add 时换全）。
+// 持久化键目前仍是 uid（迁移到 AccountKey 是后续步骤），因此这里把它同时当主键与
+// uid 镜像键登记；SyncToDir 拿到真实凭证后会按 AccountKey 归位。
 // 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
 func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 	now := time.Now()
@@ -211,6 +213,8 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
 			}
 		}
+		e.key = auth.AccountKey(uid)
+		p.byKey[e.key] = e
 		p.byUID[uid] = e
 	}
 }
@@ -226,6 +230,7 @@ func (p *Pool) adoptSnapshot(s snapshot) {
 }
 func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
+	p.byKey = map[auth.AccountKey]*entry{}
 	p.applyAccountsLocked(s.Accounts)
 }
 func (p *Pool) saveLocked() {

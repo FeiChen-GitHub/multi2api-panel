@@ -142,3 +142,45 @@ func TestLoadDirAccountKeysAreUniqueAndPreserved(t *testing.T) {
 		t.Fatalf("keys not unique: %+v", keys)
 	}
 }
+
+// EnsureKey 是「内存态补键」入口：首次生成、再次调用幂等。
+// 池（pool.upsertLocked）依赖它保证每个进池账号都有主键，所以必须幂等且不动已有键。
+func TestEnsureKeyGeneratesOnce(t *testing.T) {
+	a := &Auth{}
+	k1, changed, err := a.EnsureKey()
+	if err != nil {
+		t.Fatalf("EnsureKey: %v", err)
+	}
+	if !changed {
+		t.Fatal("first EnsureKey should report changed=true")
+	}
+	if !isUUIDv4(string(k1)) {
+		t.Fatalf("generated key %q is not a UUIDv4", k1)
+	}
+	k2, changed2, err := a.EnsureKey()
+	if err != nil {
+		t.Fatalf("EnsureKey 2: %v", err)
+	}
+	if changed2 {
+		t.Fatal("second EnsureKey should report changed=false")
+	}
+	if k1 != k2 {
+		t.Fatalf("key changed across calls: %q -> %q", k1, k2)
+	}
+}
+
+// EnsureKey 不覆盖已有键（加载回来的键必须原样保留）。
+func TestEnsureKeyKeepsExisting(t *testing.T) {
+	const want = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	a := &Auth{key: AccountKey(want)}
+	got, changed, err := a.EnsureKey()
+	if err != nil {
+		t.Fatalf("EnsureKey: %v", err)
+	}
+	if changed {
+		t.Fatal("EnsureKey should not report changed for an existing key")
+	}
+	if string(got) != want {
+		t.Fatalf("EnsureKey = %q, want %q", got, want)
+	}
+}

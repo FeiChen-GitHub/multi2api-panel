@@ -213,13 +213,36 @@ func (a *Auth) Provider() Provider {
 // 供 LoadDir 判断是否需要迁移；业务判定一律用 Provider()。
 func (a *Auth) ProviderStored() Provider { return a.provider }
 
-// Key 返回池内主键（UUIDv4）。尚未生成时返回空串——生成与落盘由 LoadDir /
-// 登录导入路径负责，Parse 保持只读。key 加载后不变，故不加锁。
+// Key 返回池内主键（UUIDv4）。尚未生成时返回空串——生成由 EnsureKey / LoadDir /
+// 登录导入路径负责，Parse 保持只读。
+// key 会被 EnsureKey 写入，故加锁（与 Realm() 同理）。
 func (a *Auth) Key() AccountKey {
 	if a == nil {
 		return ""
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	return a.key
+}
+
+// EnsureKey 保证账号有池内主键：缺则生成并写入内存字段，返回 (key, 是否新生成, error)。
+// 只改内存，不落盘；持久化由调用方（LoadDir / 登录导入路径）SaveAtomic 负责。
+// 池在账号入池时调用它，保证 entry 的 map 键恒非空。
+func (a *Auth) EnsureKey() (AccountKey, bool, error) {
+	if a == nil {
+		return "", false, fmt.Errorf("nil auth")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.key != "" {
+		return a.key, false, nil
+	}
+	k, err := NewAccountKey()
+	if err != nil {
+		return "", false, err
+	}
+	a.key = k
+	return k, true, nil
 }
 
 // BackfillRealmFor 显式写入 realm 标识（包外登录路径使用：panel login 已知用户选了
@@ -501,13 +524,10 @@ func LoadDir(dir string) ([]*Auth, error) {
 		// 主键存量迁移：缺 account_key 时生成 UUIDv4。生成后必须落盘，否则重启会换键、
 		// state.json 与 Redis 里的引用全部失配。
 		keyChanged := false
-		if a.Key() == "" {
-			if k, err := NewAccountKey(); err != nil {
-				log.Printf("WARN: auth %s account key gen: %v", logfmt.Label(a.UID, a.Nickname), err)
-			} else {
-				a.key = k
-				keyChanged = true
-			}
+		if _, changed, err := a.EnsureKey(); err != nil {
+			log.Printf("WARN: auth %s account key gen: %v", logfmt.Label(a.UID, a.Nickname), err)
+		} else {
+			keyChanged = changed
 		}
 		if providerChanged || realmChanged || keyChanged {
 			if err := a.SaveAtomic(); err != nil {

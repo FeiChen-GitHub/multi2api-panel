@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,7 +13,12 @@ import (
 )
 
 type Pool struct {
-	mu      sync.RWMutex
+	mu sync.RWMutex
+	// byKey 主索引：池内账号主键（auth.AccountKey，UUIDv4）→ entry。账号身份的唯一来源。
+	byKey map[auth.AccountKey]*entry
+	// byUID 过渡期兼容镜像：上游 uid → entry。现有 uid-based API 与测试走它；
+	// uid 不是身份，跨 provider 撞号时后进者覆盖（upsertLocked 打 WARN）。
+	// 待调用点全部迁到 AccountKey 后删除。
 	byUID   map[string]*entry
 	stateFp string
 	dirty   atomic.Bool // 内存有变更待落盘
@@ -85,6 +91,7 @@ type Pool struct {
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
 func New(stateFp string) *Pool {
 	p := &Pool{
+		byKey:              map[auth.AccountKey]*entry{},
 		byUID:              map[string]*entry{},
 		stateFp:            stateFp,
 		breakerThreshold:   defaultBreakerThreshold,
@@ -277,13 +284,30 @@ func (p *Pool) SetStore(s StoreSnapshotter) {
 // RestoreFromSnapshot 择新恢复：比较本地 state.json 与 Redis 快照，采用较新者。
 // 无快照、快照无 savedAt、或本地不存在/不可读时，都会被判定为"本地优先/跳过快照"，
 // 同时打一条恢复来源日志。必须在 SyncToDir 之前调用（SyncToDir 只增删不入值）。
+// entryByKeyLocked 主索引查找（调用方须持 p.mu）；空键返回 nil。
+func (p *Pool) entryByKeyLocked(k auth.AccountKey) *entry {
+	if k == "" {
+		return nil
+	}
+	return p.byKey[k]
+}
+
+// entryByUIDLocked 是过渡期兼容入口：按上游 uid 查镜像索引（调用方须持 p.mu）。
+// uid 只是索引、不是身份；跨 provider 撞号时镜像只保留后进者。新代码一律用 AccountKey。
+func (p *Pool) entryByUIDLocked(uid string) *entry {
+	if uid == "" {
+		return nil
+	}
+	return p.byUID[uid]
+}
+
 // Acquire 为 uid 占一个在途名额（会话粘性命中后调用）；池上限内返回 true。
 // 名额用 entry.inFlight 原子自增，满额返回 false。上限按账号 realm 分档
 // （global 档 maxInFlightGlobal，P1-1；未设置回落 maxInFlight）。
 func (p *Pool) Acquire(uid string) bool {
 	p.mu.RLock()
-	e, ok := p.byUID[uid]
-	if !ok {
+	e := p.entryByUIDLocked(uid)
+	if e == nil {
 		p.mu.RUnlock()
 		return false
 	}
@@ -308,9 +332,9 @@ func (p *Pool) Acquire(uid string) bool {
 // Release 释放一个在途名额。幂等减到 0 为止（防重复释放扣成负数）。
 func (p *Pool) Release(uid string) {
 	p.mu.RLock()
-	e, ok := p.byUID[uid]
+	e := p.entryByUIDLocked(uid)
 	p.mu.RUnlock()
-	if !ok {
+	if e == nil {
 		return
 	}
 	for {
@@ -344,17 +368,29 @@ func (p *Pool) Add(a *auth.Auth) {
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	seen := make(map[string]bool, len(auths))
+	seen := make(map[auth.AccountKey]bool, len(auths))
 	for _, a := range auths {
-		seen[a.UID] = true
+		if a == nil {
+			continue
+		}
+		if key, _, err := a.EnsureKey(); err == nil && key != "" {
+			seen[key] = true
+		}
 		p.upsertLocked(a)
 	}
 	changed := false
-	for uid := range p.byUID {
-		if !seen[uid] {
-			delete(p.byUID, uid)
-			changed = true
+	for key, e := range p.byKey {
+		if seen[key] {
+			continue
 		}
+		// 只有 uid 索引仍指向本 key 时才清理，避免误删撞号后的新映射。
+		if e != nil && e.a != nil {
+			if cur := p.byUID[e.a.UID]; cur == e {
+				delete(p.byUID, e.a.UID)
+			}
+		}
+		delete(p.byKey, key)
+		changed = true
 	}
 	if changed {
 		p.saveLocked()
@@ -367,11 +403,14 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 func (p *Pool) Remove(uid string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok {
+	e := p.entryByUIDLocked(uid)
+	if e == nil {
 		return nil
 	}
 	delete(p.byUID, uid)
+	if e.key != "" {
+		delete(p.byKey, e.key)
+	}
 	p.dirty.Store(true)
 	p.saveLocked()
 	return e.a
@@ -380,11 +419,46 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 // upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。
 // 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
 func (p *Pool) upsertLocked(a *auth.Auth) {
-	if e, ok := p.byUID[a.UID]; ok {
-		e.a = a // 保留 credits/cooling 状态
+	if a == nil {
 		return
 	}
-	p.byUID[a.UID] = &entry{a: a}
+	key, _, err := a.EnsureKey()
+	if err != nil || key == "" {
+		log.Printf("WARN: pool: account %s ensure key failed: %v", a.UID, err)
+		return
+	}
+	e, ok := p.byKey[key]
+	if !ok {
+		// 迁移：state.json 旧条目以 uid 为键，这里把它归位到 AccountKey，
+		// 保留 credits / 冷却 / 熔断等历史状态（placeholder 凭证换成真实凭证）。
+		legacyKey := auth.AccountKey(a.UID)
+		if a.UID != "" && legacyKey != key {
+			if legacy := p.byKey[legacyKey]; legacy != nil {
+				delete(p.byKey, legacyKey)
+				legacy.key = key
+				legacy.a = a
+				p.byKey[key] = legacy
+				e, ok = legacy, true
+			}
+		}
+	}
+	if ok {
+		e.a = a // 保留 credits/cooling 状态
+	} else {
+		e = &entry{a: a, key: key}
+		p.byKey[key] = e
+	}
+	// uid 镜像：撞号时后进者覆盖并 WARN；同时清掉指向本 entry 的旧 uid。
+	if prev := p.byUID[a.UID]; prev != nil && prev != e && prev.key != "" && prev.key != key {
+		log.Printf("WARN: pool: uid %s 已映射到 key %s，现被 %s 覆盖（跨 provider 撞号？）",
+			a.UID, prev.key, key)
+	}
+	for uid, cur := range p.byUID {
+		if cur == e && uid != a.UID {
+			delete(p.byUID, uid)
+		}
+	}
+	p.byUID[a.UID] = e
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

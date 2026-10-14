@@ -329,21 +329,55 @@ func (p *Pool) AuthByUID(uid string) *auth.Auth {
 	return nil
 }
 
+// AuthByKey 按池内主键返回账号完整凭证（新代码入口；AuthByUID 是过渡兼容，uid 可能撞号）。
+func (p *Pool) AuthByKey(key auth.AccountKey) *auth.Auth {
+	if key == "" {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e := p.byKey[key]
+	if e == nil || e.a == nil {
+		return nil
+	}
+	return e.a
+}
+
+// StatusByKey 按池内主键查状态（新代码入口）。
+func (p *Pool) StatusByKey(key auth.AccountKey) (Status, bool) {
+	if key == "" {
+		return Status{}, false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e := p.byKey[key]
+	if e == nil {
+		return Status{}, false
+	}
+	uid := ""
+	if e.a != nil {
+		uid = e.a.UID
+	}
+	return p.statusOf(uid, e), true
+}
+
 // AvailableUIDs 返回当前 healthy 且未占满在途名额的账号 UID 列表（按 UID 排序，稳定输出）。
 // 供会话粘性路由（internal/session）做快路径命中校验 + 双段分配；无可用返回空切片。
 func (p *Pool) AvailableUIDs() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
-	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
+	uids := make([]string, 0, len(p.byKey))
+	for _, e := range p.byKey {
 		if !e.healthy(now) {
 			continue
 		}
 		if p.inFlightFull(e) {
 			continue
 		}
-		uids = append(uids, uid)
+		if e.a != nil {
+			uids = append(uids, e.a.UID)
+		}
 	}
 	sort.Strings(uids)
 	return uids
@@ -356,15 +390,17 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
-	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
+	uids := make([]string, 0, len(p.byKey))
+	for _, e := range p.byKey {
 		if !e.healthyForModel(now, model) {
 			continue
 		}
 		if p.inFlightFull(e) {
 			continue
 		}
-		uids = append(uids, uid)
+		if e.a != nil {
+			uids = append(uids, e.a.UID)
+		}
 	}
 	sort.Strings(uids)
 	return uids
@@ -466,7 +502,7 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
-	for _, e := range p.byUID {
+	for _, e := range p.byKey {
 		if realm != "" && e.a.Realm() != realm {
 			continue
 		}
@@ -505,7 +541,7 @@ func (p *Pool) ServableForRealm(realm string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
-	for _, e := range p.byUID {
+	for _, e := range p.byKey {
 		if realm != "" && e.a.Realm() != realm {
 			continue
 		}
@@ -526,21 +562,43 @@ func (p *Pool) ServableForRealm(realm string) bool {
 func (p *Pool) List() []Status {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	uids := make([]string, 0, len(p.byUID))
-	for uid := range p.byUID {
-		uids = append(uids, uid)
+	// 按主键遍历（而非 uid 镜像）：跨 provider 同 uid 的账号必须都出现。
+	entries := make([]*entry, 0, len(p.byKey))
+	for _, e := range p.byKey {
+		entries = append(entries, e)
 	}
-	sort.Strings(uids)
-	out := make([]Status, 0, len(uids))
-	for _, uid := range uids {
-		out = append(out, p.statusOf(uid, p.byUID[uid]))
+	sort.Slice(entries, func(i, j int) bool {
+		ui, uj := "", ""
+		if entries[i].a != nil {
+			ui = entries[i].a.UID
+		}
+		if entries[j].a != nil {
+			uj = entries[j].a.UID
+		}
+		if ui != uj {
+			return ui < uj
+		}
+		return entries[i].key < entries[j].key
+	})
+	out := make([]Status, 0, len(entries))
+	for _, e := range entries {
+		uid := ""
+		if e.a != nil {
+			uid = e.a.UID
+		}
+		out = append(out, p.statusOf(uid, e))
 	}
 	return out
 }
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
+	key := e.key
+	if key == "" && e.a != nil {
+		key = e.a.Key()
+	}
 	st := Status{
 		UID: uid,
+		Key: key,
 		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空，
 		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
