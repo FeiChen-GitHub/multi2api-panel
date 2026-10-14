@@ -68,3 +68,24 @@ func TestAvailableKeysSkipsPaused(t *testing.T) {
 		t.Fatalf("keys = %v, want only %s", keys, a.Key())
 	}
 }
+
+// 显式 provider 路由：选号只在指定 provider 内，tried 排完后返回 nil，绝不跨 provider 兜底。
+func TestPickExcludingForProviderRealmStaysWithinProvider(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	wb := mustParseAuth(t, `{"provider":"workbuddy","auth":{"accessToken":"wb"},"account":{"uid":"wb1"}}`)
+	tr := mustParseAuth(t, `{"provider":"trae","auth":{"accessToken":"tr"},"account":{"uid":"tr1"}}`)
+	p.Add(wb)
+	p.Add(tr)
+
+	for i := 0; i < 50; i++ {
+		got := p.PickExcludingForProviderRealm(nil, "", "", auth.ProviderTrae)
+		if got == nil || got.Provider() != auth.ProviderTrae {
+			t.Fatalf("pick = %+v, want a trae account", got)
+		}
+	}
+	got := p.PickExcludingForProviderRealm(map[auth.AccountKey]bool{tr.Key(): true}, "", "", auth.ProviderTrae)
+	if got != nil {
+		t.Fatalf("pick with tried trae = %+v, want nil（不跨 provider 兜底）", got)
+	}
+}
