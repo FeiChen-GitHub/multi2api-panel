@@ -498,8 +498,8 @@ func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 		Session:      sess,
 		SoftCooldown: time.Minute,
 	})
-	// 预绑定：sess.Bind("conv-1", "bad")，然后请求体带同 conversation_id。
-	sess.Bind("conv-1", bad.Key())
+	// 预绑定：sess.Bind("workbuddy|conv-1", "bad")，然后请求体带同 conversation_id。
+	sess.Bind("workbuddy|conv-1", bad.Key())
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -507,7 +507,7 @@ func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	// 绑定必须收敛到最终成功的 good。
-	if uid, ok := st.lastUID("conv-1"); !ok || uid != string(good.Key()) {
+	if uid, ok := st.lastUID("workbuddy|conv-1"); !ok || uid != string(good.Key()) {
 		t.Fatalf("sticky binding should follow final success to good, got %s ok=%v (binds=%v)", uid, ok, st.binds)
 	}
 }
@@ -526,14 +526,14 @@ func TestChatStickySuccessKeepsBinding(t *testing.T) {
 		return 200, sseOK, true
 	})
 	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
-	sess.Bind("conv-1", good.Key())
+	sess.Bind("workbuddy|conv-1", good.Key())
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	if uid, ok := st.lastUID("conv-1"); !ok || uid != string(good.Key()) {
+	if uid, ok := st.lastUID("workbuddy|conv-1"); !ok || uid != string(good.Key()) {
 		t.Fatalf("binding should stay good after success, got %s ok=%v", uid, ok)
 	}
 }
@@ -563,7 +563,7 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 		Session:      sess,
 		SoftCooldown: time.Minute,
 	})
-	sess.Bind("conv-1", bad.Key())
+	sess.Bind("workbuddy|conv-1", bad.Key())
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -571,7 +571,7 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	// 满载粘性号被解绑，绑定收敛到最终成功号 good。
-	if uid, ok := st.lastUID("conv-1"); !ok || uid != string(good.Key()) {
+	if uid, ok := st.lastUID("workbuddy|conv-1"); !ok || uid != string(good.Key()) {
 		t.Fatalf("sticky binding should fall back to good, got %s ok=%v (binds=%v)", uid, ok, st.binds)
 	}
 	p.Release("bad")

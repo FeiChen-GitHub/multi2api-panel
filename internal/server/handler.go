@@ -732,11 +732,22 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级——提取本身与粘性无关。
 	sessKey := session.ExtractKey(body)
+	// 粘性键带 provider 维度：绑定只记账号主键、不区分 provider，而 Trae 与
+	// WorkBuddy 的 realm 同为 cn —— 下方 sticky 校验的 realm 判据拦不住跨 provider
+	// 命中。同一会话从 wb:* 切到 trae:* 时会命中 WorkBuddy 号，拿 WB 的 token 去打
+	// Trae 端点 → 上游 401 → TraeClassify 判成 ErrSessionDead → 把 WorkBuddy 账号
+	// 永久禁用（需人工重登）。按 (provider, sessKey) 二维隔离后，两个 provider 各自
+	// 维持自己的会话亲和性，互不覆盖。
+	// chatMeta 一侧的会话聚合键仍用原始 sessKey（那是客户端对话维度，与 provider 无关）。
+	stickySessKey := sessKey
+	if sessKey != "" {
+		stickySessKey = string(provider) + "|" + sessKey
+	}
 	var stickyKey auth.AccountKey
 	if h.cfg.Session != nil && sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		if key, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
+		if key, ok := h.cfg.Session.ResolveForModel(stickySessKey, peek.Model); ok {
 			stickyKey = auth.AccountKey(key)
 		}
 	}
@@ -770,7 +781,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 	// 幂等：stickyKey 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyKey 才会非空。
 	unbindSticky := func() {
 		if stickyKey != "" {
-			h.cfg.Session.Unbind(sessKey)
+			h.cfg.Session.Unbind(stickySessKey)
 			stickyKey = ""
 		}
 	}
@@ -920,6 +931,13 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
 				// 本次回落普通轮换。
 				unbindSticky()
+				acct = nil
+			} else if acct.Provider() != provider {
+				// provider 不符：纵深防御。粘性键已带 provider 维度（见 stickySessKey），
+				// 正常读不到别的 provider 的绑定；但绑定号可能由外部 Store（Redis 快照）
+				// 回填，或将来键构造再漂移——照用会拿 A provider 的 token 打 B provider
+				// 端点，上游 401 被判成 ErrSessionDead 后**永久禁用那个无辜的账号**。
+				// 本次不走粘性，但保留绑定（切 provider 是临时行为，不该毁掉原绑定）。
 				acct = nil
 			}
 		}
@@ -1152,7 +1170,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 		if isTrae {
 			// Trae 成功路径（SOLO 原生流）：格式归一化与错误处置都在 serveTraeSuccess 内，
 			// 不落入下方 WorkBuddy 专属的 StreamHint / markup repair / 统计路径。
-			h.serveTraeSuccess(w, r, acct, rc, bareModel, peek.Stream, st, sessKey, chatChannel, proto)
+			h.serveTraeSuccess(w, r, acct, rc, bareModel, peek.Stream, st, stickySessKey, chatChannel, proto)
 			return
 		}
 		if peek.Stream {
@@ -1217,7 +1235,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 				h.cfg.Pool.NoteSuccess(acct.UID)
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 				if sessKey != "" && h.cfg.Session != nil {
-					h.cfg.Session.Bind(sessKey, acct.Key())
+					h.cfg.Session.Bind(stickySessKey, acct.Key())
 				}
 			default:
 				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
@@ -1229,7 +1247,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 				// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 				// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
 				if sessKey != "" && h.cfg.Session != nil {
-					h.cfg.Session.Bind(sessKey, acct.Key())
+					h.cfg.Session.Bind(stickySessKey, acct.Key())
 				}
 			}
 			credit, hasCredit := stats.Credit()
@@ -1314,7 +1332,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.Key())
+			h.cfg.Session.Bind(stickySessKey, acct.Key())
 		}
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if hasCredit {
