@@ -76,6 +76,18 @@ func (p *Pool) WeightedAvailableKeysForModelRealm(model, realm string) []string 
 // 这是多 provider 路由的选号入口：调用方（handler / session）拿到主键后，
 // 用 AuthByKey / PickByKey 系列取号，不再依赖上游 uid。
 func (p *Pool) AvailableKeysForProviderModelRealm(provider auth.Provider, model, realm string) []auth.AccountKey {
+	return p.availableKeysForProviderModelRealm(provider, model, realm, ChannelSOLO)
+}
+
+// AvailableKeysForProviderModelRealmChannel 同上，再叠一层通道维度（DESIGN §6.6
+// 第 ② ③ 点）：Work 请求只统计「Work 出口未冷却」的账号，SOLO 反之。
+// 调用方用它判断「某个 provider+realm+通道是否还有号」，避免 Work 请求被 SOLO
+// 侧的冷却误判成无号。
+func (p *Pool) AvailableKeysForProviderModelRealmChannel(provider auth.Provider, model, realm string, ch Channel) []auth.AccountKey {
+	return p.availableKeysForProviderModelRealm(provider, model, realm, ch)
+}
+
+func (p *Pool) availableKeysForProviderModelRealm(provider auth.Provider, model, realm string, ch Channel) []auth.AccountKey {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
@@ -90,11 +102,9 @@ func (p *Pool) AvailableKeysForProviderModelRealm(provider auth.Provider, model,
 		if realm != "" && e.a.Realm() != realm {
 			continue
 		}
-		if model == "" {
-			if !e.healthy(now) {
-				continue
-			}
-		} else if !e.healthyForModel(now, model) {
+		// healthyForChannel 已含模型级维度（model=="" 时该维度不生效），
+		// 与改前两分支等价（零回归）。
+		if !e.healthyForChannel(now, ch, model) {
 			continue
 		}
 		if p.inFlightFull(e) {

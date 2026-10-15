@@ -20,6 +20,16 @@ const (
 	CoolSoft                 // 429 → 短冷却
 )
 
+// Channel provider 内部的通道维度（DESIGN §6.6）。与 upstream.Channel 同形但
+// 独立定义：pool 不能被 upstream 反向依赖（upstream 已 import auth，再 import
+// pool 会成环）。字符串常量值与 upstream.Channel 一致，两层之间可直接转换。
+type Channel string
+
+const (
+	ChannelSOLO Channel = "solo"
+	ChannelWork Channel = "work"
+)
+
 func (k CoolKind) String() string {
 	switch k {
 	case CoolHard:
@@ -64,12 +74,12 @@ type Status struct {
 	UID string `json:"uid"`
 	// Key 池内主键（UUIDv4）：面板路由参数与跨 provider 唯一标识用。
 	// UID 仍是上游账号号（展示/日志/凭证文件名），两者可能在不同 provider 间重复。
-	Key          auth.AccountKey `json:"key"`
+	Key auth.AccountKey `json:"key"`
 	// Provider 账号所属上游（"workbuddy" / "trae"）：面板按 provider 展示与筛选。
-	Provider     auth.Provider   `json:"provider"`
-	Nickname     string `json:"nickname,omitempty"`
-	Credits      int64  `json:"credits"`
-	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	Provider     auth.Provider `json:"provider"`
+	Nickname     string        `json:"nickname,omitempty"`
+	Credits      int64         `json:"credits"`
+	CreditsTotal int64         `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
 	// CreditsExpiring / CreditsEarliestExpiry / CreditsEarliestRemaining 描述当前积分中
 	// 的到期压力。CreditsExpiring 是配置窗口内的剩余积分；后两者是全部未来到期批次中
 	// 最早的一批及其剩余量，供 WorkDaddy 同口径的“最早到期优先”路由使用。
@@ -88,26 +98,26 @@ type Status struct {
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
-	Realm           string     `json:"realm,omitempty"`
+	Realm string `json:"realm,omitempty"`
 	// Enterprise 企业版账号（auth.EnterpriseID 非空，计算值不落盘）。
 	// 企业版无个人成长体系（签到/成长任务/连登/旅行/夜猫子 上游均拒），
 	// 面板据此隐藏对应按钮；选号、保活、额度展示不受影响。
-	Enterprise      bool       `json:"enterprise,omitempty"`
-	Disabled        bool       `json:"disabled"`
-	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	Enterprise     bool   `json:"enterprise,omitempty"`
+	Disabled       bool   `json:"disabled"`
+	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	// Paused 暂停选号：退出选号候选（与 disabled 一样不参与选号），但**照常参与**
 	// 签到 / 活跃上报 / 保活 / 余额刷新四类保号任务。与 disabled 正交——disabled 是
 	// 「授权/session 终态，需人工 revive」，paused 是「运维临时让位」（多号轮换场景），
 	// 账号本身健康，只是暂不接流量。
-	Paused          bool       `json:"paused,omitempty"`
-	SuccessCount    int64      `json:"success_count,omitempty"`
-	ErrTotal        int64      `json:"err_total,omitempty"`
-	LastSuccessTime time.Time  `json:"last_success,omitempty"`
-	LastErrTime     time.Time  `json:"last_err,omitempty"`
+	Paused          bool      `json:"paused,omitempty"`
+	SuccessCount    int64     `json:"success_count,omitempty"`
+	ErrTotal        int64     `json:"err_total,omitempty"`
+	LastSuccessTime time.Time `json:"last_success,omitempty"`
+	LastErrTime     time.Time `json:"last_err,omitempty"`
 	// CheckinDone 本地今日已签到（签到成功或上游"今天已签到"幂等拒绝均算）。
 	// global 域账号无签到体系，恒为 false。面板签到按钮据此显示 签到/已签。
-	CheckinDone bool        `json:"checkin_done,omitempty"`
-	TokenUsage  TokenUsage  `json:"token_usage,omitempty"`
+	CheckinDone bool       `json:"checkin_done,omitempty"`
+	TokenUsage  TokenUsage `json:"token_usage,omitempty"`
 	// ModelCosts 每模型实测成本台账（P1-anti-monopoly 可观测性）：运维据此自查
 	//「为什么总选它」——tier 0（免费）垄断 / tier 2 单价排序一眼可见。
 	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
@@ -122,6 +132,12 @@ type Status struct {
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
+	// WorkCredits / WorkCooling / WorkUntil TRAE Work 通道的独立额度与冷却
+	// （DESIGN §6.6）。WorkBuddy 账号恒为零值（omit），Trae 账号据此在面板上
+	// 看到「SOLO 有额度但 Work 在冷却」这类分通道状态。
+	WorkCredits float64   `json:"work_credits,omitempty"`
+	WorkCooling bool      `json:"work_cooling,omitempty"`
+	WorkUntil   time.Time `json:"work_until,omitempty"`
 }
 
 // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
@@ -185,7 +201,7 @@ type modelCostEntry struct {
 	Samples   int
 }
 type entry struct {
-	a            *auth.Auth
+	a *auth.Auth
 	// key 池内主键（auth.AccountKey，UUIDv4）。与 a.Key() 一致，但 placeholder
 	// entry（由 state.json 恢复、尚无真实凭证）也有键，所以单独存一份便于删除/迁移。
 	key          auth.AccountKey
@@ -212,9 +228,9 @@ type entry struct {
 	// paused 暂停选号：与 disabled 正交。置位后退出选号候选（healthy 判否），
 	// 但保号任务遍历只按 Disabled 过滤，故 paused 号天然继续参与签到 / 活跃上报 /
 	// 保活 / 余额刷新。持久化（state.json），跨重启不丢。
-	paused         bool
-	reason         string
-	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
+	paused   bool
+	reason   string
+	lastUsed time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -261,6 +277,19 @@ type entry struct {
 	// 持久化（stateAccount.ModelCosts，P1-anti-monopoly）：重启后成本知识保留；
 	// 落盘/恢复按 modelCostTTL 惰性过滤，陈旧观测不复活。
 	modelCost map[string]modelCostEntry
+
+	// ---- TRAE Work 通道维度（DESIGN §6.6「一账号两出口」）----
+	// 同一个 Trae 账号的 SOLO 与 Work 是两条出口，各有自己的积分与冷却：
+	// SOLO 走 credits/until，Work 走 workCredits/workUntil。不做通道维度的话，
+	// SOLO 撞 1005 会把整个账号（含健康的 Work 出口）一起冷却。
+	// 仅在 provider == trae 时有效；wb 账号恒为零值（healthyForChannel 不受影响）。
+	// workCredits 是浮点（上游 cn_credits_remain_info.work_credits 是浮点秒数）。
+	// 持久化（stateAccount.WorkCredits / WorkUntil / WorkReason）：Work 冷却
+	// 跨重启不失忆，与 until 同口径。
+	workCredits float64
+	workUntil   time.Time
+	workReason  string
+
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
 }
@@ -348,6 +377,44 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	}
 	// 账号级冷却/熔断先判；若未冷却则由账号级健康决定。
 	return e.healthy(now)
+}
+
+// workCooling 报告该账号的 TRAE Work 通道是否正处于冷却中。
+// 与账号级 until 正交：SOLO 撞 1005 写的是 until，不该连带封掉 Work 出口。
+func (e *entry) workCooling(now time.Time) bool {
+	return !e.workUntil.IsZero() && now.Before(e.workUntil)
+}
+
+// healthyForChannel 报告账号在指定通道上是否可选（DESIGN §6.6 第 ③ 点）。
+//
+// 通道维度只加一层：Work 通道额外看 workUntil，SOLO（及 wb 恒 solo）看账号级
+// until——两者互不连坐。其余维度（禁用/暂停/熔断/连败降权/模型级冷却）对两条
+// 通道同样生效，那是账号身份层面的状态（channel 不进 AccountKey，§6.6 边界）。
+//
+// ch 为零值 / 非 ChannelWork 时等价于 healthyForModel（零回归）。
+func (e *entry) healthyForChannel(now time.Time, ch Channel, reqModel string) bool {
+	if e.disabled || e.paused {
+		return false
+	}
+	if e.modelCooled(now, reqModel) {
+		return false
+	}
+	if ch == ChannelWork {
+		// Work 通道：自己的冷却时间戳，且不受 SOLO 触发的账号级 until 影响。
+		if e.workCooling(now) {
+			return false
+		}
+	} else if !e.until.IsZero() && now.Before(e.until) {
+		// SOLO 通道：账号级冷却照常生效（SOLO 就是它触发的）。
+		return false
+	}
+	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+		return false
+	}
+	if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
+		return false
+	}
+	return true
 }
 
 // pruneExpiredModelCosts 删除 modelCost 中已过期的条目（惰性清理，与
@@ -438,10 +505,10 @@ type stateAccount struct {
 	SuccessCount int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
-	ErrTotal    int64      `json:"err_total,omitempty"`
-	ErrCount       int        `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
-	LastSuccess    time.Time  `json:"last_success,omitempty"`
-	LastErr        time.Time  `json:"last_err,omitempty"`
+	ErrTotal    int64     `json:"err_total,omitempty"`
+	ErrCount    int       `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
+	LastSuccess time.Time `json:"last_success,omitempty"`
+	LastErr     time.Time `json:"last_err,omitempty"`
 	// LastCheckinDay 最近一次签到成功的本地日期（entry.lastCheckinDay 同源）。
 	// 持久化以保留「当日已签」状态：签到后重启，面板按钮不回退成「签到」。
 	LastCheckinDay string     `json:"last_checkin_day,omitempty"`
@@ -483,6 +550,13 @@ type stateAccount struct {
 	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——
 	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/零 LastSeen 的结构破损条目）。
 	ModelCosts map[string]stateModelCost `json:"model_costs,omitempty"`
+	// WorkCredits / WorkUntil / WorkReason TRAE Work 通道的独立余额与冷却
+	// （DESIGN §6.6「一账号两出口」）。与 Credits / Until 正交：SOLO 与 Work 各
+	// 花各的额度、各冷各的出口。持久化同 until 口径——Work 冷却跨重启不失忆。
+	// 旧文件缺字段 → 零值（未探测、未冷却），不需要迁移。
+	WorkCredits float64    `json:"work_credits,omitempty"`
+	WorkUntil   *time.Time `json:"work_until,omitempty"`
+	WorkReason  string     `json:"work_reason,omitempty"`
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的模型级独立冷却持久化记录，与运行态

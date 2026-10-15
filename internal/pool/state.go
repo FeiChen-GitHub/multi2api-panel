@@ -92,6 +92,10 @@ func (p *Pool) Revive(uid string) bool {
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
+	// 解冻是全清：TRAE Work 通道的独立冷却一并解除（与账号级 until 同口径），
+	// 否则运维点"解冻"后 Work 出口仍被旧冷却挡着，看起来像没生效。
+	e.workUntil = time.Time{}
+	e.workReason = ""
 	p.dirty.Store(true)
 	return true
 }
@@ -658,6 +662,10 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		InFlight:                 int(e.inFlight.Load()),
 		BreakerFails:             e.fails,
 		BreakerUntil:             e.breakerUntil,
+		// TRAE Work 通道（DESIGN §6.6）：只给 Trae 账号填，wb 恒零值被 omit。
+		WorkCredits: e.workCredits,
+		WorkCooling: e.workCooling(now),
+		WorkUntil:   e.workUntil,
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。

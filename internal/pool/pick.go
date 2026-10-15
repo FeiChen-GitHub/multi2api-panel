@@ -15,50 +15,56 @@ import (
 // Pick 单一选号入口（无请求级轮换、无 realm 过滤，模型感知缺省账号级）。
 // 需要请求级轮换（tried）或分池（realm）时用 PickExcludingForRealm。
 func (p *Pool) Pick() *auth.Auth {
-	return p.pick(nil, "", "", "")
+	return p.pick(nil, "", "", "", ChannelSOLO)
 }
 
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
 // 挑选策略：healthy 账号中按权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
 func (p *Pool) PickExcluding(tried map[auth.AccountKey]bool) *auth.Auth {
-	return p.pick(tried, "", "", "")
+	return p.pick(tried, "", "", "", ChannelSOLO)
 }
 
 // PickExcludingForModel 模型感知选号：等同 PickExcluding，但对「6004 模型级冷却中的
 // 账号」进行模型豁免——请求模型与其 trigger 模型不同时视为可用（issue #31）。
 // reqModel 为空时即普通 PickExcluding（不影响既有调用语义）。
 func (p *Pool) PickExcludingForModel(tried map[auth.AccountKey]bool, reqModel string) *auth.Auth {
-	return p.pick(tried, reqModel, "", "")
+	return p.pick(tried, reqModel, "", "", ChannelSOLO)
 }
 
 // PickExcludingForRealm 模型感知 + 分池选号：候选集先按 Realm()==realm 过滤
 // （realm 空 = 不过滤，退化为 PickExcludingForModel），再按模型健康口径判定。
 // 供 handler 在 global/cn 双域下分流（global 模型请求只路由 global 账号）。
 func (p *Pool) PickExcludingForRealm(tried map[auth.AccountKey]bool, reqModel, realm string) *auth.Auth {
-	return p.pick(tried, reqModel, realm, "")
+	return p.pick(tried, reqModel, realm, "", ChannelSOLO)
 }
 
 // PickExcludingForProviderRealm 多 provider 版选号：在 realm 过滤之上再按
 // Provider()==provider 过滤，tried 按 AccountKey 排除。显式 provider 路由
 // （DESIGN §4）就用这个入口，绝不跨 provider 换号。
 func (p *Pool) PickExcludingForProviderRealm(tried map[auth.AccountKey]bool, reqModel, realm string, provider auth.Provider) *auth.Auth {
-	return p.pick(tried, reqModel, realm, provider)
+	return p.pick(tried, reqModel, realm, provider, ChannelSOLO)
+}
+
+// PickExcludingForProviderRealmChannel 在 provider/realm 过滤之上再带通道维度：
+// Trae 的 SOLO / Work 两条出口各有自己的冷却与余额（DESIGN §6.6），Work 请求不得
+// 被 SOLO 触发的账号级冷却挡住，反之亦然。ch 为零值时等价上一入口（零回归）。
+func (p *Pool) PickExcludingForProviderRealmChannel(tried map[auth.AccountKey]bool, reqModel, realm string, provider auth.Provider, ch Channel) *auth.Auth {
+	return p.pick(tried, reqModel, realm, provider, ch)
 }
 
 // pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
-func (p *Pool) pick(tried map[auth.AccountKey]bool, reqModel, realm string, provider auth.Provider) *auth.Auth {
+func (p *Pool) pick(tried map[auth.AccountKey]bool, reqModel, realm string, provider auth.Provider, ch Channel) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
 	providerOK := func(e *entry) bool { return provider == "" || e.a.Provider() == provider }
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
-	healthyOf := func(e *entry) bool { return providerOK(e) && realmOK(e) && e.healthy(now) }
-	if reqModel != "" {
-		healthyOf = func(e *entry) bool { return providerOK(e) && realmOK(e) && e.healthyForModel(now, reqModel) }
-	}
+	// 统一走 healthyForChannel：reqModel 为空时模型级维度自然不生效，ch 为
+	// 零值/SOLO 时通道维度退化为账号级 until —— 与改前逐分支等价（零回归）。
+	healthyOf := func(e *entry) bool { return providerOK(e) && realmOK(e) && e.healthyForChannel(now, ch, reqModel) }
 	// floorBlocked 积分保底拦截判定（实现在 floorBlockedForRealmModel，与粘性路径共用）：
 	// 触底 + 收费（本地实测台账 或 上游目录倍率）即拦；免费/未知倍率不受限。
 	floorBlocked := func(e *entry) bool { return p.floorBlockedForRealmModel(e, reqModel, realm, now) }
@@ -85,12 +91,12 @@ func (p *Pool) pick(tried map[auth.AccountKey]bool, reqModel, realm string, prov
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel, provider)
+		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel, provider, ch)
 	}
 	// provider 级策略（DESIGN §9.5）：Trae 用「余额最高优先」（trae2api PickExcluding 口径），
 	// WorkBuddy 保留现有加权随机 + 防惊群 + cost tier。
 	if provider == auth.ProviderTrae {
-		return p.pickHighestCreditsLocked(cands)
+		return p.pickTraeHighestCreditsLocked(cands, ch)
 	}
 	// top5 短名单按权重降序截断（而非 credits 单纯降序）：否则闲置补偿根本进不了
 	// 短名单决策，低 credits 但久置的账号会永远排不进 top5。
@@ -308,7 +314,7 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 // 这里，若兜底不看保底，触底号会被「捞回来」继续接收费模型——表现为同一条
 // floor WARN 反复刷同一个号（实测：credits=1 < floor=150 仍持续中选）。
 // 兜底是**最后一道**选号路径，保底在它之前挡不住就等于没挡。
-func (p *Pool) pickEarliestExpiryLocked(tried map[auth.AccountKey]bool, now time.Time, realm, model string, provider auth.Provider) *auth.Auth {
+func (p *Pool) pickEarliestExpiryLocked(tried map[auth.AccountKey]bool, now time.Time, realm, model string, provider auth.Provider, ch Channel) *auth.Auth {
 	var best *entry
 	for key, e := range p.byKey {
 		if tried != nil && tried[key] {
@@ -323,8 +329,14 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[auth.AccountKey]bool, now time
 		if e.disabled || e.paused {
 			continue // 禁用/暂停选号的账号永不参与兜底
 		}
-		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
-			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+		// 通道口径（与 healthyForChannel 同判据）：Work 看 workUntil，SOLO 看账号级
+		// until；硬冷却（余额耗尽）不参与兜底——调了必失败，等签到恢复才有意义。
+		if ch == ChannelWork {
+			if e.workCooling(now) {
+				continue
+			}
+		} else if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
+			continue
 		}
 		if p.floorBlockedForRealmModel(e, model, realm, now) {
 			continue // 积分保底：触底号不接收费模型（兜底路径同判据）
@@ -378,12 +390,25 @@ var minPickGap = 100 * time.Millisecond
 // credits 全 0 时仍按 idleWeight 加权（不退化均匀随机）。
 // 权重为浮点，用 int64 定点（×1e6）抽签可保持确定性随机源注入（randInt64N 语义不变）。
 // 随机源优先用 p.randInt64N（仅供测试注入确定性），nil 时回退 math/rand/v2 全局源。
-// pickHighestCreditsLocked Trae 的选号策略：候选集里取 credits 最高者，
-// 同分按 AccountKey 稳定排序（trae2api PickExcluding 口径）。调用方须持 p.mu。
-func (p *Pool) pickHighestCreditsLocked(cands []*entry) *auth.Auth {
+// pickTraeHighestCreditsLocked Trae 的选号策略（DESIGN §9.5）：候选集里取余额最高者。
+//   - SOLO 通道看 credits（ide_credits），Work 通道看 workCredits —— 两条通道各花
+//     各的额度，用错一个字段就会把 Work 请求派给没有 work 额度的号。
+//   - 同分按 AccountKey 稳定排序（trae2api PickExcluding / PickWorkExcluding 口径）。
+//
+// workCredits 未探测时全为 0：此时退化为按 key 取首个可用号，与 trae2api
+// 「若所有账号 work_credits 均为 0（如尚未探测），仍选首个健康账号以供探测与请求」
+// 同语义——不会因为没有探测数据就选不出号。
+// 调用方须持 p.mu。
+func (p *Pool) pickTraeHighestCreditsLocked(cands []*entry, ch Channel) *auth.Auth {
+	bal := func(e *entry) float64 {
+		if ch == ChannelWork {
+			return e.workCredits
+		}
+		return float64(e.credits)
+	}
 	best := cands[0]
 	for _, e := range cands[1:] {
-		if e.credits > best.credits || (e.credits == best.credits && e.key < best.key) {
+		if bal(e) > bal(best) || (bal(e) == bal(best) && e.key < best.key) {
 			best = e
 		}
 	}

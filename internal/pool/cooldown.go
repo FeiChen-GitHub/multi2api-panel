@@ -466,6 +466,59 @@ func (p *Pool) CooldownUntilTomorrow4AM(uid string, reason string) {
 	p.Cooldown(uid, CoolHard, nextDay4AM(now).Sub(now), reason)
 }
 
+// CooldownWorkUntilTomorrow4AM 只冷却账号的 TRAE Work 通道到次日 04:00，
+// 不动 SOLO 侧的账号级 until（DESIGN §6.6：两条通道分别记账）。
+// Work 出口自己撞 work_credits 不足时用它，SOLO 出口照常可用。
+func (p *Pool) CooldownWorkUntilTomorrow4AM(uid, reason string) {
+	now := time.Now()
+	p.CooldownWork(uid, nextDay4AM(now).Sub(now), reason)
+}
+
+// CooldownWork 冷却账号的 TRAE Work 通道至 now+d，不影响 SOLO 通道。
+func (p *Pool) CooldownWork(uid string, d time.Duration, reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.workUntil = time.Now().Add(d)
+		e.workReason = reason
+		p.dirty.Store(true)
+	}
+}
+
+// SetWorkCredits 更新账号 TRAE Work 通道余额（ProbeCredits 探测值）。
+// 余额回正即自动解冻 workUntil —— 与 trae2api 的 SetWorkCredits 同口径，
+// 解冻条件限定在「此前正是因余额不足冷却」的条目上，避免抹掉其他原因的冷却。
+func (p *Pool) SetWorkCredits(uid string, credits float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.workCredits = credits
+		if credits > 0 && e.workReason == traeWorkCreditReason {
+			e.workUntil = time.Time{}
+			e.workReason = ""
+		}
+		p.dirty.Store(true)
+	}
+}
+
+// traeWorkCreditReason Work 通道「余额不足」冷却的固定文案：SetWorkCredits 据此
+// 识别可自动解冻的冷却条目。字符串与 trae2api（pool.go + handler.go）保持一致，
+// 便于两边日志/state 对照。
+const traeWorkCreditReason = "work_credits 余额不足"
+
+// TraeWorkCreditReason 暴露该文案给上游侧（写冷却时用同一串，判定才成立）。
+func TraeWorkCreditReason() string { return traeWorkCreditReason }
+
+// WorkCredits 返回账号 TRAE Work 通道余额（未探测/非 Trae 账号为 0）。
+func (p *Pool) WorkCredits(uid string) float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.workCredits
+	}
+	return 0
+}
+
 // nextDay4AM 返回 now 之后最近的一个 04:00（与 now 同一时区）。
 // now 在当天 04:00 之前（凌晨 00:00~04:00）时返回当天 04:00——此时签到尚未执行，
 // 该窗内触发的硬冷却等当天签到即可恢复；返回次日会白冷约一天。

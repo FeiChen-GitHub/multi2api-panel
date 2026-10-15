@@ -193,6 +193,8 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		if s.DegradeUntil != nil && now.Before(*s.DegradeUntil) {
 			e.degradeUntil = *s.DegradeUntil
 		}
+		// TRAE Work 通道余额与冷却（DESIGN §6.6）：与 SOLO 侧正交恢复。
+		applyWorkChannelLocked(e, s, now)
 		// 模型级独立冷却（6004 重置墙钟 / 11102 负缓存）：惰性过滤已过期条目。
 		if len(s.ModelCooldowns) > 0 {
 			for m, mc := range s.ModelCooldowns {
@@ -222,6 +224,18 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		p.byKey[key] = e
 		p.byUID[uid] = e
 	}
+}
+
+// applyWorkChannelLocked 恢复 TRAE Work 通道的余额与冷却。单独成函数：只有未过期的
+// 冷却才复活（与 breakerUntil/degradeUntil 同口径），过期的冷却不写回内存。
+// 调用方必须已持有 p.mu。
+func applyWorkChannelLocked(e *entry, s stateAccount, now time.Time) {
+	e.workCredits = s.WorkCredits
+	if s.WorkUntil == nil || !now.Before(*s.WorkUntil) {
+		return
+	}
+	e.workUntil = *s.WorkUntil
+	e.workReason = s.WorkReason
 }
 
 // applySnapshotLocked 用 Redis 快照覆盖内存状态（已在择新判定后采用）。调用方必须已持有 p.mu。
@@ -334,6 +348,13 @@ func (p *Pool) stateOverviewLocked() stateFile {
 		if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
 			u := e.degradeUntil
 			s.DegradeUntil = &u
+		}
+		// TRAE Work 通道：余额直写，冷却仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
+		s.WorkCredits = e.workCredits
+		if !e.workUntil.IsZero() && now.Before(e.workUntil) {
+			u := e.workUntil
+			s.WorkUntil = &u
+			s.WorkReason = e.workReason
 		}
 		// 模型级独立冷却：惰性过滤已过期条目（Hits 不落盘，重启后 11102 退避从基数重学）。
 		if len(e.modelCooldowns) > 0 {
