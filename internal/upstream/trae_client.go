@@ -153,6 +153,34 @@ func TraeClassify(status int, body string) ErrKind {
 	return ErrNone
 }
 
+// TraeWorkClassify 判定 Work 通道的失败形态（DESIGN §15.5 D8）。
+//
+// Work 与 SOLO 共用 HTTP 状态码语义，但另有自己的失败形态，不能套 SOLO 的分类：
+//   - 400 + credit/1005/4008 文案：work_credits 余额不足 → 硬冷却（该通道额度耗尽，
+//     等次日额度刷新；SOLO 出口不受影响）。
+//   - 流内 / 响应体 code 4001 / 4000105：原生任务参数或配置错误 → 客户端错误
+//     （trae2api 据此判定 native 失败；本项目 native-only，只能报给调用方）。
+//   - 401/403：session 失效 → 禁用（Work 与 SOLO 共用凭证，所以是账号级禁用）。
+//   - 429：限流 → 软冷却。
+//
+// 其余状态码回落到 TraeClassify（共用部分不重复实现）。
+func TraeWorkClassify(status int, body string) ErrKind {
+	if strings.Contains(body, "1005") || strings.Contains(body, "4008") ||
+		strings.Contains(body, "credit") {
+		return ErrHardCredit
+	}
+	if strings.Contains(body, `"code":4001`) || strings.Contains(body, `"code":4000105`) {
+		return ErrClient
+	}
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return ErrSessionDead
+	case status == http.StatusTooManyRequests:
+		return ErrSoftRate
+	}
+	return TraeClassify(status, body)
+}
+
 // ChatStream 发 llm_utils_chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 TraeClassify）、err 为 nil；
 // 只有传输层失败才返回 err。ch 目前只影响日志/后续 Work 通道分流，SOLO 走同一端点。

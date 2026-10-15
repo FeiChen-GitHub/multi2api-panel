@@ -532,6 +532,27 @@ func (s *Scheduler) checkinWorkBuddy(st pool.Status, a *auth.Auth, expiringSoon 
 	s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
 }
 
+// probeTraeWorkCredits 探测并刷新账号的 Work 通道额度（DESIGN §6.6 ProbeCredits）。
+// 探测失败只记日志——**不写 0**：探测失败不等于余额为 0，写 0 会把健康号按
+// 「work_credits 不足」冷却掉。只有明确探测到 0 才冷却该通道。
+func (s *Scheduler) probeTraeWorkCredits(a *auth.Auth, uid string) {
+	tc, ok := s.clientFor(auth.ProviderTrae).(*upstream.TraeClient)
+	if !ok || tc == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	snap, err := tc.ProbeCredits(ctx, a)
+	if err != nil {
+		log.Printf("work balance %s: %v", logfmt.Label(uid, a.Nickname), err)
+		return
+	}
+	s.cfg.Pool.SetWorkCredits(uid, snap.WorkCredits)
+	if snap.WorkCredits <= 0 {
+		s.cfg.Pool.CooldownWorkUntilTomorrow4AM(uid, pool.TraeWorkCreditReason())
+	}
+}
+
 // checkinTrae 单账号 Trae 签到 + 额度刷新（phase 1 只支持 cn）。
 // 签到拥挤（9074）是可重试的，不是账号故障：只记日志、不罚号。
 func (s *Scheduler) checkinTrae(st pool.Status, a *auth.Auth) {
@@ -710,6 +731,9 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 				}
 				s.cfg.Pool.ReenableIfCredits(uid, remain, total)
 				s.cfg.Pool.SetCredits(uid, remain, total)
+				// Work 通道额度走独立探测（ProbeCredits）：不刷它的话 work_credits
+				// 恒为 0，Work 选号退化成「取 key 最小者」，且余额恢复后无法自动解冻。
+				s.probeTraeWorkCredits(a, uid)
 				return
 			}
 			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)

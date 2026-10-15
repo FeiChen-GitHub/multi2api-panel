@@ -141,6 +141,17 @@ func (h *Handler) clientFor(provider auth.Provider) upstream.ChatClient {
 	return upstream.NewWBClient(h.cfg.Upstream)
 }
 
+// toPoolChannel 把 upstream.Channel 转成 pool.Channel（DESIGN §6.6）。
+// 两个包同形但独立定义（pool 不能被 upstream 反向依赖，否则成环），这里做显式
+// 转换而不是靠字符串零值巧合——只认 ChannelWork，其余（含零值）一律按 SOLO，
+// 保证 wb 与既有调用点行为不变。
+func toPoolChannel(ch upstream.Channel) pool.Channel {
+	if ch == upstream.ChannelWork {
+		return pool.ChannelWork
+	}
+	return pool.ChannelSOLO
+}
+
 func NewHandler(cfg Config) *Handler {
 	if cfg.MaxRotate <= 0 {
 		cfg.MaxRotate = 3
@@ -842,7 +853,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
-			acct = h.cfg.Pool.PickExcludingForProviderRealm(tried, bareModel, realm, provider)
+			// 带通道维度：Trae 的 Work 请求不被 SOLO 触发的账号级冷却挡住（DESIGN §6.6）。
+			acct = h.cfg.Pool.PickExcludingForProviderRealmChannel(tried, bareModel, realm, provider, toPoolChannel(chatChannel))
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -947,7 +959,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if uerr != nil {
 				kind = uerr.Kind
 			} else {
-				kind = h.classifyFor(provider, status, string(respBody))
+				kind = h.classifyForChannel(provider, chatChannel, status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			}
 			// Trae：SOLO 撞权益/配额不足（1005/4008）→ 同一账号降级到 Work 通道重试一次
@@ -1046,7 +1058,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
-			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+			h.applyErrorPolicyFor(acct.UID, kind, string(respBody), bareModel, uerr, chatChannel)
 			fail(acct.Key())
 			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：
 			// 该次 WAF 403 喂入 IP 级状态机，若激活（短窗多号命中，IP 被拦而非账号）
@@ -1067,7 +1079,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if isTrae {
 			// Trae 成功路径（SOLO 原生流）：格式归一化与错误处置都在 serveTraeSuccess 内，
 			// 不落入下方 WorkBuddy 专属的 StreamHint / markup repair / 统计路径。
-			h.serveTraeSuccess(w, r, acct, rc, bareModel, peek.Stream, st, sessKey)
+			h.serveTraeSuccess(w, r, acct, rc, bareModel, peek.Stream, st, sessKey, chatChannel)
 			return
 		}
 		if peek.Stream {
@@ -1438,6 +1450,18 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 // 携带的模型名。uerr 是 ChatStreamContext 返回的分类信封（可携带 RetryAfter）；
 // 零值/防御路径下为 nil，冷却时长回落既有计算。
 func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string, uerr *upstream.Error) {
+	h.applyErrorPolicyFor(uid, kind, body, model, uerr, upstream.ChannelSOLO)
+}
+
+// applyErrorPolicyFor 按通道维度落实错误策略（DESIGN §6.6 第 ③ 点）。
+// 只有一处与账号级不同：Trae Work 通道的 ErrHardCredit（work_credits 不足）只冷
+// Work 出口（workUntil），不冷账号级 until —— SOLO 出口没撞限额，不该被连坐。
+// 其余形态两条通道共用凭证与身份，一律按账号级处置（零回归）。
+func (h *Handler) applyErrorPolicyFor(uid string, kind upstream.ErrKind, body, model string, uerr *upstream.Error, ch upstream.Channel) {
+	if kind == upstream.ErrHardCredit && ch == upstream.ChannelWork {
+		h.cfg.Pool.CooldownWorkUntilTomorrow4AM(uid, pool.TraeWorkCreditReason())
+		return
+	}
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
