@@ -583,7 +583,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 路由协议解析（DESIGN §3.1）：model 名可带 "[provider:][realm:]" 前缀。
 	// 剥出 provider + realm + bareModel；bareModel 用于选号/粘性/出站 body 重写
 	// （前缀是网关侧路由协议，上游只认裸名）。过渡期裸名 → (workbuddy, cn, 原串)。
-	provider, realm, bareModel := resolveModel(peek.Model)
+	provider, realm, bareModel, rmErr := resolveModel(peek.Model)
+	if rmErr != nil {
+		// provider 必填（DESIGN §3.1）：缺前缀/未知 provider 一律 400，
+		// 不再有「未知前缀整体当裸名」的兜底。
+		st := newChatStat(time.Now(), body, peek.Stream)
+		st.status = http.StatusBadRequest
+		st.done()
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", rmErr.Error())
+		return
+	}
 	upClient := h.clientFor(provider)
 	isTrae := provider == auth.ProviderTrae
 	if upClient == nil {

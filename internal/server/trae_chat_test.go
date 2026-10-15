@@ -137,7 +137,7 @@ func TestChatBareModelStillRoutesWorkBuddy(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+		strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}

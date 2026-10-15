@@ -56,7 +56,7 @@ func TestStatusCreditFloorZeroOff(t *testing.T) {
 // 真正证明拦截落在选号层的是**对照断言**：对照组（不开 floor）必须能选到 poor，
 // 实验组（开 floor）必须在同一条件下选不到号。
 func TestCreditFloorBlocksPaidRequest(t *testing.T) {
-	const body = `{"model":"paid-model","messages":[{"role":"user","content":"hi"}]}`
+	const body = `{"model":"wb:paid-model","messages":[{"role":"user","content":"hi"}]}`
 	// 对照组：不设 floor，其余逐字相同（同一触底号、同一 tier 2 观测）。
 	ctlPool := testPoolWith(&auth.Auth{UID: "poor", AccessToken: "at", ExpiresAt: 9999999999})
 	ctlPool.SetCredits("poor", 30, 0)

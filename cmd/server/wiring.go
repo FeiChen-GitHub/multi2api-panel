@@ -18,7 +18,10 @@ import (
 // 权重细节，已有绑定的快路径仍直接返回原账号，不做迁移。
 func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
 	return func(model string) []string {
-		_, realm, bare := server.ResolveModel(model)
+		_, realm, bare, err := server.ResolveModel(model)
+		if err != nil {
+			return nil // provider 必填：解析失败视为无可用账号（粘性走普通轮换）
+		}
 		// 返回池内主键（AccountKey）：会话粘性绑定以主键为准（uid 跨 provider 可撞）。
 		return p.WeightedAvailableKeysForModelRealm(bare, realm)
 	}

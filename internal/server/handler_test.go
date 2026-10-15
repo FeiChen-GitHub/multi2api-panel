@@ -125,7 +125,7 @@ func TestChatLargeBodyNoGatewayLimit(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
 	pad := strings.Repeat("a", 4<<20) // 4MB 合法 JSON 字符串值
-	body := []byte(`{"model":"glm-5.2","messages":[],"pad":"` + pad + `"}`)
+	body := []byte(`{"model":"wb:glm-5.2","messages":[],"pad":"` + pad + `"}`)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
 	if rec.Code != http.StatusOK {
@@ -153,7 +153,7 @@ func TestChatBadParamsFailsFastWithoutPenalty(t *testing.T) {
 	p.SetCredits("good", 1000, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`)))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("code=%d body=%s (want 400: request-level error must not be retried on other accounts)", rec.Code, rec.Body)
 	}
@@ -176,7 +176,7 @@ func TestChatBadParams400CarriesUpstreamBody(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`)))
 	if rec.Code != 400 {
 		t.Fatalf("code=%d body=%s (want 400)", rec.Code, rec.Body)
 	}
@@ -200,7 +200,7 @@ func TestChatNonStreamAggregates(t *testing.T) {
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up,
 	})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -238,7 +238,7 @@ func TestChatStreamPassthrough(t *testing.T) {
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up,
 	})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -282,9 +282,9 @@ func TestChatRecordsCreditForStreamAndSync(t *testing.T) {
 				Upstream: up,
 				Usage:    rec,
 			})
-			body := `{"model":"glm-5.2","messages":[]}`
+			body := `{"model":"wb:glm-5.2","messages":[]}`
 			if stream {
-				body = `{"model":"glm-5.2","stream":true,"messages":[]}`
+				body = `{"model":"wb:glm-5.2","stream":true,"messages":[]}`
 			}
 			recorder := httptest.NewRecorder()
 			h.ServeHTTP(recorder, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
@@ -320,7 +320,7 @@ func TestChatRotatesOnHardCredit(t *testing.T) {
 	p.SetCredits("bad", 2000, 0)
 	p.SetCredits("good", 1000, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -366,7 +366,7 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: soft})
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`)))
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
@@ -385,7 +385,7 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	// 冷却生效：同一账号在冷却期内不得再被选中。
 	before := calls["Bearer at-bad"]
 	rec2 := httptest.NewRecorder()
-	h.ServeHTTP(rec2, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	h.ServeHTTP(rec2, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`)))
 	if rec2.Code != 200 {
 		t.Fatalf("second code=%d body=%s", rec2.Code, rec2.Body)
 	}
@@ -461,7 +461,7 @@ func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 SoftCooldown
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`)))
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
@@ -500,7 +500,7 @@ func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 	})
 	// 预绑定：sess.Bind("conv-1", "bad")，然后请求体带同 conversation_id。
 	sess.Bind("conv-1", bad.Key())
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -527,7 +527,7 @@ func TestChatStickySuccessKeepsBinding(t *testing.T) {
 	})
 	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
 	sess.Bind("conv-1", good.Key())
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -564,7 +564,7 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 		SoftCooldown: time.Minute,
 	})
 	sess.Bind("conv-1", bad.Key())
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -591,7 +591,7 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 	p.SetCredits("bad", 2000, 0) // bad 积分高，确定性源 → 先被选中
 	p.SetCredits("good", 1000, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -634,7 +634,7 @@ func TestChat429Code14018UsesHardCreditCooldown(t *testing.T) {
 	p.SetCredits("good", 1000, 1000)
 	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -674,7 +674,7 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	// 隔离对 breaker 的干扰：熔断阈值默认 3，一次失败不触发。
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.3","messages":[]}`))
+		strings.NewReader(`{"model":"wb:glm-5.3","messages":[]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -725,7 +725,7 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.3","messages":[]}`)))
+		strings.NewReader(`{"model":"wb:glm-5.3","messages":[]}`)))
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
@@ -750,7 +750,7 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up,
 	})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 503 {
@@ -769,7 +769,7 @@ func TestChatSessionDeadDisables(t *testing.T) {
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 503 {
@@ -793,7 +793,7 @@ func TestChatTransportErrorDoesNotPenalize(t *testing.T) {
 	// 传输错误不喂熔断计数：一次 transport error 不应累计 errTotal 也不应熔断。
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`)))
 	if rec.Code != 503 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
@@ -812,7 +812,7 @@ func TestChatHTTP5xxPenalizes(t *testing.T) {
 	})
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`)))
 	if rec.Code != 503 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
@@ -829,7 +829,7 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 	})
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`)))
 	if rec.Code != 503 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
@@ -1373,7 +1373,7 @@ func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"原始指纹"},{"role":"user","content":"hi"}]}`))
+		strings.NewReader(`{"model":"wb:glm-5.2","stream":true,"messages":[{"role":"system","content":"原始指纹"},{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -1407,7 +1407,7 @@ func TestContentBlockedStickyDegraded(t *testing.T) {
 	// 首请求触发降级 → 200。
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"x"},{"role":"user","content":"hi"}]}`)))
+		strings.NewReader(`{"model":"wb:glm-5.2","stream":true,"messages":[{"role":"system","content":"x"},{"role":"user","content":"hi"}]}`)))
 	if rec.Code != 200 {
 		t.Fatalf("first req code=%d", rec.Code)
 	}
@@ -1431,7 +1431,7 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"system","content":"old"},{"role":"user","content":"hi"}]}`)))
+		strings.NewReader(`{"model":"wb:glm-5.2","messages":[{"role":"system","content":"old"},{"role":"user","content":"hi"}]}`)))
 	// custom 模式下仍拦 → 400 content_blocked（内容终态，换号无意义），不降级重试。
 	if rec.Code != 400 {
 		t.Fatalf("code=%d want 400 content_blocked (custom does not degrade)", rec.Code)
@@ -1472,7 +1472,7 @@ func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+		strings.NewReader(`{"model":"wb:glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
 
 	st, _ := p.Status("u1")
 	if st.Cooling || st.Disabled || st.ErrTotal != 0 {
@@ -1509,7 +1509,7 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 
 	// user 消息含 Claude Code 指纹句（PR39 的 fixture 串，逐字精确指纹）。
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
-		"model":"glm-5.2",
+		"model":"wb:glm-5.2",
 		"stream":true,
 		"messages":[
 			{"role":"system","content":"You are Claude Code, Anthropic's official CLI for Claude."},
@@ -1616,7 +1616,7 @@ func TestChatNonStreamRepairsMarkupToolCalls(t *testing.T) {
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up,
 	})
-	reqBody := `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],` + declaredToolsBody + `}`
+	reqBody := `{"model":"wb:glm-5.2","messages":[{"role":"user","content":"hi"}],` + declaredToolsBody + `}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(reqBody)))
 	if rec.Code != 200 {
@@ -1665,7 +1665,7 @@ func TestChatStreamRepairsMarkupToolCalls(t *testing.T) {
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up,
 	})
-	reqBody := `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}],` + declaredToolsBody + `}`
+	reqBody := `{"model":"wb:glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}],` + declaredToolsBody + `}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(reqBody)))
 	if rec.Code != 200 {
@@ -1749,7 +1749,7 @@ func TestChatRepairsMarkupWithoutDeclaredTools(t *testing.T) {
 	})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+		strings.NewReader(`{"model":"wb:glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
@@ -1788,7 +1788,7 @@ func TestChatMarkupRepairRejectsNonIdentifierToolName(t *testing.T) {
 	})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+		strings.NewReader(`{"model":"wb:glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
@@ -1816,7 +1816,7 @@ func TestChatMarkupRepairStrictModeRejectsUndeclaredTool(t *testing.T) {
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up,
 	})
-	reqBody := `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],` + declaredToolsBody + `}`
+	reqBody := `{"model":"wb:glm-5.2","messages":[{"role":"user","content":"hi"}],` + declaredToolsBody + `}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(reqBody)))
 	if rec.Code != 200 {

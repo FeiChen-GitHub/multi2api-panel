@@ -123,7 +123,7 @@ func TestRequestMetricsRecordsStream(t *testing.T) {
 	})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+		strings.NewReader(`{"model":"wb:glm-5.2","stream":true,"messages":[]}`))
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
@@ -136,7 +136,7 @@ func TestRequestMetricsRecordsStream(t *testing.T) {
 		t.Fatalf("metrics = %+v", s)
 	}
 	e := s.Recent[0]
-	if e.Outcome != reqlog.OutcomeSuccess || e.Status != http.StatusOK || !e.OK || e.Model != "glm-5.2" || e.TotalTokens != 2 || e.Attempts != 1 {
+	if e.Outcome != reqlog.OutcomeSuccess || e.Status != http.StatusOK || !e.OK || e.Model != "wb:glm-5.2" || e.TotalTokens != 2 || e.Attempts != 1 {
 		t.Fatalf("event = %+v", e)
 	}
 }
@@ -154,7 +154,7 @@ func TestRequestMetricsCapturesClientInfo(t *testing.T) {
 		RecordClientInfo: true,
 	})
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+		strings.NewReader(`{"model":"wb:glm-5.2","stream":true,"messages":[]}`))
 	req.Header.Set("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
 	req.Header.Set("User-Agent", "python-requests/2.31.0")
 	rec := httptest.NewRecorder()
@@ -186,7 +186,7 @@ func TestRequestMetricsClientInfoDisabled(t *testing.T) {
 		RequestLog: reqLog,
 	})
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+		strings.NewReader(`{"model":"wb:glm-5.2","stream":true,"messages":[]}`))
 	req.Header.Set("X-Forwarded-For", "203.0.113.7")
 	req.Header.Set("User-Agent", "python-requests/2.31.0")
 	h.ServeHTTP(httptest.NewRecorder(), req)
@@ -197,7 +197,7 @@ func TestRequestMetricsClientInfoDisabled(t *testing.T) {
 	if s.Recent[0].ClientIP != "" || s.Recent[0].UserAgent != "" {
 		t.Fatalf("client info recorded while disabled: %+v", s.Recent[0])
 	}
-	if s.Recent[0].Model != "glm-5.2" {
+	if s.Recent[0].Model != "wb:glm-5.2" {
 		t.Errorf("model = %q, metrics should be unaffected", s.Recent[0].Model)
 	}
 }
@@ -248,7 +248,7 @@ func TestRequestMetricsDetectsStreamErrorFrame(t *testing.T) {
 	})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`)))
+		strings.NewReader(`{"model":"wb:glm-5.2","stream":true,"messages":[]}`)))
 	s := reqLog.Snapshot()
 	if len(s.Recent) != 1 || s.Recent[0].Outcome != reqlog.OutcomeStreamError || s.Recent[0].OK {
 		t.Fatalf("stream error metrics = %+v", s.Recent)
@@ -401,7 +401,7 @@ func TestChatLogsStreamRow(t *testing.T) {
 	})
 	out := captureStdout(t, func() {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","stream":true,"messages":[]}`))
 		h.ServeHTTP(rec, req)
 		if rec.Code != 200 {
 			t.Fatalf("code=%d", rec.Code)
@@ -428,7 +428,7 @@ func TestChatLogsSyncRowTTFBDash(t *testing.T) {
 	})
 	out := captureStdout(t, func() {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`))
 		h.ServeHTTP(rec, req)
 		if rec.Code != 200 {
 			t.Fatalf("code=%d", rec.Code)
@@ -450,7 +450,7 @@ func TestChatLogsErrorRow(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	out := captureStdout(t, func() {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`))
 		h.ServeHTTP(rec, req)
 		if rec.Code != 503 {
 			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
