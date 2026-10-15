@@ -509,8 +509,11 @@ func (h *Handler) modelList() []map[string]any {
 // 返回的 acct 供调用方在同一账号上取富 ModelInfo（FetchGlobalModelInfos 与
 // FetchGlobalModels 共享缓存，不会触发第二次上游探测）。
 // GlobalEnabled=false 时 modelList 已不进入本分支（逃生门在调用方 gate）。
+//
+// 选号显式带 ProviderWorkBuddy：global 端点属 WorkBuddy 专有，不过滤 provider 时
+// 一旦池里出现 realm=global 的 Trae 号就会拿 Trae token 打 WorkBuddy 端点。
 func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
-	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
+	acct := h.cfg.Pool.PickExcludingForProviderRealm(nil, "", "global", auth.ProviderWorkBuddy)
 	if acct == nil {
 		return nil, nil
 	}
@@ -519,7 +522,7 @@ func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
 
 // fetchDynamicModels 从第一个可用 CN 账号拉模型列表（含 contextWindow/maxTokens），
 // 缓存 10min。
-// 选号与 /panel/api/models 完全同口径（AvailableUIDsForRealm("cn") 首个 + AuthByUID），
+// 选号与 /panel/api/models 完全同口径（按 provider + realm 过滤后取首个可用号），
 // 而非 Pool.Pick()：Pick 无 realm 过滤，混合池里可能选中 global 号去打 CN 端点，
 // 表现为偶发失败/面板与 /v1/models 两套目录（PR #38 报告并给出的选号修复）。
 // 缓存 + 5min 负缓存按既有语义**保留**（#38 原案整体删除缓存被拒）：公开端点逐请求
@@ -540,11 +543,14 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
-	uids := h.cfg.Pool.AvailableUIDsForRealm("cn")
-	if len(uids) == 0 {
+	// 选号显式带 ProviderWorkBuddy：AvailableUIDsForRealm("cn") 不过滤 provider，
+	// 而 Trae 账号 Realm() 也是 cn —— 纯 Trae 池会选中 Trae 号去打 WorkBuddy 端点，
+	// 上游回 401 且此处静默失败，只污染 5min 负缓存（混池时连累正常的 CN 分支）。
+	keys := h.cfg.Pool.AvailableKeysForProviderModelRealm(auth.ProviderWorkBuddy, "", "cn")
+	if len(keys) == 0 {
 		return nil
 	}
-	acct := h.cfg.Pool.AuthByUID(uids[0])
+	acct := h.cfg.Pool.AuthByKey(keys[0])
 	if acct == nil {
 		return nil
 	}

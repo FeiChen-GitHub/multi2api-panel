@@ -37,8 +37,11 @@ docs/
 
 # Windows binaries
 /wb2api.exe
+/signin_bin.exe
 /login.exe
 /credit.exe
+# 覆盖正在运行的 exe 时 go build 把旧映像改名留下的备份（Windows 上无法直接删除）
+*.exe~
 
 # 本地验证工具（判据逆向过程脚本，结论沉淀于 data/desktop-task-protocol.md）
 /cmd/desktopverify*/

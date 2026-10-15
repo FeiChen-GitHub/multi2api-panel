@@ -639,9 +639,13 @@ async function loadModels() {
       $('mdNote').textContent = '上游未返回模型';
       return;
     }
-    // 探测键带域前缀（cn:glm-5.2），模型表显示裸名，按「精确命中或 :后缀」关联。
+    /* 探测键带域前缀（cn:glm-5.2），模型 id 现在带 provider 前缀（wb:glm-5.2 /
+       trae:glm-5.2），两者前缀体系不同 —— 一律取最后一段裸名再按「:后缀」关联。 */
     const probeKeys = Object.keys(mdProbes);
-    mdProbeOf = id => mdProbes[id] || mdProbes[probeKeys.find(k => k.endsWith(':' + id))];
+    mdProbeOf = id => {
+      const bare = String(id || '').split(':').pop();
+      return mdProbes[id] || mdProbes[probeKeys.find(k => k.endsWith(':' + bare))];
+    };
     const hit = mdAll.filter(m => mdProbeOf(m.id)).length;
     $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
     renderModels();
@@ -680,7 +684,10 @@ function mdMatch(m, f) {
       if (!text.includes(kw)) return false;
     }
   }
-  if (f.realm && !String(m.id || '').startsWith(f.realm + ':')) return false;
+  /* 来源筛选按后端透出的 provider + realm 两个显式字段判定，不再解析 id 前缀：
+     id 前缀是 wb: / wb:global: / trae: 三态，用 "wb:" 做 startsWith 会把
+     wb:global: 也一起匹配进来。 */
+  if (f.realm && (String(m.provider || '') + ':' + String(m.realm || '')) !== f.realm) return false;
   if (f.cap === 'tool' && !m.supports_tool_call) return false;
   if (f.cap === 'vision' && !m.supports_images) return false;
   if (f.cap === 'reasoning' && !m.supports_reasoning) return false;
@@ -714,9 +721,14 @@ function mdRowHtml(m, pr) {
   const eff = (m.supported_efforts || []).slice();
   if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
   const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
-    : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
-  // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
+    : '<span style="color:var(--ink-3);font-size:12.5px">' +
+      // Trae 上游（get_detail_param）不披露档位与倍率：显示"未披露"而不是冒充"不支持思考"。
+      (m.provider === 'trae' ? '上游未披露'
+        : (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考')) + '</span>';
+  // 能力徽标：来源 / 默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
   const caps = [];
+  if (m.provider === 'trae') caps.push('<span class="realm-tag">Trae</span>');
+  else if (m.realm === 'global') caps.push('<span class="realm-tag">国际版</span>');
   if (m.is_default) caps.push('<span class="tag ok">默认</span>');
   if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
   if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');

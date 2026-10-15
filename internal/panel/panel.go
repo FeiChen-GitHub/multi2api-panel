@@ -11,6 +11,7 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -337,42 +338,70 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
 // 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
-// 与 /v1/models 同口径的双域输出：CN 域模型加 "cn:" 前缀、global 域加 "global:" 前缀
-// （gateway 路由协议，前端显示的 id 就是调用时要填的完整 model 值）。
-// 各域独立探测、独立容错：某域无可用账号则整域跳过；两域全空时才报错
+//
+// 三段输出，各段**按 provider 分流选号**——与 /v1/models 同口径：
+//   - WorkBuddy CN     → "wb:"        + EffortListing("cn")
+//   - WorkBuddy Global → "wb:global:" + EffortListing("global")
+//   - Trae             → "trae:"      （上游只给 ID/名称/上下文，无档位无倍率）
+//
+// id 前缀必须与 /v1/models 一致：resolveModel 要求 provider 前缀，前端显示的 id
+// 就是调用时要填的完整 model 值（早先的 "cn:" / "global:" 不是合法网关模型名）。
+//
+// 各段独立探测、独立容错：某段无可用账号则整段跳过；三段全空时才报错
 // （有错误明细回 502，一个账号都没有回 503）。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
 	var fetchErrs []string
 
-	// CN 域：有可用 CN 账号才查（此前无条件 Pool.Pick()+FetchModels——选中 global
-	// 账号时打 CN 端点必然失败，混合池表现为偶发 502，纯 global 池必炸）。
-	if uids := p.cfg.Pool.AvailableUIDsForRealm("cn"); len(uids) > 0 {
-		if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
+	// WorkBuddy CN 域：显式过滤 provider=workbuddy（此前用 AvailableUIDsForRealm("cn")，
+	// 不过滤 provider，而 Trae 账号 Realm() 也是 cn —— 纯 Trae 池会选中 Trae 号，
+	// 再拿它的 access token 去打 WorkBuddy 的 /console/enterprises/personal/models，
+	// 上游 nginx 直接甩 401 HTML 页）。
+	if keys := p.cfg.Pool.AvailableKeysForProviderModelRealm(auth.ProviderWorkBuddy, "", "cn"); len(keys) > 0 {
+		if acct := p.cfg.Pool.AuthByKey(keys[0]); acct != nil {
 			infos, err := p.cfg.Upstream.FetchModels(acct)
 			if err != nil {
 				fetchErrs = append(fetchErrs, "cn: "+err.Error())
 			} else {
 				for _, mi := range infos {
-					out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
+					out = append(out, panelModelEntry("wb", "cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
 				}
 			}
 		}
 	}
 
-	// global 域：路由开关开且有可用 global 账号才查（独立目录端点，FetchGlobalModelInfos；
-	// Upstream.GlobalEnabled 是探测侧同一道闸，与 main 装配的 config global.enabled 一致）。
+	// WorkBuddy global 域：路由开关开且有可用 global 账号才查（独立目录端点，
+	// FetchGlobalModelInfos；Upstream.GlobalEnabled 是探测侧同一道闸，与 main 装配的
+	// config global.enabled 一致）。同样显式过滤 provider。
 	if p.cfg.Upstream.GlobalEnabled {
-		if uids := p.cfg.Pool.AvailableUIDsForRealm("global"); len(uids) > 0 {
-			if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
+		if keys := p.cfg.Pool.AvailableKeysForProviderModelRealm(auth.ProviderWorkBuddy, "", "global"); len(keys) > 0 {
+			if acct := p.cfg.Pool.AuthByKey(keys[0]); acct != nil {
 				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
 				if len(infos) == 0 {
 					fetchErrs = append(fetchErrs, "global: 上游未返回可用模型")
 				} else {
 					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
 					for _, mi := range infos {
-						out = append(out, panelModelEntry("global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
+						out = append(out, panelModelEntry("wb:global", "global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
 					}
+				}
+			}
+		}
+	}
+
+	// Trae 域：走 ChatClient.FetchModels（ModelLister），与 /v1/models 的 Trae 分支
+	// 完全同口径（含 10s 超时）。池里没有可用 Trae 账号则整段跳过。
+	if keys := p.cfg.Pool.AvailableKeysForProviderModelRealm(auth.ProviderTrae, "", "cn"); len(keys) > 0 {
+		if acct := p.cfg.Pool.AuthByKey(keys[0]); acct != nil {
+			if ml, ok := p.clientFor(auth.ProviderTrae).(upstream.ModelLister); ok {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				infos, err := ml.FetchModels(ctx, acct)
+				cancel()
+				if err != nil {
+					fetchErrs = append(fetchErrs, "trae: "+err.Error())
+				}
+				for _, mi := range infos {
+					out = append(out, panelTraeModelEntry(mi))
 				}
 			}
 		}
@@ -389,12 +418,18 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }
 
-// panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），
+// panelModelEntry 构造单个 WorkBuddy 模型条目（CN / global 两域共用）：
+// idPrefix 是 /v1/models 的 provider 前缀（"wb" / "wb:global"），realm 是档位查找域
+// ——两者必须分开传：id 前缀服务于网关路由，realm 服务于 effort 表查找，
+// 同名模型在两域档位不同，混用会把 CN 档位套到 global 模型上。
 // context_length / max_output_tokens 走四级查找链，effort 档位按 realm 域取
 // EffortListing（远端权威 ∪ 静态兜底表）——与 /v1/models 同一口径，两侧不再漂移。
-func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string, remoteDefault string, httpc *http.Client) map[string]any {
+// provider / realm 一并透出，供前端按「来源」筛选（不再靠解析 id 前缀）。
+func panelModelEntry(idPrefix, realm string, mi upstream.ModelInfo, remoteEfforts []string, remoteDefault string, httpc *http.Client) map[string]any {
 	entry := map[string]any{
-		"id":                   realm + ":" + mi.ID,
+		"id":                   idPrefix + ":" + mi.ID,
+		"provider":             string(auth.ProviderWorkBuddy),
+		"realm":                realm,
 		"name":                 mi.Name,
 		"default_effort":       mi.DefaultEffort,
 		"supported_efforts":    mi.Efforts,
@@ -435,6 +470,27 @@ func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string
 		if def != "" {
 			entry["default_effort"] = def
 		}
+	}
+	return entry
+}
+
+// panelTraeModelEntry 构造单个 Trae 模型条目。
+//
+// 刻意不复用 panelModelEntry：那个函数内部走 EffortListing → staticEffortCap →
+// 按模型名查 CN 兜底表，而 glm-5.2 / kimi-k3 / DeepSeek-V4-Flash 等在两个上游
+// 同名，套上去等于把 WorkBuddy 的档位张冠李戴到 Trae 模型上（编数据）。
+// Trae 的 get_detail_param 只回 ID / 展示名 / 上下文，因此倍率、能力旗标、档位
+// 一律留空——前端据此显示"上游未披露"，而不是冒充"不支持思考"。
+func panelTraeModelEntry(mi upstream.ModelInfo) map[string]any {
+	entry := map[string]any{
+		"id":       "trae:" + mi.ID,
+		"provider": string(auth.ProviderTrae),
+		"realm":    "cn",
+		"name":     mi.Name,
+		"channel":  string(upstream.TraeChannelForModel(mi.ID)),
+	}
+	if mi.ContextWindow > 0 {
+		entry["context_length"] = mi.ContextWindow
 	}
 	return entry
 }
@@ -598,6 +654,13 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	uid := a.UID
+	// provider 分发（DESIGN §11.1）：Trae 的额度走 ChatClient.QueryCredits。
+	// 此前不分流 → 拿 Trae 的 token 打 WorkBuddy 的 user-resource 端点 → 401，
+	// 与 accountCheckin 早已做对的分流不一致（签到能刷、刷新余额却报 401）。
+	if a.Provider() == auth.ProviderTrae {
+		p.balanceTrae(w, a)
+		return
+	}
 	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
@@ -711,9 +774,17 @@ func (p *Panel) syncNicknames() {
 		if st.Disabled {
 			continue
 		}
-		if a := p.cfg.Pool.AuthByUID(st.UID); a != nil && a.AccessTokenValue() != "" {
-			jobs = append(jobs, job{uid: st.UID, a: a})
+		a := p.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.AccessTokenValue() == "" {
+			continue
 		}
+		// 昵称同步打的是 WorkBuddy 的 account profile 端点；Trae 上游没有对应接口，
+		// 打过去只会 401（且本函数对单号失败静默计数，不显形）。Trae 号的昵称在
+		// 登录回调 / 导入时已经落盘，无需同步。
+		if a.Provider() != auth.ProviderWorkBuddy {
+			continue
+		}
+		jobs = append(jobs, job{uid: st.UID, a: a})
 	}
 	if len(jobs) == 0 {
 		return
@@ -862,6 +933,13 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 			a := p.cfg.Pool.AuthByUID(s.UID)
 			if a == nil {
 				it.Error = "account not loaded"
+				out[i] = it
+				return
+			}
+			// 积分包构成是 WorkBuddy 专属端点（Trae 上游没有对应接口）：Trae 号不打
+			// 上游、直接标注，否则会拿它的 token 打 WB 端点拿到 401 并显示成故障。
+			if a.Provider() != auth.ProviderWorkBuddy {
+				it.Error = "该来源不支持积分包构成（仅 WorkBuddy 账号）"
 				out[i] = it
 				return
 			}

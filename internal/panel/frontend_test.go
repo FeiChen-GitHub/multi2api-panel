@@ -334,17 +334,25 @@ if (start < 0 || end < 0) throw new Error('model filter helpers not found');
 const ctx = { Number, String, Array, Object, isFinite, parseFloat };
 vm.createContext(ctx);
 vm.runInContext(src.slice(start, end) + '\nthis.mdMatch=mdMatch; this.mdSortList=mdSortList; this.mdRateValue=mdRateValue;', ctx);
+// 模型条目的 id 前缀是 provider 前缀（wb: / wb:global: / trae:），与 /v1/models
+// 同口径；provider / realm 两个显式字段供筛选使用（不再解析 id 前缀——"wb:" 的
+// startsWith 会把 "wb:global:" 一起卷进来，见 wbGlobal 断言）。
+// Trae 条目刻意不带档位/倍率/能力旗标：上游 get_detail_param 不披露这些，
+// 不能拿 WorkBuddy 同名模型的静态兜底表去套（trae 断言钉住这条边界）。
 const models = [
-  { id: 'cn:glm-5.2', name: 'GLM-5.2', vendor: 'Zhipu', tags: ['视觉'], supports_tool_call: true, supports_images: true, supports_reasoning: true, can_disable_thinking: true, supported_efforts: ['high', 'xhigh'], default_effort: 'high', is_default: false, credits: '0.79', promo_factor: 0.5, promo_credits: '0.40', promo_label: '夜间折扣', context_length: 1000000, max_output_tokens: 131000 },
-  { id: 'cn:hy3', name: 'Hy3', supports_tool_call: true, supports_images: true, supports_reasoning: true, can_disable_thinking: false, supported_efforts: ['low', 'high'], default_effort: 'high', is_default: false, credits: '0', promo_factor: 0, promo_credits: '0', promo_label: '限时免费', context_length: 192000, max_output_tokens: 64000 },
-  { id: 'global:hy3', name: 'Hy3 Global', supports_tool_call: false, supports_images: false, supports_reasoning: false, supported_efforts: [], is_default: false, credits: '0.11', context_length: 1000000, max_output_tokens: 393000 },
-  { id: 'cn:auto', name: 'Auto', supports_tool_call: true, supports_images: true, supports_reasoning: true, is_default: true, credits: null, context_length: 256000, max_output_tokens: 32000 },
+  { id: 'wb:glm-5.2', provider: 'workbuddy', realm: 'cn', name: 'GLM-5.2', vendor: 'Zhipu', tags: ['视觉'], supports_tool_call: true, supports_images: true, supports_reasoning: true, can_disable_thinking: true, supported_efforts: ['high', 'xhigh'], default_effort: 'high', is_default: false, credits: '0.79', promo_factor: 0.5, promo_credits: '0.40', promo_label: '夜间折扣', context_length: 1000000, max_output_tokens: 131000 },
+  { id: 'wb:hy3', provider: 'workbuddy', realm: 'cn', name: 'Hy3', supports_tool_call: true, supports_images: true, supports_reasoning: true, can_disable_thinking: false, supported_efforts: ['low', 'high'], default_effort: 'high', is_default: false, credits: '0', promo_factor: 0, promo_credits: '0', promo_label: '限时免费', context_length: 192000, max_output_tokens: 64000 },
+  { id: 'wb:global:hy3', provider: 'workbuddy', realm: 'global', name: 'Hy3 Global', supports_tool_call: false, supports_images: false, supports_reasoning: false, supported_efforts: [], is_default: false, credits: '0.11', context_length: 1000000, max_output_tokens: 393000 },
+  { id: 'wb:auto', provider: 'workbuddy', realm: 'cn', name: 'Auto', supports_tool_call: true, supports_images: true, supports_reasoning: true, is_default: true, credits: null, context_length: 256000, max_output_tokens: 32000 },
+  { id: 'trae:glm-5.2', provider: 'trae', realm: 'cn', name: 'GLM-5.2 (Trae)', context_length: 131072 },
 ];
 const ids = list => list.map(m => m.id);
 const filter = f => ids(ctx.mdSortList(models.filter(m => ctx.mdMatch(m, f)), f));
 process.stdout.write(JSON.stringify({
   all: ids(models),
-  realm: filter({ realm: 'cn' }),
+  wbCn: filter({ realm: 'workbuddy:cn' }),
+  wbGlobal: filter({ realm: 'workbuddy:global' }),
+  trae: filter({ realm: 'trae:cn' }),
   tool: filter({ cap: 'tool' }),
   vision: filter({ cap: 'vision' }),
   reasoning: filter({ cap: 'reasoning' }),
@@ -375,23 +383,25 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("model filter node test failed: %v\n%s", err, out)
 	}
-	const want = `{"all":["cn:glm-5.2","cn:hy3","global:hy3","cn:auto"],` +
-		`"realm":["cn:glm-5.2","cn:hy3","cn:auto"],` +
-		`"tool":["cn:glm-5.2","cn:hy3","cn:auto"],` +
-		`"vision":["cn:glm-5.2","cn:hy3","cn:auto"],` +
-		`"reasoning":["cn:glm-5.2","cn:hy3","cn:auto"],` +
-		`"isDefault":["cn:auto"],` +
-		`"effortOff":["cn:glm-5.2"],` +
-		`"effortLow":["cn:hy3"],` +
-		`"free":["cn:hy3"],` +
-		`"promo":["cn:glm-5.2","cn:hy3"],` +
-		`"discount":["cn:glm-5.2"],` +
-		`"q":["cn:glm-5.2"],` +
+	const want = `{"all":["wb:glm-5.2","wb:hy3","wb:global:hy3","wb:auto","trae:glm-5.2"],` +
+		`"wbCn":["wb:glm-5.2","wb:hy3","wb:auto"],` +
+		`"wbGlobal":["wb:global:hy3"],` +
+		`"trae":["trae:glm-5.2"],` +
+		`"tool":["wb:glm-5.2","wb:hy3","wb:auto"],` +
+		`"vision":["wb:glm-5.2","wb:hy3","wb:auto"],` +
+		`"reasoning":["wb:glm-5.2","wb:hy3","wb:auto"],` +
+		`"isDefault":["wb:auto"],` +
+		`"effortOff":["wb:glm-5.2"],` +
+		`"effortLow":["wb:hy3"],` +
+		`"free":["wb:hy3"],` +
+		`"promo":["wb:glm-5.2","wb:hy3"],` +
+		`"discount":["wb:glm-5.2"],` +
+		`"q":["wb:glm-5.2"],` +
 		`"qMiss":[],` +
-		`"sortRate":["cn:hy3","global:hy3","cn:glm-5.2","cn:auto"],` +
-		`"sortContext":["cn:glm-5.2","global:hy3","cn:auto","cn:hy3"],` +
-		`"sortOutput":["global:hy3","cn:glm-5.2","cn:hy3","cn:auto"],` +
-		`"sortName":["cn:auto","cn:glm-5.2","cn:hy3","global:hy3"],` +
+		`"sortRate":["wb:hy3","wb:global:hy3","wb:glm-5.2","wb:auto","trae:glm-5.2"],` +
+		`"sortContext":["wb:glm-5.2","wb:global:hy3","wb:auto","wb:hy3","trae:glm-5.2"],` +
+		`"sortOutput":["wb:global:hy3","wb:glm-5.2","wb:hy3","wb:auto","trae:glm-5.2"],` +
+		`"sortName":["trae:glm-5.2","wb:auto","wb:glm-5.2","wb:global:hy3","wb:hy3"],` +
 		`"rateFree":0,"rateMissing":null}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("model filter=%s\nwant %s", out, want)

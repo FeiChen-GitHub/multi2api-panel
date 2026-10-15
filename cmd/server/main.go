@@ -432,8 +432,11 @@ func warmModelRates(ctx context.Context, up *upstream.Client, p *pool.Pool) {
 		return
 	}
 	// CN：有可用 CN 账号才拉（与面板 models 同口径，避免无谓上游调用）。
-	if uids := p.AvailableUIDsForRealm("cn"); len(uids) > 0 {
-		if a := p.AuthByUID(uids[0]); a != nil {
+	// 选号必须带 ProviderWorkBuddy：AvailableUIDsForRealm 不过滤 provider，而 Trae
+	// 账号 Realm() 也是 cn —— 纯 Trae 池会拿 Trae 的 token 打 WorkBuddy 端点 →
+	// 401（启动日志表现为 "warm model rates (cn): models api status 401"）。
+	if keys := p.AvailableKeysForProviderModelRealm(auth.ProviderWorkBuddy, "", "cn"); len(keys) > 0 {
+		if a := p.AuthByKey(keys[0]); a != nil {
 			if _, err := up.FetchModels(a); err != nil {
 				log.Printf("WARN: [upstream] warm model rates (cn): %v", err)
 			} else {
@@ -443,8 +446,8 @@ func warmModelRates(ctx context.Context, up *upstream.Client, p *pool.Pool) {
 	}
 	// global：独立目录端点（workbuddy.ai），倍率按 "global" 域键存储。
 	if up.GlobalEnabled && ctx.Err() == nil {
-		if uids := p.AvailableUIDsForRealm("global"); len(uids) > 0 {
-			if a := p.AuthByUID(uids[0]); a != nil {
+		if keys := p.AvailableKeysForProviderModelRealm(auth.ProviderWorkBuddy, "", "global"); len(keys) > 0 {
+			if a := p.AuthByKey(keys[0]); a != nil {
 				// FetchGlobalModelInfos 无错误返回（内部负缓存自行节流），
 				// 仅按结果条数判断是否拿到目录。
 				if infos := up.FetchGlobalModelInfos(a); len(infos) == 0 {

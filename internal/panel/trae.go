@@ -60,6 +60,27 @@ func (p *Panel) importTrae(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "provider": "trae"})
 }
 
+// balanceTrae 单号 Trae 余额刷新：只查额度，不签到、不触碰冷却状态
+// （与 WorkBuddy 的 accountBalance 同语义）。
+func (p *Panel) balanceTrae(w http.ResponseWriter, a *auth.Auth) {
+	client := p.clientFor(auth.ProviderTrae)
+	if client == nil {
+		writeErr(w, http.StatusServiceUnavailable, "Trae provider 未接入或未启用")
+		return
+	}
+	remain, total, err := client.QueryCredits(context.Background(), a)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "trae query credits: "+err.Error())
+		return
+	}
+	p.cfg.Pool.ReenableIfCredits(a.UID, remain, total)
+	p.cfg.Pool.SetCredits(a.UID, remain, total)
+	log.Printf("panel: trae balance uid=%s credits=%d/%d", a.UID, remain, total)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "credits": remain, "credits_total": total, "provider": string(auth.ProviderTrae),
+	})
+}
+
 // clientFor 返回处理该 provider 的上游客户端。注入了 Dispatcher 就按 provider 取，
 // 返回 nil = 该 provider 未接入/未启用（调用方必须显式报错，绝不回落 WorkBuddy）；
 // 未注入 Dispatcher（测试/裸用）时只有 WorkBuddy 可用。
