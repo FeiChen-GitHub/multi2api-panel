@@ -222,6 +222,17 @@ func (a *Auth) Provider() Provider {
 // 供 LoadDir 判断是否需要迁移；业务判定一律用 Provider()。
 func (a *Auth) ProviderStored() Provider { return a.provider }
 
+// SetProvider 显式写入 provider（导入路径用：把外部凭证文件标记为本项目的 provider）。
+// 只改内存，不落盘；调用方 SaveAtomic 负责持久化。
+func SetProvider(a *Auth, p Provider) {
+	if a == nil || p == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.provider = p
+}
+
 // Key 返回池内主键（UUIDv4）。尚未生成时返回空串——生成由 EnsureKey / LoadDir /
 // 登录导入路径负责，Parse 保持只读。
 // key 会被 EnsureKey 写入，故加锁（与 Realm() 同理）。
