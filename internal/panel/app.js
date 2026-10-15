@@ -423,7 +423,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.provider === 'trae' ? ' <span class="realm-tag">Trae</span>' : '') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -442,7 +442,7 @@ function renderAccounts(list) {
         (s.enterprise ? '' :
           '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
-        (s.enterprise ? '' :
+        (s.enterprise || s.provider === 'trae' ? '' :
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
@@ -1197,6 +1197,32 @@ $('importFile').onchange = async () => {
     $('importErr').textContent = '导入失败：' + e.message;
   }
   $('importFile').value = '';
+};
+
+// 导入 Trae 凭证（trae2api 导出格式，单账号）：POST /panel/api/import/trae，body 为原始 JSON。
+$('btnImportTrae').onclick = async () => {
+  const raw = ($('traeAuthJson').value || '').trim();
+  $('traeImportDone').hidden = true; $('traeImportErr').hidden = true;
+  if (!raw) {
+    $('traeImportErr').hidden = false;
+    $('traeImportErr').textContent = '请先粘贴 Trae 凭证 JSON';
+    return;
+  }
+  const h = { 'Content-Type': 'application/json' };
+  const k = localStorage.getItem(LS_KEY);
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  try {
+    const r = await fetch('/panel/api/import/trae', { method: 'POST', body: raw, headers: h });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || d.message || ('HTTP ' + r.status));
+    $('traeImportDone').hidden = false;
+    $('traeImportDone').textContent = '已导入 Trae 账号：' + (d.uid || '');
+    $('traeAuthJson').value = '';
+    loadOverview(true);
+  } catch (e) {
+    $('traeImportErr').hidden = false;
+    $('traeImportErr').textContent = '导入失败：' + e.message;
+  }
 };
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */

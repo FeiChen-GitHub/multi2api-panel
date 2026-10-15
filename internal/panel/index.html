@@ -1226,6 +1226,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <input type="file" id="importFile" accept=".json" style="margin-bottom:8px">
         <div id="importDone" class="state ok" hidden></div>
         <div id="importErr" class="state err" hidden></div>
+        <div class="hint" style="margin:14px 0 8px">粘贴 Trae 凭证 JSON（trae2api 导出格式，单账号），导入为 trae 账号（当前仅 cn）。</div>
+        <textarea id="traeAuthJson" rows="6" style="width:100%;margin-bottom:8px" placeholder='{"auth":{"accessToken":"...","refreshToken":"...","apiHost":"https://api.trae.com.cn","machineId":"...","deviceId":"..."},"account":{"uid":"...","nickname":"..."}}'></textarea>
+        <button id="btnImportTrae" class="primary">导入 Trae 账号</button>
+        <div id="traeImportDone" class="state ok" hidden></div>
+        <div id="traeImportErr" class="state err" hidden></div>
       </div>
     </div>
     <footer>
