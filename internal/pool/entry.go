@@ -65,6 +65,8 @@ type Status struct {
 	// Key 池内主键（UUIDv4）：面板路由参数与跨 provider 唯一标识用。
 	// UID 仍是上游账号号（展示/日志/凭证文件名），两者可能在不同 provider 间重复。
 	Key          auth.AccountKey `json:"key"`
+	// Provider 账号所属上游（"workbuddy" / "trae"）：面板按 provider 展示与筛选。
+	Provider     auth.Provider   `json:"provider"`
 	Nickname     string `json:"nickname,omitempty"`
 	Credits      int64  `json:"credits"`
 	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）

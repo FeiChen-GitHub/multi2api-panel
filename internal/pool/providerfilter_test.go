@@ -89,3 +89,24 @@ func TestPickExcludingForProviderRealmStaysWithinProvider(t *testing.T) {
 		t.Fatalf("pick with tried trae = %+v, want nil（不跨 provider 兜底）", got)
 	}
 }
+
+// Trae 的选号策略是「余额最高优先」（DESIGN §9.5），不受加权随机影响。
+func TestPickForTraeUsesHighestCredits(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	// 反向随机源：若走加权路径会选中最后一个候选；最高余额策略应忽略它。
+	p.SetRandomSource(func(n int64) int64 { return n - 1 })
+	lo := mustParseAuth(t, `{"provider":"trae","auth":{"accessToken":"a"},"account":{"uid":"lo"}}`)
+	hi := mustParseAuth(t, `{"provider":"trae","auth":{"accessToken":"b"},"account":{"uid":"hi"}}`)
+	p.Add(lo)
+	p.Add(hi)
+	p.SetCredits("lo", 100, 0)
+	p.SetCredits("hi", 500, 0)
+
+	for i := 0; i < 20; i++ {
+		got := p.PickExcludingForProviderRealm(nil, "", "", auth.ProviderTrae)
+		if got == nil || got.UID != "hi" {
+			t.Fatalf("pick = %+v, want hi（余额最高优先）", got)
+		}
+	}
+}

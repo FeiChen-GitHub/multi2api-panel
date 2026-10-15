@@ -87,6 +87,11 @@ func (p *Pool) pick(tried map[auth.AccountKey]bool, reqModel, realm string, prov
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
 		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel, provider)
 	}
+	// provider 级策略（DESIGN §9.5）：Trae 用「余额最高优先」（trae2api PickExcluding 口径），
+	// WorkBuddy 保留现有加权随机 + 防惊群 + cost tier。
+	if provider == auth.ProviderTrae {
+		return p.pickHighestCreditsLocked(cands)
+	}
 	// top5 短名单按权重降序截断（而非 credits 单纯降序）：否则闲置补偿根本进不了
 	// 短名单决策，低 credits 但久置的账号会永远排不进 top5。
 	// maxCredits 统一用**全集口径**（tier 过滤前的全部 healthy 候选）：截断排序与
@@ -373,6 +378,21 @@ var minPickGap = 100 * time.Millisecond
 // credits 全 0 时仍按 idleWeight 加权（不退化均匀随机）。
 // 权重为浮点，用 int64 定点（×1e6）抽签可保持确定性随机源注入（randInt64N 语义不变）。
 // 随机源优先用 p.randInt64N（仅供测试注入确定性），nil 时回退 math/rand/v2 全局源。
+// pickHighestCreditsLocked Trae 的选号策略：候选集里取 credits 最高者，
+// 同分按 AccountKey 稳定排序（trae2api PickExcluding 口径）。调用方须持 p.mu。
+func (p *Pool) pickHighestCreditsLocked(cands []*entry) *auth.Auth {
+	best := cands[0]
+	for _, e := range cands[1:] {
+		if e.credits > best.credits || (e.credits == best.credits && e.key < best.key) {
+			best = e
+		}
+	}
+	best.lastUsed = time.Now()
+	p.pickSeq++
+	best.usedSeq = p.pickSeq
+	return best.a
+}
+
 func (p *Pool) pickWeighted(cands []*entry) *entry {
 	now := time.Now()
 	var maxCredits int64
