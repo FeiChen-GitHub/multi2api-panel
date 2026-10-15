@@ -1198,6 +1198,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="tabs" id="addTabs">
         <button class="tab on" data-tab="login">浏览器登录</button>
         <button class="tab" data-tab="import">导入 JSON</button>
+        <button class="tab" data-tab="trae">Trae 登录</button>
       </div>
     </header>
     <div class="body">
@@ -1231,6 +1232,21 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <button id="btnImportTrae" class="primary">导入 Trae 账号</button>
         <div id="traeImportDone" class="state ok" hidden></div>
         <div id="traeImportErr" class="state err" hidden></div>
+      </div>
+      <!-- Trae 网页登录 -->
+      <div id="addTabTrae" class="tab-panel" hidden>
+        <div class="hint" style="margin-bottom:8px">在浏览器打开登录链接，登录成功后 Trae 会跳回本机回调地址，网关自动落盘并载入账号。</div>
+        <div class="hint" style="margin-bottom:8px">回调端口：<input id="traeCbPort" value="18080" size="6" style="width:auto">（需与服务端 trae.callback_port 一致）</div>
+        <button id="btnTraeLogin" class="primary">获取 Trae 登录链接</button>
+        <button id="btnTraeOpen" class="primary" hidden>在浏览器打开</button>
+        <div id="traeReady" hidden>
+          <div class="state" style="margin-top:8px">在浏览器打开以下链接并登录：</div>
+          <div class="url" id="traeUrl"></div>
+          <div class="state" id="traePoll"><span class="dots">等待登录回调，自动检测中</span></div>
+        </div>
+        <div id="traeDone" class="state ok" hidden></div>
+        <div id="traeErr" class="state err" hidden></div>
+        <div class="hint" style="margin:14px 0 8px">若回调端口不通（容器/远程部署），可改用「导入 JSON」粘贴 Trae 凭证。</div>
       </div>
     </div>
     <footer>

@@ -138,11 +138,13 @@ func main() {
 	// 都会明确报“未启用”，不会把 Trae 请求误发给 WorkBuddy。
 	var traeClient upstream.ChatClient
 	traeWorkDisabled := false
+	traeApiHost := ""
 	if cfg.ProviderEnabled("trae") {
 		tc := upstream.NewTraeClient()
 		if pcfg, ok := cfg.Upstream.Providers["trae"]; ok {
 			if pcfg.ApiHost != "" {
 				tc.OAuthHost = pcfg.ApiHost
+				traeApiHost = pcfg.ApiHost
 			}
 			if pcfg.WorkEnabled != nil && !*pcfg.WorkEnabled {
 				traeWorkDisabled = true
@@ -297,6 +299,8 @@ func main() {
 		StickyCount: sessCount,
 		Version:     appVersion,
 		Live:        live,
+		// Trae 网页登录的 OAuth host 覆盖（面板落盘凭证前换 token / 查账号信息用）。
+		TraeApiHost: traeApiHost,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -372,6 +376,30 @@ func main() {
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
+
+	// Trae 网页登录回调 server（DESIGN §16 缺口 2）：登录页要求回调落在固定端口
+	// （默认 18080），与 listen 端口无关，故单独起一个复用同一 Handler 的 server。
+	// trae.callback_port="0" 时不启动（纯粘贴导入模式）；端口被占用只记 WARN 并
+	// 降级为粘贴导入——主服务不受影响，不致命。
+	if cfg.Trae.CallbackPort != "" && cfg.Trae.CallbackPort != "0" {
+		cbSrv := &http.Server{
+			Addr:              ":" + cfg.Trae.CallbackPort,
+			Handler:           h,
+			ReadHeaderTimeout: 30 * time.Second,
+		}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = cbSrv.Shutdown(shutdownCtx)
+		}()
+		go func() {
+			log.Printf("trae callback server on :%s（Trae 网页登录 /authorize）", cfg.Trae.CallbackPort)
+			if err := cbSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("trae callback server（:%s）启动失败: %v — Trae 网页登录降级为粘贴导入", cfg.Trae.CallbackPort, err)
+			}
+		}()
+	}
 
 	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

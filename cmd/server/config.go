@@ -153,6 +153,15 @@ type Config struct {
 		Providers map[string]ProviderConfig `json:"providers"`
 	} `json:"upstream"`
 
+	// Trae Trae 专属设置（与 upstream.providers.trae 分开：后者是 provider 开关，
+	// 这里是登录/回调这类 Trae 特有的进程级参数）。
+	Trae struct {
+		// CallbackPort Trae 网页登录的回调监听端口（登录页要求回调落在固定端口）。
+		// 缺省 "18080"；显式 "0" = 不起回调 server（只能用粘贴导入）。
+		// 端口被占用时只记 WARN 并降级为粘贴导入，不阻断主服务。
+		CallbackPort string `json:"callback_port"`
+	} `json:"trae"`
+
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
@@ -257,6 +266,10 @@ func (c *Config) ProviderEnabled(name string) bool {
 	return *p.Enabled
 }
 
+// defaultTraeCallbackPort Trae 网页登录回调端口的缺省值（与 panel.TraeDefaultCallbackPort
+// 同值；此处独立定义，避免配置层反向依赖面板包）。
+const defaultTraeCallbackPort = "18080"
+
 func Default() *Config {
 	c := &Config{
 		Listen:    ":7863",
@@ -298,6 +311,10 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	// Trae 网页登录回调端口（缺省 18080；显式 "0" = 不起回调 server）。
+	// 常量值与面板侧 TraeDefaultCallbackPort 相同（config 包不引 panel，避免
+	// 配置层反向依赖 UI 层）。
+	c.Trae.CallbackPort = defaultTraeCallbackPort
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复

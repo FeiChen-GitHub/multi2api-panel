@@ -4,7 +4,7 @@ const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
-let logPin = true, loginState = null, loginTimer = null;
+let logPin = true, loginState = null, loginTimer = null, traeTimer = null;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
@@ -1119,12 +1119,16 @@ function openAdd() {
   $('importDone').hidden = true; $('importErr').hidden = true;
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
-  stopPoll();
+  stopPoll(); stopTraePoll();
+  // Trae 面板态复位
+  $('traeReady').hidden = true; $('traeDone').hidden = true; $('traeErr').hidden = true;
+  $('btnTraeOpen').hidden = true; $('btnTraeLogin').disabled = false;
 }
 function switchAddTab(tab) {
   document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   $('addTabLogin').hidden = tab !== 'login';
   $('addTabImport').hidden = tab !== 'import';
+  $('addTabTrae').hidden = tab !== 'trae';
 }
 document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
@@ -1167,12 +1171,62 @@ async function pollLogin() {
     $('addErr').textContent = e.message + '（关闭后重新添加）';
   }
 }
-function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
+function closeAdd() { stopPoll(); stopTraePoll(); loginState = null; $('addVeil').classList.remove('on'); }
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
+
+/* ── Trae 网页登录（DESIGN §16 缺口 2） ──────────────────────────── */
+// 与 WorkBuddy 设备流的区别：这里不需要服务端轮询上游 state，而是等浏览器
+// 302 回 /authorize，服务端落盘后由 login/trae/result 回报 success。
+let traePending = null;
+function startTraeLogin() {
+  $('btnTraeLogin').disabled = true;
+  $('traeDone').hidden = true; $('traeErr').hidden = true; $('traeReady').hidden = true;
+  const port = ($('traeCbPort').value || '').trim() || '18080';
+  api('login/trae/start', { method: 'POST', body: JSON.stringify({ callback_port: port }) }).then(r => {
+    traePending = r.pending_id;
+    $('traeUrl').textContent = r.login_url;
+    $('traeReady').hidden = false;
+    $('btnTraeOpen').hidden = false;
+    $('btnTraeLogin').disabled = false;
+    traeTimer = setInterval(pollTraeLogin, 3000);
+  }).catch(e => {
+    $('btnTraeLogin').disabled = false;
+    $('traeErr').hidden = false;
+    $('traeErr').textContent = e.message;
+  });
+}
+function stopTraePoll() { if (traeTimer) { clearInterval(traeTimer); traeTimer = null; } traePending = null; }
+async function pollTraeLogin() {
+  if (!traePending) return;
+  let r;
+  try {
+    r = await api('login/trae/result?pending_id=' + encodeURIComponent(traePending));
+  } catch (e) {
+    stopTraePoll();
+    $('traeReady').hidden = true;
+    $('traeErr').hidden = false;
+    $('traeErr').textContent = e.message + '（关闭后重新添加）';
+    return;
+  }
+  if (r.state === 'success') {
+    stopTraePoll();
+    $('traeReady').hidden = true;
+    $('traeDone').hidden = false;
+    $('traeDone').textContent = '已添加 ' + (r.nickname || r.uid) + '，Trae 账号已载入池中';
+    setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+  } else if (r.state === 'failed') {
+    stopTraePoll();
+    $('traeReady').hidden = true;
+    $('traeErr').hidden = false;
+    $('traeErr').textContent = r.error || '登录失败';
+  }
+}
+$('btnTraeLogin').onclick = startTraeLogin;
+$('btnTraeOpen').onclick = () => open($('traeUrl').textContent, '_blank');
 $('importFile').onchange = async () => {
   const file = $('importFile').files[0];
   if (!file) return;

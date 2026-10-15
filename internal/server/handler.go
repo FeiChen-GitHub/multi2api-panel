@@ -172,6 +172,14 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
+		// Trae 网页登录回调落点（DESIGN §16 缺口 2）：回调 URL 是固定端口下的
+		// /authorize（浏览器 302 跳转，带不上 Bearer），必须免鉴权挂在根 mux。
+		// 面板未启用 Trae 登录能力时不注册（保持旧行为：未匹配路由 404）。
+		if pa, ok := cfg.Panel.(interface {
+			TraeAuthorizeHandler() http.HandlerFunc
+		}); ok {
+			h.mux.HandleFunc("GET /authorize", pa.TraeAuthorizeHandler())
+		}
 	}
 	return h
 }

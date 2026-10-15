@@ -33,15 +33,15 @@ import (
 
 // Config 面板依赖（main 装配注入）。
 type Config struct {
-	Pool      *pool.Pool
-	Upstream  *upstream.Client
+	Pool     *pool.Pool
+	Upstream *upstream.Client
 	// Dispatcher 多 provider 分发器（可选）。nil 时 clientFor 退化为 WorkBuddy 客户端。
 	Dispatcher *upstream.Dispatcher
-	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
-	AuthDir   string               // OAuth 登录完成后凭证落盘目录
-	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
-	RedisMode string               // "upstash" / "noop"，仅观测透出
-	Version   string               // 面板版本号（展示用）
+	Scheduler  *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
+	AuthDir    string               // OAuth 登录完成后凭证落盘目录
+	APIKey     string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
+	RedisMode  string               // "upstash" / "noop"，仅观测透出
+	Version    string               // 面板版本号（展示用）
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
@@ -67,6 +67,12 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// TraeApiHost Trae 的 OAuth host 覆盖（对应 config upstream.providers.trae.api_host；
+	// 空 = upstream.TraeOAuthHost）。只影响网页登录时的 ExchangeToken / GetUserInfo。
+	// 不接受来自回调 query 的 host——浏览器可控输入决定凭证发往哪个域会变成
+	// token 外泄面，host 只能来自配置。
+	TraeApiHost string
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -81,6 +87,12 @@ type Panel struct {
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
 	loginMu sync.Mutex
 	logins  map[string]loginSession
+
+	// traeLogins 进行中的 Trae 网页登录会话（pending_id → 上下文）。
+	// 与上面 WorkBuddy 设备流的 logins 完全独立：两套协议的态结构不同，
+	// 混用一张表会让「按 login_trace_id 反查」误命中 WorkBuddy 会话。
+	traeLoginMu sync.Mutex
+	traeLogins  map[string]*traePendingLogin
 
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，
@@ -135,11 +147,12 @@ func New(cfg Config) *Panel {
 		cfg.RedisMode = "noop"
 	}
 	p := &Panel{
-		cfg:     cfg,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
-		logs:    NewRing(500),
-		logins:  map[string]loginSession{},
+		cfg:        cfg,
+		mux:        http.NewServeMux(),
+		started:    time.Now(),
+		logs:       NewRing(500),
+		logins:     map[string]loginSession{},
+		traeLogins: map[string]*traePendingLogin{},
 	}
 	p.routes()
 	return p
@@ -161,6 +174,13 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
 	p.mux.HandleFunc("POST /panel/api/import/trae", p.withAuth(p.importTrae))
+	// Trae 网页登录闭环（DESIGN §16 缺口 2）。
+	// 注意 /authorize **不在这里注册**：本 mux 只服务 /panel/ 前缀（外层按前缀
+	// 转发），而回调 URL 是固定的 http://127.0.0.1:<port>/authorize。落点由
+	// server.Handler 经 Panel.TraeAuthorizeHandler 挂到根 mux 上。
+	p.mux.HandleFunc("POST /panel/api/login/trae/start", p.withAuth(p.loginTraeStart))
+	p.mux.HandleFunc("GET /panel/api/login/trae/result", p.withAuth(p.loginTraeResult))
+	p.mux.HandleFunc("POST /panel/api/login/trae/cancel", p.withAuth(p.loginTraeCancel))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))

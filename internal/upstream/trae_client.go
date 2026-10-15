@@ -28,8 +28,12 @@ const (
 	TraeAgentHost = "https://trae-api-cn.mchost.guru"
 	TraeUgHost    = "https://api.trae.cn"
 	TraeOAuthHost = "https://api.trae.com.cn"
-	TraeClientID  = "en1oxy7wnw8j9n"
-	TraeAppID     = "6eefa01c-1036-4c7e-9e5a-d891f63bfcd8"
+	// TraeConsoleHost 网页端控制台域名：登录页与 OAuth 跳转都挂在它下面
+	// （对照 trae2api constants.go 的 ConsoleHost）。登录 URL 只在这里构造，
+	// 网关侧不参与回调解析之外的人机交互。
+	TraeConsoleHost = "https://www.trae.cn"
+	TraeClientID    = "en1oxy7wnw8j9n"
+	TraeAppID       = "6eefa01c-1036-4c7e-9e5a-d891f63bfcd8"
 
 	traeIdeVersion     = "0.1.52"
 	traeIdeVersionCode = "20260811"
@@ -39,6 +43,7 @@ const (
 	TraeEpChat          = "/api/agent/v3/llm_utils_chat"
 	TraeEpModels        = "/api/ide/v1/get_detail_param"
 	TraeEpExchange      = "/cloudide/api/v3/trae/oauth/ExchangeToken"
+	TraeEpUserInfo      = "/cloudide/api/v3/trae/GetUserInfo"
 	TraeEpCheckinStatus = "/trae/api/v2/ug/checkin_credits/status"
 	TraeEpCheckinClaim  = "/trae/api/v2/ug/checkin_credits/claim"
 	TraeEpEntUsage      = "/trae/api/v2/pay/ide_user_ent_usage"
@@ -129,6 +134,48 @@ func traeOAuthHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "Trae/"+traeIdeVersion)
+}
+
+// GetUserInfo 查询账号信息（登录补全用）：返回 uid / 昵称 / 企业 ID。
+//
+// 走 OAuth host 的 GetUserInfo（与 ExchangeToken 同域），用 access token 作
+// X-Cloudide-Token。回调里带的 userInfo 可能缺字段，这里做权威补全；失败由调用
+// 方决定是报错还是沿用回调里的值（本项目：uid 为空才判失败）。
+func (c *TraeClient) GetUserInfo(ctx context.Context, a *auth.Auth) (uid, nickname, enterpriseID string, err error) {
+	host := a.ApiHost
+	if host == "" {
+		host = c.OAuthHost
+	}
+	payload, err := json.Marshal(map[string]any{"ReqSource": "IDE", "IDEVersion": traeIdeVersion})
+	if err != nil {
+		return "", "", "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, host+TraeEpUserInfo, bytes.NewReader(payload))
+	if err != nil {
+		return "", "", "", err
+	}
+	traeOAuthHeaders(req)
+	req.Header.Set("X-Cloudide-Token", a.AccessTokenValue())
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", "", "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return "", "", "", &Error{Kind: TraeClassify(resp.StatusCode, string(raw)), Status: resp.StatusCode, Msg: truncateText(string(raw), 200)}
+	}
+	var out struct {
+		Result struct {
+			UserID       string `json:"UserID"`
+			ScreenName   string `json:"ScreenName"`
+			EnterpriseID string `json:"EnterpriseID"`
+		} `json:"Result"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", "", "", fmt.Errorf("userinfo parse: %w", err)
+	}
+	return out.Result.UserID, out.Result.ScreenName, out.Result.EnterpriseID, nil
 }
 
 // TraeClassify 按 HTTP 状态码 + body 判定错误类别，映射到本项目统一的 ErrKind。
