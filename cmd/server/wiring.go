@@ -19,6 +19,7 @@ import (
 func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
 	return func(model string) []string {
 		_, realm, bare := server.ResolveModel(model)
-		return p.WeightedAvailableUIDsForModelRealm(bare, realm)
+		// 返回池内主键（AccountKey）：会话粘性绑定以主键为准（uid 跨 provider 可撞）。
+		return p.WeightedAvailableKeysForModelRealm(bare, realm)
 	}
 }

@@ -611,16 +611,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
 
-	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
+	// 会话粘性：从请求体提取会话键并解析绑定主键（找不到/无效则 stickyKey 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级——提取本身与粘性无关。
 	sessKey := session.ExtractKey(body)
-	stickyUID := ""
+	var stickyKey auth.AccountKey
 	if h.cfg.Session != nil && sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
-			stickyUID = uid
+		if key, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
+			stickyKey = auth.AccountKey(key)
 		}
 	}
 
@@ -649,18 +649,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			heldUID = ""
 		}
 	}
-	// unbindSticky 解绑当前会话粘性号（stickyUID 非空时）。供「粘性号不可用/被抢」与 fail 共用。
-	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
+	// unbindSticky 解绑当前会话粘性号（stickyKey 非空时）。供「粘性号不可用/被抢」与 fail 共用。
+	// 幂等：stickyKey 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyKey 才会非空。
 	unbindSticky := func() {
-		if stickyUID != "" {
+		if stickyKey != "" {
 			h.cfg.Session.Unbind(sessKey)
-			stickyUID = ""
+			stickyKey = ""
 		}
 	}
 	// fail 在轮转失败分支统一：释放租约 + 若失败号正是粘性号则解绑（下次请求重新分配）。
-	fail := func(uid string) {
+	// 入参是 AccountKey（不是 uid）：粘性绑定与身份都以主键为准。
+	fail := func(acctKey auth.AccountKey) {
 		releaseHeld()
-		if stickyUID != "" && uid == stickyUID {
+		if stickyKey != "" && acctKey == stickyKey {
 			unbindSticky()
 		}
 	}
@@ -796,8 +797,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
-		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
+		if stickyKey != "" {
+			acct = h.cfg.Pool.PickByKeyForModel(stickyKey, bareModel)
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
 				// 本次回落普通轮换。
@@ -829,7 +830,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if !h.cfg.Pool.Acquire(acct.UID) {
 			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
 			// 满载粘性号再浪费一次 PickByUID 往返（语义与 fail()/PickByUID-nil 的解绑一致）。
-			if stickyUID != "" && acct.UID == stickyUID {
+			if stickyKey != "" && acct.Key() == stickyKey {
 				unbindSticky()
 			}
 			if !rotateBackoff(i, r.Context()) {
@@ -850,7 +851,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				} else {
 					h.cfg.Pool.NoteError(acct.UID)
 				}
-				fail(acct.UID)
+				fail(acct.Key())
 				if !rotateBackoff(i, r.Context()) {
 					break // ctx 取消：终止轮转（refresh 失败换号退避）
 				}
@@ -900,7 +901,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
 			h.cfg.Pool.NoteFailures(acct.UID)
-			fail(acct.UID)
+			fail(acct.Key())
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（传输层错误换号退避）
 			}
@@ -926,7 +927,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				delete(tried, acct.Key())
 				log.Printf("INFO: [server] trae SOLO 权益不足 → 降级 Work 通道 acct=%s model=%s: %s",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, logfmt.Truncate(string(respBody), 160))
-				fail(acct.UID)
+				fail(acct.Key())
 				continue
 			}
 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
@@ -949,7 +950,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// error-passthrough：message 装上游 body 原文（code/msg/requestId 原样），
 				// 不再改写成网关固定文案——客户端必须看到真实错误才能排查。
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				fail(acct.Key())
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
@@ -969,7 +970,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
 			if kind == upstream.ErrPromptTooLong {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				fail(acct.Key())
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
 					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
@@ -980,7 +981,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 同一 body 换账号仍是同样的解析结果，轮转只会放大无效请求。
 			if kind == upstream.ErrImageInvalid {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				fail(acct.Key())
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					msg = "image request was rejected by upstream"
@@ -998,7 +999,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 客户端于是对必然失败的请求无限重试。立即透传上游原文回 400。
 			if kind == upstream.ErrBadParams {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				fail(acct.Key())
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					msg = "chat request body was rejected by upstream"
@@ -1013,7 +1014,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-			fail(acct.UID)
+			fail(acct.Key())
 			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：
 			// 该次 WAF 403 喂入 IP 级状态机，若激活（短窗多号命中，IP 被拦而非账号）
 			// 则立即终止轮转——继续换号只会把请求放大 MaxRotate 倍打同一出口 IP，
@@ -1083,7 +1084,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Pool.NoteSuccess(acct.UID)
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 				if sessKey != "" && h.cfg.Session != nil {
-					h.cfg.Session.Bind(sessKey, acct.UID)
+					h.cfg.Session.Bind(sessKey, acct.Key())
 				}
 			default:
 				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
@@ -1095,7 +1096,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 				// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
 				if sessKey != "" && h.cfg.Session != nil {
-					h.cfg.Session.Bind(sessKey, acct.UID)
+					h.cfg.Session.Bind(sessKey, acct.Key())
 				}
 			}
 			credit, hasCredit := stats.Credit()
@@ -1177,7 +1178,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
+			h.cfg.Session.Bind(sessKey, acct.Key())
 		}
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if hasCredit {

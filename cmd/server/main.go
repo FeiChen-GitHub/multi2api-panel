@@ -115,7 +115,7 @@ func main() {
 			TTL:        cfg.SessionTTL,
 			GCInterval: cfg.SessionGCInterval,
 			Store:      store,
-			Available:  p.AvailableUIDs,
+			Available:  p.AvailableKeys,
 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
 			// 裸名走 cn（现状零回归）。闭包内部 resolveModel 剥前缀，再按 realm 过滤。
 			AvailableForModel: realmAwareAvailableForModel(p),

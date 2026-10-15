@@ -200,12 +200,12 @@ func TestConcurrentSameKeyAssignsOnce(t *testing.T) {
 	}
 }
 
-// boundUID 直接读绑定 uid（不触发 Resolve 的重分配），供 Bind 系列测试断言用（包内私有 helper）。
+// boundUID 直接读绑定主键（不触发 Resolve 的重分配），供 Bind 系列测试断言用（包内私有 helper）。
 func (r *Router) boundUID(key string) (string, bool) {
 	r.mu.RLock()
 	e, ok := r.entries[key]
 	r.mu.RUnlock()
-	return e.uid, ok
+	return string(e.key), ok
 }
 
 func TestBindOverridesAndMirrors(t *testing.T) {

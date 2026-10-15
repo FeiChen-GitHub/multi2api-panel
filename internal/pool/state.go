@@ -441,6 +441,33 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	return e.a
 }
 
+// PickByKeyForModel 同 PickByUIDForModel，但以 AccountKey 为准（多 provider 主键）。
+// uid 版是过渡兼容；同 uid 跨 provider 时 byUID 镜像只保留后进者，粘性必须用 key。
+func (p *Pool) PickByKeyForModel(key auth.AccountKey, model string) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.byKey[key]
+	if e == nil {
+		return nil
+	}
+	now := time.Now()
+	if !e.healthyForModel(now, model) {
+		return nil
+	}
+	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
+		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
+			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
+		return nil
+	}
+	if p.inFlightFull(e) {
+		return nil
+	}
+	e.lastUsed = now
+	p.pickSeq++
+	e.usedSeq = p.pickSeq
+	return e.a
+}
+
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
 // 否则返回 nil。供会话粘性路由命中校验与直取使用。
 func (p *Pool) PickByUID(uid string) *auth.Auth {

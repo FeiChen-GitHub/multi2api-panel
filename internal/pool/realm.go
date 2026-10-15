@@ -12,6 +12,62 @@ import (
 // 3:1 是温和偏好，不是固定比例：账号组成变化会自然改变最终占比。
 const expiringVirtualSlots = 3
 
+// AvailableKeys 同 AvailableUIDs，但返回池内主键（AccountKey）——会话粘性绑定用主键，
+// 因为 uid 在跨 provider 之间可能重复。按主键字符串排序，输出稳定。
+func (p *Pool) AvailableKeys() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	keys := make([]string, 0, len(p.byKey))
+	for key, e := range p.byKey {
+		if !e.healthy(now) {
+			continue
+		}
+		if p.inFlightFull(e) {
+			continue
+		}
+		keys = append(keys, string(key))
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// WeightedAvailableKeysForModelRealm 同 WeightedAvailableUIDsForModelRealm，但返回主键：
+// 普通账号出现 1 次，有效快过期账号出现 expiringVirtualSlots 次（新会话温和偏好）。
+func (p *Pool) WeightedAvailableKeysForModelRealm(model, realm string) []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	entries := make(map[string]*entry, len(p.byKey))
+	keys := make([]string, 0, len(p.byKey))
+	for key, e := range p.byKey {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if !e.healthyForModel(now, model) {
+			continue
+		}
+		if p.inFlightFull(e) {
+			continue
+		}
+		s := string(key)
+		entries[s] = e
+		keys = append(keys, s)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		slots := 1
+		if p.preferExpiring && expiringNow(entries[k], now) {
+			slots = expiringVirtualSlots
+		}
+		for i := 0; i < slots; i++ {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 // AvailableKeysForProviderModelRealm 返回候选账号主键：先按 provider + realm 过滤，
 // 再做模型健康判定（healthyForModel，含 6004 模型豁免）与在途占满判定。
 // provider=="" 不过滤 provider；realm=="" 不过滤 realm；model=="" 退化为账号级 healthy。

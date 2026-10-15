@@ -98,6 +98,6 @@ func (h *Handler) markTraeSuccess(acct *auth.Auth, model string, st *chatStat, s
 	h.cfg.Pool.NoteSuccess(acct.UID)
 	h.cfg.Pool.BlockModelClear(acct.UID, model)
 	if sessKey != "" && h.cfg.Session != nil {
-		h.cfg.Session.Bind(sessKey, acct.UID)
+		h.cfg.Session.Bind(sessKey, acct.Key())
 	}
 }

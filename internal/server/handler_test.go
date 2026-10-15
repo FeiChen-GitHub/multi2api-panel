@@ -477,15 +477,14 @@ func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 // TestChatStickyFollowsFinalSuccess 端到端验证 D4：粘性号失败换号成功后，会话绑定收敛到成功号。
 func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 	st := newBindStore()
+	bad := &auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999}
+	good := &auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999}
+	p := testPoolWith(bad, good)
 	sess := session.New(session.Config{
 		TTL:       time.Minute,
 		Store:     st,
-		Available: func() []string { return []string{"bad", "good"} },
+		Available: func() []string { return []string{string(bad.Key()), string(good.Key())} },
 	})
-	p := testPoolWith(
-		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
-		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
-	)
 	// 先把会话预绑定到 bad（模拟历史粘性），bad 失败、good 成功 → 绑定应切到 good。
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if authz == "Bearer at-bad" {
@@ -500,7 +499,7 @@ func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 		SoftCooldown: time.Minute,
 	})
 	// 预绑定：sess.Bind("conv-1", "bad")，然后请求体带同 conversation_id。
-	sess.Bind("conv-1", "bad")
+	sess.Bind("conv-1", bad.Key())
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -508,7 +507,7 @@ func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	// 绑定必须收敛到最终成功的 good。
-	if uid, ok := st.lastUID("conv-1"); !ok || uid != "good" {
+	if uid, ok := st.lastUID("conv-1"); !ok || uid != string(good.Key()) {
 		t.Fatalf("sticky binding should follow final success to good, got %s ok=%v (binds=%v)", uid, ok, st.binds)
 	}
 }
@@ -516,24 +515,25 @@ func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 // TestChatStickySuccessKeepsBinding 粘性号直接成功 → 绑定不变（仍为该号）。
 func TestChatStickySuccessKeepsBinding(t *testing.T) {
 	st := newBindStore()
+	good := &auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999}
+	p := testPoolWith(good)
 	sess := session.New(session.Config{
 		TTL:       time.Minute,
 		Store:     st,
-		Available: func() []string { return []string{"good"} },
+		Available: func() []string { return []string{string(good.Key())} },
 	})
-	p := testPoolWith(&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999})
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 200, sseOK, true
 	})
 	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
-	sess.Bind("conv-1", "good")
+	sess.Bind("conv-1", good.Key())
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	if uid, ok := st.lastUID("conv-1"); !ok || uid != "good" {
+	if uid, ok := st.lastUID("conv-1"); !ok || uid != string(good.Key()) {
 		t.Fatalf("binding should stay good after success, got %s ok=%v", uid, ok)
 	}
 }
@@ -542,15 +542,14 @@ func TestChatStickySuccessKeepsBinding(t *testing.T) {
 // 请求在同一轮内解绑并回落普通轮换选中健康账号，绑定收敛到最终成功号——而非空耗一轮。
 func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 	st := newBindStore()
+	bad := &auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999}
+	good := &auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999}
+	p := testPoolWith(bad, good)
 	sess := session.New(session.Config{
 		TTL:       time.Minute,
 		Store:     st,
-		Available: func() []string { return []string{"bad", "good"} },
+		Available: func() []string { return []string{string(bad.Key()), string(good.Key())} },
 	})
-	p := testPoolWith(
-		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
-		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
-	)
 	// bad 占满唯一在途名额：PickByUID 将返回 nil（healthy 但 inFlight 满）→ 解绑 + 回落轮换。
 	p.SetMaxInFlight(1)
 	p.Acquire("bad")
@@ -564,7 +563,7 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 		Session:      sess,
 		SoftCooldown: time.Minute,
 	})
-	sess.Bind("conv-1", "bad")
+	sess.Bind("conv-1", bad.Key())
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -572,7 +571,7 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	// 满载粘性号被解绑，绑定收敛到最终成功号 good。
-	if uid, ok := st.lastUID("conv-1"); !ok || uid != "good" {
+	if uid, ok := st.lastUID("conv-1"); !ok || uid != string(good.Key()) {
 		t.Fatalf("sticky binding should fall back to good, got %s ok=%v (binds=%v)", uid, ok, st.binds)
 	}
 	p.Release("bad")

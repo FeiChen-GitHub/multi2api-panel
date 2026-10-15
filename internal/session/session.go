@@ -19,16 +19,21 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
 // entry 单条会话绑定。
 type entry struct {
-	uid        string
+	// key 池内主键（auth.AccountKey，UUIDv4）。uid 在跨 provider 间可撞，
+	// 粘性绑定必须用主键；显示/日志用 Pool.Status 的 UID。
+	key        auth.AccountKey
 	lastActive time.Time
 }
 
-// Config 路由依赖；Available 返回"可用账号"（healthy 且未占满在途）的有序 uid 列表，
-// 由 pool.AvailableUIDs 提供。Store 可为 redisstore.Noop（纯内存）。
+// Config 路由依赖；Available 返回"可用账号"（healthy 且未占满在途）的有序 uid 列表
+//（过渡期仍由 pool.AvailableUIDs 提供，Router 内部把它转换成 AccountKey）。
+// Store 可为 redisstore.Noop（纯内存）。
 type Config struct {
 	TTL        time.Duration
 	GCInterval time.Duration
@@ -37,7 +42,7 @@ type Config struct {
 	// AvailableForModel 按请求模型返回"在该模型上可用"的账号（healthy 且未占满在途，
 	// 且未被该模型限流/限额）。nil 时回落 Available（无模型维度，行为与引入前一致）。
 	//
-	// 为什么粘性需要模型维度：绑定只记 uid，而同一个会话可能换模型。账号被 6004
+	// 为什么粘性需要模型维度：绑定只记主键，而同一个会话可能换模型。账号被 6004
 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
 	AvailableForModel func(model string) []string
@@ -122,7 +127,7 @@ func (r *Router) LoadFromStore() {
 		if _, exists := r.entries[key]; exists {
 			continue
 		}
-		r.entries[key] = entry{uid: uid, lastActive: now}
+		r.entries[key] = entry{key: auth.AccountKey(uid), lastActive: now}
 		loaded++
 	}
 	r.mu.Unlock()
@@ -131,17 +136,18 @@ func (r *Router) LoadFromStore() {
 	}
 }
 
-// Resolve 返回会话 key 应绑定的账号 uid，ok=false 表示当前无可用账号。
+// Resolve 返回会话 key 应绑定的账号主键字符串（AccountKey 的字符串形态）。
 // 无模型维度（等价于 ResolveForModel(key, "")），保留给不关心模型的调用方。
 func (r *Router) Resolve(key string) (string, bool) {
 	return r.ResolveForModel(key, "")
 }
 
-// ResolveForModel 返回会话 key 在该模型上应绑定的账号 uid。
+// ResolveForModel 返回会话 key 在该模型上应绑定的账号主键字符串（AccountKey 的
+// 字符串形态）。调用方拿到主键后用 Pool.PickByKeyForModel / AuthByKey 还原账号。
 // 命中且账号在该模型可用 → 滚动 lastActive 并直接返回；否则（绑定号已冷却/占满/
 // 被该模型限流）走重新分配。
 //
-// 为什么必须带模型：绑定只记 uid，同一个会话可能换模型；账号被 6004 模型级限额后
+// 为什么必须带模型：绑定只记主键，而同一个会话可能换模型；账号被 6004 模型级限额后
 // 对其他模型仍可用（见 pool.healthyForModel 的 softRateModel 豁免）。若只按账号级
 // 可用性校验，会话会被钉在一个"对当前模型不可用"的号上反复失败。
 func (r *Router) ResolveForModel(key, model string) (string, bool) {
@@ -153,9 +159,9 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	e, found := r.entries[key]
 	r.mu.RUnlock()
 	if found && !expired(e, now, r.cfg.TTL) {
-		if available[e.uid] {
-			r.touch(key, e.uid, now)
-			return e.uid, true
+		if available[e.key] {
+			r.touch(key, e.key, now)
+			return string(e.key), true
 		}
 		// 绑定号已冷却/占满 → 失效，落入慢路径重分配。
 	}
@@ -166,64 +172,64 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 
 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
 	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) {
-		if available[e2.uid] {
-			r.entries[key] = entry{uid: e2.uid, lastActive: now}
-			return e2.uid, true
+		if available[e2.key] {
+			r.entries[key] = entry{key: e2.key, lastActive: now}
+			return string(e2.key), true
 		}
 		delete(r.entries, key) // 失效：清掉再分配
 	}
 
-	uids := r.availableSlice(model)
-	if len(uids) == 0 {
+	keys := r.availableSlice(model)
+	if len(keys) == 0 {
 		return "", false
 	}
 
 	// 双段策略：优先"空闲账号"（未被任何会话绑定的可用号），其次全池。
-	bound := map[string]bool{}
+	bound := map[auth.AccountKey]bool{}
 	for _, v := range r.entries {
-		bound[v.uid] = true
+		bound[v.key] = true
 	}
-	var idle []string
-	for _, u := range uids {
-		if !bound[u] {
-			idle = append(idle, u)
+	var idle []auth.AccountKey
+	for _, k := range keys {
+		if !bound[k] {
+			idle = append(idle, k)
 		}
 	}
 	pool2 := idle
 	if len(pool2) == 0 {
-		pool2 = uids
+		pool2 = keys
 	}
-	uid := pool2[hashIndex(key, len(pool2))]
+	selected := pool2[hashIndex(key, len(pool2))]
 
 	prev, existed := r.entries[key]
-	r.entries[key] = entry{uid: uid, lastActive: now}
-	if existed && prev.uid != uid {
+	r.entries[key] = entry{key: selected, lastActive: now}
+	if existed && prev.key != selected {
 		r.cfg.Store.DelBind(key)
 	}
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
-	return uid, true
+	r.cfg.Store.SetBind(key, string(selected), r.cfg.TTL)
+	return string(selected), true
 }
 
 // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
-func (r *Router) touch(key, uid string, now time.Time) {
+func (r *Router) touch(sessKey string, acctKey auth.AccountKey, now time.Time) {
 	r.mu.Lock()
-	r.entries[key] = entry{uid: uid, lastActive: now}
+	r.entries[sessKey] = entry{key: acctKey, lastActive: now}
 	r.mu.Unlock()
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	r.cfg.Store.SetBind(sessKey, string(acctKey), r.cfg.TTL)
 }
 
-// Bind 显式把会话 key 绑定到 uid（幂等覆盖旧值），并异步镜像到 redisstore。
+// Bind 显式把会话 key 绑定到账号主键（幂等覆盖旧值），并异步镜像到 redisstore。
 // 供"粘性跟随最终成功号"用：请求成功返回前，把会话重绑到实际成功的账号，让多轮对话下一跳稳定
 // 收敛到"对该会话持续成功的号"（对齐 antigravity 语义）。空 key 直接返回（无会话则不绑）。
-func (r *Router) Bind(key, uid string) {
-	if key == "" || uid == "" {
+func (r *Router) Bind(sessKey string, acctKey auth.AccountKey) {
+	if sessKey == "" || acctKey == "" {
 		return
 	}
 	now := time.Now()
 	r.mu.Lock()
-	r.entries[key] = entry{uid: uid, lastActive: now}
+	r.entries[sessKey] = entry{key: acctKey, lastActive: now}
 	r.mu.Unlock()
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	r.cfg.Store.SetBind(sessKey, string(acctKey), r.cfg.TTL)
 }
 
 // Unbind 解除会话绑定（请求失败时调用，让该会话下次重新分配）。返回是否存在。
@@ -267,24 +273,34 @@ func (r *Router) gcOnce(now time.Time) int {
 }
 
 // availableSet 把 AvailableForModel(model) 的有序列表转集合（快路径命中校验用）。
-func (r *Router) availableSet(model string) map[string]bool {
+func (r *Router) availableSet(model string) map[auth.AccountKey]bool {
 	uids := r.availableSlice(model)
-	set := make(map[string]bool, len(uids))
+	set := make(map[auth.AccountKey]bool, len(uids))
 	for _, u := range uids {
-		set[u] = true
+		set[auth.AccountKey(u)] = true
 	}
 	return set
 }
 
 // availableSlice 安全调用 AvailableForModel；未注入时回落 Available（nil 视空池）。
-func (r *Router) availableSlice(model string) []string {
+func (r *Router) availableSlice(model string) []auth.AccountKey {
 	if r.cfg.AvailableForModel != nil {
-		return r.cfg.AvailableForModel(model)
+		uids := r.cfg.AvailableForModel(model)
+		out := make([]auth.AccountKey, 0, len(uids))
+		for _, u := range uids {
+			out = append(out, auth.AccountKey(u))
+		}
+		return out
 	}
 	if r.cfg.Available == nil {
 		return nil
 	}
-	return r.cfg.Available()
+	uids := r.cfg.Available()
+	out := make([]auth.AccountKey, 0, len(uids))
+	for _, u := range uids {
+		out = append(out, auth.AccountKey(u))
+	}
+	return out
 }
 
 func expired(e entry, now time.Time, ttl time.Duration) bool {
