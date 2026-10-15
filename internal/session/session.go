@@ -46,6 +46,15 @@ type Config struct {
 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
 	AvailableForModel func(model string) []string
+
+	// ResolveLegacyKey 把**旧版裸 uid 绑定值**解析成 AccountKey（DESIGN §9.2 / 缺口 3）。
+	//
+	// 背景：粘性绑定值从裸 uid 改成了 AccountKey（UUIDv4）。Redis 里残留的旧绑定
+	// 若直接按 AccountKey 用，永远匹配不到任何账号，等价于全部静默失效——存量
+	// 会话会在下一次请求时集体换号（上游 prompt cache 全 miss）。注入该函数后，
+	// 启动时把能解析的旧值原地改写成新键；解析不到的（账号已删）按失效处理，
+	// TTL 内自然过期。nil 时不迁移（保持旧行为：值原样载入）。
+	ResolveLegacyKey func(uid string) (auth.AccountKey, bool)
 }
 
 // Router 会话粘性路由器。
@@ -115,6 +124,11 @@ func (r *Router) StopGC() {
 
 // LoadFromStore 启动时从 redisstore 恢复绑定（内存覆盖本地，读操作仅此处发生）。
 // 已有本地绑定被保留——Redis 仅为恢复备份，本地一旦建立即为权威。
+//
+// 旧值迁移（DESIGN §9.2）：绑定值不是已知 AccountKey 的（UUIDv4 形态），按旧版
+// 裸 uid 处理，经 ResolveLegacyKey 解析成新键后**原地改写**（写回 Redis）；
+// 解析不到（账号已删/换了 provider 撞号）的整条绑定丢弃——账户都不在了，留着
+// 只会让会话钉在一个永远不可用的值上。
 func (r *Router) LoadFromStore() {
 	binds := r.cfg.Store.LoadBinds()
 	if len(binds) == 0 {
@@ -123,17 +137,81 @@ func (r *Router) LoadFromStore() {
 	now := time.Now()
 	r.mu.Lock()
 	loaded := 0
-	for key, uid := range binds {
-		if _, exists := r.entries[key]; exists {
+	var migrated, dropped []string
+	for sessKey, val := range binds {
+		if _, exists := r.entries[sessKey]; exists {
 			continue
 		}
-		r.entries[key] = entry{key: auth.AccountKey(uid), lastActive: now}
+		acctKey, ok := r.resolveStoredValue(val)
+		if !ok {
+			dropped = append(dropped, sessKey)
+			continue
+		}
+		// 旧值改写：把 Redis 里的裸 uid 换成 AccountKey，下轮启动不必再迁移。
+		if auth.AccountKey(val) != acctKey {
+			migrated = append(migrated, sessKey)
+			r.cfg.Store.SetBind(sessKey, string(acctKey), r.cfg.TTL)
+		}
+		r.entries[sessKey] = entry{key: acctKey, lastActive: now}
 		loaded++
 	}
 	r.mu.Unlock()
+	for _, sessKey := range dropped {
+		r.cfg.Store.DelBind(sessKey)
+	}
 	if loaded > 0 {
 		log.Printf("[session] 从 Redis 恢复 %d 条粘性会话绑定", loaded)
 	}
+	if len(migrated) > 0 {
+		log.Printf("[session] 旧 uid 绑定原地改写为 AccountKey：%d 条", len(migrated))
+	}
+	if len(dropped) > 0 {
+		log.Printf("[session] 旧 uid 绑定无法解析（账号已不存在），丢弃 %d 条", len(dropped))
+	}
+}
+
+// resolveStoredValue 把 store 里读到的绑定值解析成 AccountKey。
+// AccountKey 是 UUIDv4（36 字符带连字符），据此区分新旧值：新值直接用；旧值
+//（裸 uid）走 ResolveLegacyKey，未注入该函数时按旧行为原样接受。
+func (r *Router) resolveStoredValue(val string) (auth.AccountKey, bool) {
+	if val == "" {
+		return "", false
+	}
+	if isAccountKey(val) {
+		return auth.AccountKey(val), true
+	}
+	if r.cfg.ResolveLegacyKey == nil {
+		// 未注入迁移函数（纯内存/裸用场景）：保持旧行为，不擅自判死。
+		return auth.AccountKey(val), true
+	}
+	k, ok := r.cfg.ResolveLegacyKey(val)
+	if !ok || k == "" {
+		return "", false
+	}
+	return k, true
+}
+
+// isAccountKey 粗判是否为 AccountKey（UUIDv4 形态：8-4-4-4-12）。
+// 只用于区分新旧绑定值，不用于校验合法性——真正的校验在 pool 侧解析时发生。
+func isAccountKey(v string) bool {
+	if len(v) != 36 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			hex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+			if !hex {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Resolve 返回会话 key 应绑定的账号主键字符串（AccountKey 的字符串形态）。

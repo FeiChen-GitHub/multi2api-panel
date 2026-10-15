@@ -119,6 +119,15 @@ func main() {
 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
 			// 裸名走 cn（现状零回归）。闭包内部 resolveModel 剥前缀，再按 realm 过滤。
 			AvailableForModel: realmAwareAvailableForModel(p),
+			// 旧版粘性绑定存的是裸 uid（绑定值改成 AccountKey 之前的遗留值）。
+			// 启动时按 uid 反查主键并原地改写，避免存量会话在升级后集体换号。
+			ResolveLegacyKey: func(uid string) (auth.AccountKey, bool) {
+				st, ok := p.Status(uid)
+				if !ok || st.Key == "" {
+					return "", false
+				}
+				return st.Key, true
+			},
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
