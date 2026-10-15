@@ -137,10 +137,16 @@ func main() {
 	// trae.enabled=false 时传 nil：Dispatcher.For(trae) 返回 nil，handler/scheduler/panel
 	// 都会明确报“未启用”，不会把 Trae 请求误发给 WorkBuddy。
 	var traeClient upstream.ChatClient
+	traeWorkDisabled := false
 	if cfg.ProviderEnabled("trae") {
 		tc := upstream.NewTraeClient()
-		if pcfg, ok := cfg.Upstream.Providers["trae"]; ok && pcfg.ApiHost != "" {
-			tc.OAuthHost = pcfg.ApiHost
+		if pcfg, ok := cfg.Upstream.Providers["trae"]; ok {
+			if pcfg.ApiHost != "" {
+				tc.OAuthHost = pcfg.ApiHost
+			}
+			if pcfg.WorkEnabled != nil && !*pcfg.WorkEnabled {
+				traeWorkDisabled = true
+			}
 		}
 		traeClient = tc
 	} else {
@@ -309,20 +315,21 @@ func main() {
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
 	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		Dispatcher:   dispatcher,
-		APIKey:       cfg.APIKey,
-		Session:      sessRouter,
-		StickyCount:  sessCount,
-		RedisMode:    redisMode,
-		SoftCooldown: cfg.SoftRateDur,
-		Panel:        pn,
-		Live:         live,
-		Usage:        rec,
-		RequestLog:   requestLog,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
+		Pool:             p,
+		Upstream:         up,
+		Dispatcher:       dispatcher,
+		TraeWorkDisabled: traeWorkDisabled,
+		APIKey:           cfg.APIKey,
+		Session:          sessRouter,
+		StickyCount:      sessCount,
+		RedisMode:        redisMode,
+		SoftCooldown:     cfg.SoftRateDur,
+		Panel:            pn,
+		Live:             live,
+		Usage:            rec,
+		RequestLog:       requestLog,
+		PromptMode:       cfg.Prompt.Mode,
+		PromptText:       cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,

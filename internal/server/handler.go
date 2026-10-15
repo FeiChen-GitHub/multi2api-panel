@@ -30,13 +30,16 @@ import (
 
 // Config handler 依赖。
 type Config struct {
-	Pool      *pool.Pool
-	Upstream  *upstream.Client
+	Pool     *pool.Pool
+	Upstream *upstream.Client
 	// Dispatcher 多 provider 分发器（可选）。nil 时 clientFor 退化为 WorkBuddy
 	// 客户端，测试与裸用场景行为不变。
 	Dispatcher *upstream.Dispatcher
-	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
-	MaxRotate int    // 单请求最多换号次数，默认 3
+	// TraeWorkDisabled 关闭 Trae 的 Work 通道（config providers.trae.work_enabled=false）：
+	// Work 专属模型请求直接 503，SOLO 撞权益不足时也不降级到 Work。
+	TraeWorkDisabled bool
+	APIKey           string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
+	MaxRotate        int    // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -610,6 +613,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if isTrae {
 		chatChannel = upstream.TraeChannelForModel(bareModel)
 	}
+	if isTrae && chatChannel == upstream.ChannelWork && h.cfg.TraeWorkDisabled {
+		// Work 通道被配置关闭：Work 专属模型直接报错，不静默改走 SOLO。
+		st := newChatStat(time.Now(), body, peek.Stream)
+		st.status = http.StatusServiceUnavailable
+		st.done()
+		writeOpenAIError(w, http.StatusServiceUnavailable, "work_disabled",
+			"Trae Work 通道已禁用（upstream.providers.trae.work_enabled=false）")
+		return
+	}
 	workFallbackTried := false
 	modelRate := ""
 	if h.cfg.Upstream != nil {
@@ -941,7 +953,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// Trae：SOLO 撞权益/配额不足（1005/4008）→ 同一账号降级到 Work 通道重试一次
 			// （trae2api 的 executeWorkRequest 语义）。此时响应首字节尚未写出，可以安全切换；
 			// 通道切换不计入换号预算（DESIGN §4.6），所以把该账号从 tried 里放回。
-			if isTrae && kind == upstream.ErrHardCredit &&
+			if isTrae && !h.cfg.TraeWorkDisabled && kind == upstream.ErrHardCredit &&
 				chatChannel == upstream.ChannelSOLO && !workFallbackTried {
 				workFallbackTried = true
 				chatChannel = upstream.ChannelWork

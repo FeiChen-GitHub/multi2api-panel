@@ -233,6 +233,56 @@ func TestChatTraeWithoutTraeClientReturns503(t *testing.T) {
 	}
 }
 
+// work_enabled=false：Work 专属模型直接 503（不静默改走 SOLO），SOLO 模型不受影响。
+func TestChatTraeWorkDisabled(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	var soloHits, workHits int
+	tc := upstream.NewTraeClient()
+	tc.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case upstream.TraeEpCreateAgentTask:
+			workHits++
+		case upstream.TraeEpChat:
+			soloHits++
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(traeSOLOFixture))}, nil
+	})}
+	tc.StreamHTTP = tc.HTTP
+
+	traeAuth, err := auth.Parse([]byte(`{"provider":"trae","auth":{"accessToken":"trae-at","expiresAt":9999999999},"account":{"uid":"trae1"}}`))
+	if err != nil {
+		t.Fatalf("parse trae auth: %v", err)
+	}
+	p := testPoolWith(traeAuth)
+	h := NewHandler(Config{
+		Pool:             p,
+		Upstream:         up,
+		Dispatcher:       upstream.NewDispatcher(upstream.NewWBClient(up), tc),
+		TraeWorkDisabled: true,
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"trae:cn:DeepSeek-V4-Flash-Official","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("work model with work disabled: code=%d body=%s, want 503", rec.Code, rec.Body.String())
+	}
+	if workHits != 0 {
+		t.Fatalf("work upstream calls = %d, want 0", workHits)
+	}
+
+	// SOLO 模型不受 work_enabled 影响。
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"trae:cn:glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("solo model with work disabled: code=%d body=%s, want 200", rec2.Code, rec2.Body.String())
+	}
+	if soloHits != 1 {
+		t.Fatalf("solo upstream calls = %d, want 1", soloHits)
+	}
+}
+
 func keysOf(m map[string]map[string]any) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
