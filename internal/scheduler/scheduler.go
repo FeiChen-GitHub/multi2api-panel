@@ -480,13 +480,15 @@ func (s *Scheduler) RunCheckinNow() {
 	}
 }
 
-// clientFor 返回处理该 provider 的上游客户端；Dispatcher 未注入或未接入时
-// 退化为 WorkBuddy 客户端（测试/裸用场景行为不变）。
+// clientFor 返回处理该 provider 的上游客户端。注入了 Dispatcher 就按 provider 取，
+// 返回 nil = 该 provider 未接入/未启用（调用方必须跳过，绝不回落 WorkBuddy）；
+// 未注入 Dispatcher（测试/裸用）时只有 WorkBuddy 可用。
 func (s *Scheduler) clientFor(provider auth.Provider) upstream.ChatClient {
 	if s.cfg.Dispatcher != nil {
-		if c := s.cfg.Dispatcher.For(provider); c != nil {
-			return c
-		}
+		return s.cfg.Dispatcher.For(provider)
+	}
+	if provider == auth.ProviderTrae {
+		return nil
 	}
 	return upstream.NewWBClient(s.cfg.Upstream)
 }
@@ -541,6 +543,9 @@ func (s *Scheduler) checkinTrae(st pool.Status, a *auth.Auth) {
 	}
 	ctx := context.Background()
 	client := s.clientFor(auth.ProviderTrae)
+	if client == nil {
+		return // Trae provider 未启用
+	}
 	if err := client.Checkin(ctx, a); err != nil {
 		log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 	} else {
@@ -649,7 +654,11 @@ func (s *Scheduler) RunKeepaliveNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		if err := s.clientFor(a.Provider()).RefreshToken(context.Background(), a); err != nil {
+		client := s.clientFor(a.Provider())
+		if client == nil {
+			continue // provider 未启用
+		}
+		if err := client.RefreshToken(context.Background(), a); err != nil {
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
@@ -690,7 +699,11 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			defer wg.Done()
 			if a.Provider() == auth.ProviderTrae {
 				// Trae 额度来源是 ide_user_ent_usage（账号级），没有 wb 的到期分桶。
-				remain, total, err := s.clientFor(auth.ProviderTrae).QueryCredits(context.Background(), a)
+				client := s.clientFor(auth.ProviderTrae)
+				if client == nil {
+					return // Trae provider 未启用
+				}
+				remain, total, err := client.QueryCredits(context.Background(), a)
 				if err != nil {
 					log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
 					return

@@ -205,6 +205,34 @@ func TestModelsIncludesTraeEntries(t *testing.T) {
 	}
 }
 
+// provider 未接入（Dispatcher 里 trae=nil）时必须 503，绝不回落 WorkBuddy 上游。
+func TestChatTraeWithoutTraeClientReturns503(t *testing.T) {
+	wbCalls := 0
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		wbCalls++
+		return 200, sseOK, true
+	})
+	traeAuth, err := auth.Parse([]byte(`{"provider":"trae","auth":{"accessToken":"trae-at","expiresAt":9999999999},"account":{"uid":"trae1"}}`))
+	if err != nil {
+		t.Fatalf("parse trae auth: %v", err)
+	}
+	p := testPoolWith(traeAuth)
+	h := NewHandler(Config{
+		Pool:       p,
+		Upstream:   up,
+		Dispatcher: upstream.NewDispatcher(upstream.NewWBClient(up), nil),
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"trae:cn:glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d body=%s, want 503", rec.Code, rec.Body.String())
+	}
+	if wbCalls != 0 {
+		t.Fatalf("workbuddy upstream calls = %d, want 0（Trae 未接入时不得误路由）", wbCalls)
+	}
+}
+
 func keysOf(m map[string]map[string]any) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

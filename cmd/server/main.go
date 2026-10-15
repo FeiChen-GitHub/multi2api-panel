@@ -134,8 +134,19 @@ func main() {
 	up := upstream.New()
 
 	// 多 provider 分发器：WorkBuddy 现有客户端 + Trae SOLO 客户端（phase 1 只支持 CN）。
-	// resolveModel / handler 侧接入 provider 路由后即生效；未接入前不影响既有行为。
-	dispatcher := upstream.NewDispatcher(upstream.NewWBClient(up), upstream.NewTraeClient())
+	// trae.enabled=false 时传 nil：Dispatcher.For(trae) 返回 nil，handler/scheduler/panel
+	// 都会明确报“未启用”，不会把 Trae 请求误发给 WorkBuddy。
+	var traeClient upstream.ChatClient
+	if cfg.ProviderEnabled("trae") {
+		tc := upstream.NewTraeClient()
+		if pcfg, ok := cfg.Upstream.Providers["trae"]; ok && pcfg.ApiHost != "" {
+			tc.OAuthHost = pcfg.ApiHost
+		}
+		traeClient = tc
+	} else {
+		log.Printf("trae provider 已禁用（upstream.providers.trae.enabled=false）")
+	}
+	dispatcher := upstream.NewDispatcher(upstream.NewWBClient(up), traeClient)
 
 	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测
 	// 时用它判收费——否则「没学过」恒等于「放行」，高价新模型会把触底号一笔打穿

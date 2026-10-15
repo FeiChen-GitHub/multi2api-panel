@@ -124,13 +124,16 @@ type Handler struct {
 }
 
 // NewHandler 构建 handler。
-// clientFor 返回处理该 provider 的上游客户端。Dispatcher 未注入、或该 provider
-// 尚未接入（For 返回 nil）时退化为 WorkBuddy 客户端 —— 保持测试/裸用场景的既有行为。
+// clientFor 返回处理该 provider 的上游客户端。语义（避免误路由）：
+//   - 注入了 Dispatcher：直接按 provider 取；返回 nil 表示该 provider 未接入/未启用，
+//     调用方必须显式报错，**绝不回落到 WorkBuddy**（否则 Trae 请求会被发给 wb 上游）。
+//   - 未注入 Dispatcher（测试/裸用）：只有 WorkBuddy 可用，Trae 返回 nil。
 func (h *Handler) clientFor(provider auth.Provider) upstream.ChatClient {
 	if h.cfg.Dispatcher != nil {
-		if c := h.cfg.Dispatcher.For(provider); c != nil {
-			return c
-		}
+		return h.cfg.Dispatcher.For(provider)
+	}
+	if provider == auth.ProviderTrae {
+		return nil
 	}
 	return upstream.NewWBClient(h.cfg.Upstream)
 }
@@ -583,6 +586,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	provider, realm, bareModel := resolveModel(peek.Model)
 	upClient := h.clientFor(provider)
 	isTrae := provider == auth.ProviderTrae
+	if upClient == nil {
+		// provider 未接入/未启用：明确报错，绝不回落 WorkBuddy（见 clientFor 注释）。
+		st := newChatStat(time.Now(), body, peek.Stream)
+		st.status = http.StatusServiceUnavailable
+		st.done()
+		writeOpenAIError(w, http.StatusServiceUnavailable, "provider_not_enabled",
+			"provider "+string(provider)+" 未接入或未启用")
+		return
+	}
 	// Trae 通道路由（DESIGN §4.5/§6.6）：Work 专属模型走 Work 通道，其余 SOLO；
 	// SOLO 撞权益不足时同一请求内降级到 Work（只在首字节前，见下方 fallback）。
 	chatChannel := upstream.ChannelSOLO

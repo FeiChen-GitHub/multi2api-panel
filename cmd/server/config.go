@@ -147,6 +147,10 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// Providers 多 provider 开关与参数（DESIGN §8）。键为 provider 名
+		//（"workbuddy" / "trae"）；缺省或 enabled 缺省 = 启用。
+		// enabled=false 时该 provider 的请求返回 503（不回落其它 provider）。
+		Providers map[string]ProviderConfig `json:"providers"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -231,6 +235,28 @@ type Config struct {
 }
 
 // Default 默认配置。
+// ProviderConfig 单个 provider 的配置（多 provider，DESIGN §8）。
+type ProviderConfig struct {
+	// Enabled 是否启用该 provider；缺省（nil）= 启用。
+	Enabled *bool `json:"enabled"`
+	// ApiHost 覆盖该 provider 的 token 刷新/主端点 host（空 = 内置默认）。
+	ApiHost string `json:"api_host"`
+	// WorkEnabled Trae Work 通道开关（仅 trae 有意义）；缺省 = 启用。
+	WorkEnabled *bool `json:"work_enabled"`
+}
+
+// ProviderEnabled 报告某 provider 是否启用（未配置或 enabled 缺省 = 启用）。
+func (c *Config) ProviderEnabled(name string) bool {
+	if c == nil {
+		return true
+	}
+	p, ok := c.Upstream.Providers[name]
+	if !ok || p.Enabled == nil {
+		return true
+	}
+	return *p.Enabled
+}
+
 func Default() *Config {
 	c := &Config{
 		Listen:    ":7863",

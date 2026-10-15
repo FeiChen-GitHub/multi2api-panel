@@ -10,13 +10,15 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
-// clientFor 返回处理该 provider 的上游客户端；Dispatcher 未注入或未接入时
-// 退化为 WorkBuddy 客户端（测试/裸用场景行为不变）。
+// clientFor 返回处理该 provider 的上游客户端。注入了 Dispatcher 就按 provider 取，
+// 返回 nil = 该 provider 未接入/未启用（调用方必须显式报错，绝不回落 WorkBuddy）；
+// 未注入 Dispatcher（测试/裸用）时只有 WorkBuddy 可用。
 func (p *Panel) clientFor(provider auth.Provider) upstream.ChatClient {
 	if p.cfg.Dispatcher != nil {
-		if c := p.cfg.Dispatcher.For(provider); c != nil {
-			return c
-		}
+		return p.cfg.Dispatcher.For(provider)
+	}
+	if provider == auth.ProviderTrae {
+		return nil
 	}
 	return upstream.NewWBClient(p.cfg.Upstream)
 }
@@ -26,6 +28,10 @@ func (p *Panel) clientFor(provider auth.Provider) upstream.ChatClient {
 func (p *Panel) checkinTrae(w http.ResponseWriter, a *auth.Auth) {
 	ctx := context.Background()
 	client := p.clientFor(auth.ProviderTrae)
+	if client == nil {
+		writeErr(w, http.StatusServiceUnavailable, "Trae provider 未接入或未启用")
+		return
+	}
 	resp := map[string]any{"ok": true, "provider": string(auth.ProviderTrae)}
 
 	if err := client.Checkin(ctx, a); err != nil {
