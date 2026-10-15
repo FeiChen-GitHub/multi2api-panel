@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 )
 
@@ -182,7 +183,22 @@ func responsesMessageItem(item map[string]any) (map[string]any, error) {
 	}
 }
 
-// responsesToolsToChat 把 Responses 的扁平工具形态转成 chat 的嵌套形态。
+// responsesToolsToChat 把 Responses 的工具形态转成 chat 的嵌套形态。
+//
+// 三种形态：
+//   - {"type":"function", name, description, parameters} → chat function（原形态）
+//   - {"type":"namespace", name, tools:[...]}：容器形态（OpenAI 官方 tool_namespace，
+//     Codex CLI 用它装 MCP 工具组）。内部 function **保持原名提升到顶层**——
+//     namespace 是分组元数据而非工具名的一部分（上游 Trae 的 SSE 也把它当元数据
+//     删掉，见 trae_sse.go 的 delete(df,"namespace")），所以既不能拼前缀，
+//     也不能整组丢弃。
+//   - 其余托管工具（tool_search / web_search / mcp / computer / custom / shell 等）：
+//     本网关不实现 → **跳过并记日志**，而不是报错。
+//
+// 为什么第三类从 422 改成跳过：Responses 客户端（Codex CLI）把托管工具和业务工具
+// 混在同一个 tools 数组里发，只要有一个不认识就整个请求 422，结果是客户端彻底
+// 不可用（实测报错 "unsupported tool type \"namespace\""）。丢掉一项托管能力的
+// 代价，远小于整条链路报废。
 func responsesToolsToChat(tools any) ([]map[string]any, error) {
 	if tools == nil {
 		return nil, nil
@@ -194,14 +210,23 @@ func responsesToolsToChat(tools any) ([]map[string]any, error) {
 	out := make([]map[string]any, 0, len(list))
 	for _, raw := range list {
 		t, ok := raw.(map[string]any)
-	if !ok {
+		if !ok {
 			return nil, &responsesError{400, "invalid_request", "tools items must be objects"}
 		}
-		if typ, _ := t["type"].(string); typ != "" && typ != "function" {
-			// 内置工具（web_search 等）本网关不实现，报错而非静默丢弃。
-			return nil, &responsesError{422, "unsupported_parameter",
-				fmt.Sprintf("unsupported tool type %q", typ)}
-		}
+		appendResponsesTool(&out, t, 0)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// appendResponsesTool 展开单个工具条目并追加到 out。depth 用于防御嵌套 namespace
+// （规范禁止，但不信任客户端输入：真遇到就跳过而不是递归爆栈）。
+func appendResponsesTool(out *[]map[string]any, t map[string]any, depth int) {
+	typ, _ := t["type"].(string)
+	switch typ {
+	case "", "function":
 		fn := map[string]any{"name": str(t["name"])}
 		if d, ok := t["description"]; ok {
 			fn["description"] = d
@@ -209,9 +234,24 @@ func responsesToolsToChat(tools any) ([]map[string]any, error) {
 		if p, ok := t["parameters"]; ok {
 			fn["parameters"] = p
 		}
-		out = append(out, map[string]any{"type": "function", "function": fn})
+		*out = append(*out, map[string]any{"type": "function", "function": fn})
+	case "namespace":
+		if depth > 0 {
+			log.Printf("WARN: [responses] 跳过嵌套 namespace 工具 %q（规范要求 namespace 内只能是 function/custom）", str(t["name"]))
+			return
+		}
+		inner, _ := t["tools"].([]any)
+		for _, raw := range inner {
+			it, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			appendResponsesTool(out, it, depth+1)
+		}
+	default:
+		// 不静默：留一条日志，便于事后定位"客户端发了什么、我们丢了什么"。
+		log.Printf("WARN: [responses] 忽略不支持的工具 type=%q name=%q（本网关不实现，请求继续）", typ, str(t["name"]))
 	}
-	return out, nil
 }
 
 func str(v any) string {

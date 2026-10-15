@@ -145,3 +145,50 @@ func TestResponsesRequestToChatRejectsMissingInput(t *testing.T) {
 		t.Fatalf("err = %v, want responsesError{400, invalid_request}", err)
 	}
 }
+
+// Codex CLI 用 {"type":"namespace"} 容器装 MCP 工具组，并常与 {"type":"tool_search"}
+// 这类托管工具混在同一个 tools 数组里发。此前只要有一个非 function 就整请求 422
+// （实测客户端报 unsupported tool type "namespace"，链路完全不可用）。
+// 现在：namespace 内部 function 保持原名提升到顶层；不认识的托管工具跳过。
+func TestResponsesRequestToChatNamespaceTools(t *testing.T) {
+	raw := []byte(`{"model":"trae:cn:glm-5.2","input":"hi","tools":[
+		{"type":"function","name":"top_fn","description":"顶层工具","parameters":{"type":"object"}},
+		{"type":"namespace","name":"mcp__server","description":"MCP 工具组","tools":[
+			{"type":"function","name":"inner_fn","parameters":{"type":"object"}},
+			{"type":"custom","name":"grammar_tool"}]},
+		{"type":"tool_search"}]}`)
+	out, err := responsesRequestToChat(raw)
+	if err != nil {
+		t.Fatalf("err = %v（namespace / tool_search 不应再 422）", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v (%s)", err, out)
+	}
+	list, ok := got["tools"].([]any)
+	if !ok || len(list) != 2 {
+		t.Fatalf("tools = %v, want 2 条（顶层 1 + namespace 内 1，custom 跳过）", got["tools"])
+	}
+	names := make([]string, 0, len(list))
+	for _, raw := range list {
+		fn := raw.(map[string]any)["function"].(map[string]any)
+		names = append(names, fn["name"].(string))
+	}
+	if names[0] != "top_fn" || names[1] != "inner_fn" {
+		t.Fatalf("tool names = %v, want [top_fn inner_fn]（namespace 名不参与拼接）", names)
+	}
+}
+
+// tools 里只有托管工具时：全部跳过 → 不写 tools 键（与"无工具"同义，
+// ToolNameAllowlist 据此不启用 DSML 修复）。
+func TestResponsesRequestToChatOnlyHostedTools(t *testing.T) {
+	out, err := responsesRequestToChat([]byte(`{"model":"trae:cn:glm-5.2","input":"hi","tools":[{"type":"web_search"}]}`))
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	var got map[string]any
+	_ = json.Unmarshal(out, &got)
+	if _, ok := got["tools"]; ok {
+		t.Fatalf("只剩托管工具时不应写 tools 键: %s", out)
+	}
+}
