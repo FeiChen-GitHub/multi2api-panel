@@ -626,6 +626,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			"provider "+string(provider)+" 未接入或未启用")
 		return
 	}
+	// Trae phase 1 只支持 cn（DESIGN §4.4 / §15.3 决议 6）：trae:global:* 必须明确
+	// 报错，不静默回落 cn。若不拦在这里，选号会因「池里没有 global 的 Trae 账号」
+	// 报成 503 no_healthy_account——那会被读成「号全挂了」，而不是「该 realm 不支持」。
+	if isTrae && realm == "global" {
+		st := newChatStat(time.Now(), body, peek.Stream)
+		st.status = http.StatusBadRequest
+		st.done()
+		writeOpenAIError(w, http.StatusBadRequest, "realm_not_supported",
+			"Trae 暂不支持 global realm（phase 1 仅 cn）：请改用 trae:cn:<model>")
+		return
+	}
 	// Trae 通道路由（DESIGN §4.5/§6.6）：Work 专属模型走 Work 通道，其余 SOLO；
 	// SOLO 撞权益不足时同一请求内降级到 Work（只在首字节前，见下方 fallback）。
 	chatChannel := upstream.ChannelSOLO

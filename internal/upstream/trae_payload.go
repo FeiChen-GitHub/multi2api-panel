@@ -85,7 +85,10 @@ func TraePrepareBody(src []byte) []byte {
 
 	model, _ := obj["model"].(string)
 	model = strings.TrimSpace(model)
-	if model == "" {
+	// D7（§7.2 / §15.3 决议 12）：`auto` 不是 Trae 的模型名，是别名——trae2api 的
+	// mapModel 把 "auto"/"" 都映射到默认模型 glm-5.2。直接当 config_name 上发会被
+	// 上游拒（不是"未知模型"这种可诊断的错，而是整个请求失败）。
+	if model == "" || strings.EqualFold(model, "auto") {
 		model = TraeDefaultModel
 	}
 	obj["config_name"] = model

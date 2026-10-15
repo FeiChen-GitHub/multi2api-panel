@@ -65,6 +65,22 @@ func TestTraePrepareBodyDefaultsModel(t *testing.T) {
 	}
 }
 
+// D7：`auto` 是别名不是模型名，必须映射到默认模型（glm-5.2）。
+// 直接当 config_name 上发会被上游拒，整个请求失败。
+func TestTraePrepareBodyMapsAutoAlias(t *testing.T) {
+	for _, in := range []string{`{"model":"auto","messages":[]}`, `{"model":"AUTO","messages":[]}`} {
+		out := TraePrepareBody([]byte(in))
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("unmarshal: %v (%s)", err, in)
+		}
+		if got["model"] != TraeDefaultModel || got["config_name"] != TraeDefaultModel {
+			t.Fatalf("%s → model/config_name = %v/%v, want %q（auto 必须映射为默认模型）",
+				in, got["model"], got["config_name"], TraeDefaultModel)
+		}
+	}
+}
+
 // assistant 历史里的 OpenAI tool_calls.function 要转成上游的 function_call；
 // 缺 name 的条目上游会反序列化失败，必须整体剔除。
 func TestTraePrepareBodyConvertsAssistantToolCalls(t *testing.T) {
