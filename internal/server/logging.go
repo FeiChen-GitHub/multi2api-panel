@@ -69,7 +69,6 @@ type chatStat struct {
 	// 关闭，或非 chat 路径），展示层一律以 "-" 兜底。
 	clientIP  string
 	userAgent string
-
 	logged bool
 }
 
@@ -348,6 +347,8 @@ type requestTrace struct {
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
+	// path 实际请求路径（/v1/chat/completions 或 /v1/responses），归档时用真实路径。
+	path string
 }
 
 // captureClientInfo 采集调用来源（客户端 IP + 截断后的 UA）。开关关闭时保持空串：
@@ -400,7 +401,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	e := reqlog.Event{
 		Time:      t.start,
 		RequestID: t.id,
-		Path:      "/v1/chat/completions",
+		Path:      t.path,
 		Status:    status,
 	}
 	duration := time.Since(t.start)

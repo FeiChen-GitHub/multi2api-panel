@@ -167,6 +167,7 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responsesCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -185,8 +186,9 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
-		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost &&
+		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/responses") {
+		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
 		}
@@ -577,18 +579,64 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
-	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
-	clientIP := upstream.ExtractClientIP(r)
-	// 请求体无大小上限（max_body_mb 已移除，对齐上游）：完整读入，超限类问题交由
-	// 上游自然返回错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断
-	// 防御语义保留在读错误路径——移除预拦截后，截断只可能来自客户端自己断流，
-	// 读 body 出错就地 400，不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
+	h.chatCore(w, r, body, protoChat, body)
+}
+
+// responsesCompletions POST /v1/responses：读 body → 转 chat 形状 → chatCore。
+//
+// 转换必须发生在会话键提取之前（chatCore 内）——Responses 客户端的粘性靠
+// prompt_cache_key / metadata，两者已在转换中透传。
+func (h *Handler) responsesCompletions(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeResponsesError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+		return
+	}
+	chatBody, cerr := responsesRequestToChat(raw)
+	if cerr != nil {
+		var re *responsesError
+		if errors.As(cerr, &re) {
+			writeResponsesError(w, re.Status, re.Code, re.Message)
+			return
+		}
+		writeResponsesError(w, http.StatusBadRequest, "invalid_request", cerr.Error())
+		return
+	}
+	// rawBody 传原始 body：请求日志与 chatStat 要记客户端实际发出的内容
+	//（记转换后的 chat body 会让归档与面板「运行日志」与真实流量对不上）。
+	h.chatCore(w, r, chatBody, protoResponses, raw)
+}
+
+// protocol 出站响应协议。chatCompletions 与 responsesCompletions 共用 chatCore。
+type protocol int
+
+const (
+	protoChat protocol = iota
+	protoResponses
+)
+
+// chatErr 按协议写错误（HTTP 头尚未发出时）。
+func chatErr(w http.ResponseWriter, proto protocol, status int, code, msg, hint string) {
+	if proto == protoResponses {
+		writeResponsesErrorHint(w, status, code, msg, hint)
+		return
+	}
+	writeOpenAIErrorHint(w, status, code, msg, hint)
+}
+
+// chatCore 两条路由共用的核心链路。body 是出站用的 chat 形状请求体；
+// rawBody 是客户端原始 body（仅供观测），proto 决定响应形状。
+// 会话键提取（session.ExtractKey）作用于 body——Responses 转换已在
+// responsesCompletions 里先行完成，粘性仍能命中。
+func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, proto protocol, rawBody []byte) {
+	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
+	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
+	clientIP := upstream.ExtractClientIP(r)
 	var peek struct {
 		Stream bool   `json:"stream"`
 		Model  string `json:"model"`
@@ -609,32 +657,32 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if rmErr != nil {
 		// provider 必填（DESIGN §3.1）：缺前缀/未知 provider 一律 400，
 		// 不再有「未知前缀整体当裸名」的兜底。
-		st := newChatStat(time.Now(), body, peek.Stream)
+		st := newChatStat(time.Now(), rawBody, peek.Stream)
 		st.status = http.StatusBadRequest
 		st.done()
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", rmErr.Error())
+		chatErr(w, proto, http.StatusBadRequest, "invalid_request", rmErr.Error(), "")
 		return
 	}
 	upClient := h.clientFor(provider)
 	isTrae := provider == auth.ProviderTrae
 	if upClient == nil {
 		// provider 未接入/未启用：明确报错，绝不回落 WorkBuddy（见 clientFor 注释）。
-		st := newChatStat(time.Now(), body, peek.Stream)
+		st := newChatStat(time.Now(), rawBody, peek.Stream)
 		st.status = http.StatusServiceUnavailable
 		st.done()
-		writeOpenAIError(w, http.StatusServiceUnavailable, "provider_not_enabled",
-			"provider "+string(provider)+" 未接入或未启用")
+		chatErr(w, proto, http.StatusServiceUnavailable, "provider_not_enabled",
+			"provider "+string(provider)+" 未接入或未启用", "")
 		return
 	}
 	// Trae phase 1 只支持 cn（DESIGN §4.4 / §15.3 决议 6）：trae:global:* 必须明确
 	// 报错，不静默回落 cn。若不拦在这里，选号会因「池里没有 global 的 Trae 账号」
 	// 报成 503 no_healthy_account——那会被读成「号全挂了」，而不是「该 realm 不支持」。
 	if isTrae && realm == "global" {
-		st := newChatStat(time.Now(), body, peek.Stream)
+		st := newChatStat(time.Now(), rawBody, peek.Stream)
 		st.status = http.StatusBadRequest
 		st.done()
-		writeOpenAIError(w, http.StatusBadRequest, "realm_not_supported",
-			"Trae 暂不支持 global realm（phase 1 仅 cn）：请改用 trae:cn:<model>")
+		chatErr(w, proto, http.StatusBadRequest, "realm_not_supported",
+			"Trae 暂不支持 global realm（phase 1 仅 cn）：请改用 trae:cn:<model>", "")
 		return
 	}
 	// Trae 通道路由（DESIGN §4.5/§6.6）：Work 专属模型走 Work 通道，其余 SOLO；
@@ -645,11 +693,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if isTrae && chatChannel == upstream.ChannelWork && h.cfg.TraeWorkDisabled {
 		// Work 通道被配置关闭：Work 专属模型直接报错，不静默改走 SOLO。
-		st := newChatStat(time.Now(), body, peek.Stream)
+		st := newChatStat(time.Now(), rawBody, peek.Stream)
 		st.status = http.StatusServiceUnavailable
 		st.done()
-		writeOpenAIError(w, http.StatusServiceUnavailable, "work_disabled",
-			"Trae Work 通道已禁用（upstream.providers.trae.work_enabled=false）")
+		chatErr(w, proto, http.StatusServiceUnavailable, "work_disabled",
+			"Trae Work 通道已禁用（upstream.providers.trae.work_enabled=false）", "")
 		return
 	}
 	workFallbackTried := false
@@ -659,7 +707,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	st := newChatStat(time.Now(), body, peek.Stream)
+	st := newChatStat(time.Now(), rawBody, peek.Stream)
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
@@ -1020,7 +1068,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
 					msg = "content blocked by upstream content firewall"
 				}
-				writeOpenAIErrorHint(w, http.StatusBadRequest, "content_blocked", msg,
+				chatErr(w, proto, http.StatusBadRequest, "content_blocked", msg,
 					h.hintOf(upstream.ErrContentBlocked, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
@@ -1035,7 +1083,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if kind == upstream.ErrPromptTooLong {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.Key())
-				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
+				chatErr(w, proto, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
 					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
@@ -1050,7 +1098,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if strings.TrimSpace(msg) == "" {
 					msg = "image request was rejected by upstream"
 				}
-				writeOpenAIErrorHint(w, http.StatusBadRequest, "image_invalid", msg,
+				chatErr(w, proto, http.StatusBadRequest, "image_invalid", msg,
 					h.hintOf(upstream.ErrImageInvalid, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
@@ -1068,7 +1116,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if strings.TrimSpace(msg) == "" {
 					msg = "chat request body was rejected by upstream"
 				}
-				writeOpenAIErrorHint(w, http.StatusBadRequest, "bad_params", msg,
+				chatErr(w, proto, http.StatusBadRequest, "bad_params", msg,
 					h.hintOf(upstream.ErrBadParams, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
@@ -1098,7 +1146,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if isTrae {
 			// Trae 成功路径（SOLO 原生流）：格式归一化与错误处置都在 serveTraeSuccess 内，
 			// 不落入下方 WorkBuddy 专属的 StreamHint / markup repair / 统计路径。
-			h.serveTraeSuccess(w, r, acct, rc, bareModel, peek.Stream, st, sessKey, chatChannel)
+			h.serveTraeSuccess(w, r, acct, rc, bareModel, peek.Stream, st, sessKey, chatChannel, proto)
 			return
 		}
 		if peek.Stream {
@@ -1110,14 +1158,29 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 组装请求上下文做判定）。
 			// errFrame：上游 error 帧原文（观察者旁路采集），用于流尾的账号处置。
 			var errFrame string
+			// Responses：把 chat chunk 写出包一层翻译器（显式转发 http.Flusher，
+			// 见 upstream.NewResponsesWriter）。三个流式写入点一行不改。
+			out := w
+			var rw *upstream.ResponsesWriter
+			if proto == protoResponses {
+				rw = upstream.NewResponsesWriter(w, func(msg string) string {
+					return h.hintOf(upstream.FrameKind(msg), msg, bareModel, reqHasImage, nil)
+				})
+				out = rw
+			}
 			// 标记修复：上游在没有 tools 的请求里会把工具调用吐成原生标记文本，
 			// 这里在透传前还原成 delta.tool_calls（见 upstream/dsml.go）。
 			// 第二个参数为 true = 名单为空时启用弱判定——tools 声明在链路上丢失是
 			// 实测最常见的泄漏成因，只做严格判定等于对主场景不设防。
 			repair := upstream.NewMarkupRepair(declaredTools, true)
-			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
+			sErr := upstream.StreamHint(out, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
-			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
+			}), upstream.WithErrorFrameObserver(func(payload string) {
+				errFrame = payload
+				if rw != nil {
+					rw.ObserveErrorFrame(payload)
+				}
+			}),
 				upstream.WithMarkupRepair(repair))
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
@@ -1207,7 +1270,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
+			chatErr(w, proto, http.StatusBadGateway, "upstream_parse", err.Error(), "")
 			st.status = http.StatusBadGateway
 			st.outcome = reqlog.OutcomeHTTPError
 			return
@@ -1233,6 +1296,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted, 0)
 		if st.hasCache {
 			cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
+		}
+		if proto == protoResponses {
+			resp = chatCompletionToResponse(resp)
 		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
@@ -1327,7 +1393,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		status = http.StatusBadRequest
 	}
-	writeOpenAIErrorHint(w, status, code, msg, hint)
+	chatErr(w, proto, status, code, msg, hint)
 	st.status = status
 	st.outcome = reqlog.OutcomeHTTPError
 }

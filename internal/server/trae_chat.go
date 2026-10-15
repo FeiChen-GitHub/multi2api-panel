@@ -83,7 +83,7 @@ func (h *Handler) applyTraeWorkStreamError(acct *auth.Auth, model string, se *up
 // ch 决定用哪套解析器：Work 的事件是 payload 包裹的 plan_item/output/done 且
 // output 是累积全文，SOLO 是扁平的 response/reasoning_content —— 两套形状不能
 // 互相套用（套错的一侧会输出空内容）。
-func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct *auth.Auth, rc io.ReadCloser, model string, stream bool, st *chatStat, sessKey string, ch upstream.Channel) {
+func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct *auth.Auth, rc io.ReadCloser, model string, stream bool, st *chatStat, sessKey string, ch upstream.Channel, proto protocol) {
 	defer rc.Close()
 
 	work := ch == upstream.ChannelWork
@@ -98,13 +98,18 @@ func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct 
 		st.status = http.StatusOK
 		var streamErr *upstream.TraeStreamError
 		var err error
+		// Responses：包一层事件翻译器（转发 Flusher），两个 Trae 写入点本身不改。
+		out := w
+		if proto == protoResponses {
+			out = upstream.NewResponsesWriter(w, nil)
+		}
 		if work {
-			err = upstream.TraeStreamWorkToOpenAI(w, rc, model, func(se *upstream.TraeStreamError) {
+			err = upstream.TraeStreamWorkToOpenAI(out, rc, model, func(se *upstream.TraeStreamError) {
 				streamErr = se
 				onWorkErr(se)
 			})
 		} else {
-			err = upstream.TraeStreamToOpenAI(w, rc, model, func(se *upstream.TraeStreamError) {
+			err = upstream.TraeStreamToOpenAI(out, rc, model, func(se *upstream.TraeStreamError) {
 				streamErr = se
 				onErr(se)
 			})
@@ -140,17 +145,20 @@ func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct 
 			handleErr(se)
 			st.status = http.StatusServiceUnavailable
 			st.outcome = reqlog.OutcomeStreamError
-			writeOpenAIError(w, http.StatusServiceUnavailable, "trae_upstream_error", se.Error())
+			chatErr(w, proto, http.StatusServiceUnavailable, "trae_upstream_error", se.Error(), "")
 			return
 		}
 		st.status = http.StatusBadGateway
 		st.outcome = reqlog.OutcomeStreamError
-		writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
+		chatErr(w, proto, http.StatusBadGateway, "upstream_parse", err.Error(), "")
 		return
 	}
 	h.markTraeSuccess(acct, model, st, sessKey)
 	if work {
 		h.probeTraeWorkCredits(acct)
+	}
+	if proto == protoResponses {
+		resp = chatCompletionToResponse(resp)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
