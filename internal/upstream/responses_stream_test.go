@@ -174,3 +174,55 @@ func TestResponsesWriterHandlesSplitWrites(t *testing.T) {
 		t.Fatalf("分帧写入丢帧:\n%s", out)
 	}
 }
+
+// reasoning + message + tool_call 共存时，output_index 必须三个互不相同，
+// 且 item 的关闭顺序按 output_index 升序（客户端按 index 驱动 UI 生命周期）。
+// 实测发现过 tool_call 与 message 同为 output_index 1 的缺陷。
+func TestResponsesWriterOutputIndexUniqueAcrossItemKinds(t *testing.T) {
+	rr := httptest.NewRecorder()
+	rw := NewResponsesWriter(rr, nil)
+	w := func(s string) { _, _ = rw.Write([]byte(s)) }
+	w(`data: {"id":"c1","choices":[{"delta":{"role":"assistant","reasoning_content":"想一下"}}]}` + "\n\n")
+	w(`data: {"id":"c1","choices":[{"delta":{"content":"好的"}}]}` + "\n\n")
+	w(`data: {"id":"c1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"{}"}}]}}]}` + "\n\n")
+	w(`data: {"id":"c1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n")
+	w(sseDone())
+
+	out := rr.Body.String()
+	var addedIdx []int
+	var doneIdx []int
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "data: {") {
+			continue
+		}
+		var ev map[string]any
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev) != nil {
+			continue
+		}
+		idx, ok := ev["output_index"].(float64)
+		if !ok {
+			continue
+		}
+		switch ev["type"] {
+		case "response.output_item.added":
+			addedIdx = append(addedIdx, int(idx))
+		case "response.output_item.done":
+			doneIdx = append(doneIdx, int(idx))
+		}
+	}
+	seen := map[int]bool{}
+	for _, i := range addedIdx {
+		if seen[i] {
+			t.Fatalf("output_index %d 被两个 item 复用:\n%s", i, out)
+		}
+		seen[i] = true
+	}
+	if len(addedIdx) != 3 {
+		t.Fatalf("added 的 item 数 = %d, want 3 (reasoning/message/function_call):\n%s", len(addedIdx), out)
+	}
+	for i := 1; i < len(doneIdx); i++ {
+		if doneIdx[i] <= doneIdx[i-1] {
+			t.Fatalf("output_item.done 未按 output_index 升序: %v:\n%s", doneIdx, out)
+		}
+	}
+}

@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +33,7 @@ func NewResponsesWriter(w http.ResponseWriter, hintFn func(string) string) *Resp
 
 type responsesItem struct {
 	kind      string // message / function_call / reasoning
+	out       int    // output_index：创建时分配，全流唯一且与 output 数组下标一致
 	id        string
 	callID    string
 	name      string
@@ -64,6 +64,7 @@ type ResponsesWriter struct {
 
 	pending []byte // Write 边界之外的分帧缓冲
 	out     []byte // 待写出的事件字节
+	order   []*responsesItem // item 创建顺序，决定 output_index 与关闭顺序
 }
 
 // ObserveErrorFrame 记录上游 error 帧原文（供 WithErrorFrameObserver 使用，
@@ -165,18 +166,15 @@ func (rw *ResponsesWriter) consumeChunk(obj map[string]any) {
 
 	// 正文：切到工具调用时先把文本 item 收尾。
 	if content, ok := delta["content"].(string); ok && content != "" {
-		if rw.toolOpen() {
-			rw.closeAllTools()
-		}
 		if rw.text == nil {
-			rw.text = &responsesItem{kind: "message", id: "msg_" + rw.respSuffix()}
+			rw.text = rw.addItem(&responsesItem{kind: "message", id: "msg_" + rw.respSuffix()})
 			rw.emit("response.output_item.added", map[string]any{
-				"output_index": rw.textIndex(),
+				"output_index": rw.text.out,
 				"item":         rw.text.view(),
 			})
 			rw.emit("response.content_part.added", map[string]any{
 				"item_id":   rw.text.id,
-				"output_index": rw.textIndex(),
+				"output_index": rw.text.out,
 				"content_index": 0,
 				"part":     map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 			})
@@ -185,7 +183,7 @@ func (rw *ResponsesWriter) consumeChunk(obj map[string]any) {
 		rw.text.text += content
 		rw.emit("response.output_text.delta", map[string]any{
 			"item_id":       rw.text.id,
-			"output_index":  rw.textIndex(),
+			"output_index":  rw.text.out,
 			"content_index": 0,
 			"delta":         content,
 		})
@@ -197,7 +195,7 @@ func (rw *ResponsesWriter) consumeChunk(obj map[string]any) {
 		rw.reason.summary += rc
 		rw.emit("response.reasoning_summary_text.delta", map[string]any{
 			"item_id":      rw.reason.id,
-			"output_index": rw.reasonIndex(),
+			"output_index": rw.reason.out,
 			"summary_index": 0,
 			"delta":        rc,
 		})
@@ -209,10 +207,8 @@ func (rw *ResponsesWriter) consumeChunk(obj map[string]any) {
 		idx := intOf(tc["index"])
 		item := rw.tools[idx]
 		if item == nil {
-			rw.closeText()
-			rw.closeReasoning()
-			rw.closeAllTools()
-			item = &responsesItem{kind: "function_call", callID: str(tc["id"])}
+			rw.closeOpenItems()
+			item = rw.addItem(&responsesItem{kind: "function_call", callID: str(tc["id"])})
 			if item.callID == "" {
 				item.callID = "call_" + strconv.Itoa(idx) + "_" + rw.respSuffix()
 			}
@@ -223,7 +219,7 @@ func (rw *ResponsesWriter) consumeChunk(obj map[string]any) {
 			item.name = str(fn["name"])
 			item.open = true
 			rw.emit("response.output_item.added", map[string]any{
-				"output_index": rw.toolIndex(idx),
+				"output_index": item.out,
 				"item":         item.view(),
 			})
 		}
@@ -234,16 +230,14 @@ func (rw *ResponsesWriter) consumeChunk(obj map[string]any) {
 			item.arguments += a
 			rw.emit("response.function_call_arguments.delta", map[string]any{
 				"item_id":      item.id,
-				"output_index": rw.toolIndex(idx),
+				"output_index": item.out,
 				"delta":        a,
 			})
 		}
 	}
 
 	if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
-		rw.closeText()
-		rw.closeReasoning()
-		rw.closeAllTools()
+		rw.closeOpenItems()
 	}
 }
 
@@ -274,16 +268,16 @@ func (rw *ResponsesWriter) ensureReasoning() {
 	if rw.reason != nil {
 		return
 	}
-	rw.reason = &responsesItem{kind: "reasoning", id: "rs_" + rw.respSuffix(), open: true}
+	rw.reason = rw.addItem(&responsesItem{kind: "reasoning", id: "rs_" + rw.respSuffix(), open: true})
 	rw.emit("response.output_item.added", map[string]any{
-		"output_index": rw.reasonIndex(),
+		"output_index": rw.reason.out,
 		"item": map[string]any{
 			"type": "reasoning", "id": rw.reason.id, "summary": []any{},
 		},
 	})
 	rw.emit("response.reasoning_summary_part.added", map[string]any{
 		"item_id":      rw.reason.id,
-		"output_index": rw.reasonIndex(),
+		"output_index": rw.reason.out,
 		"summary_index": 0,
 		"part":         map[string]any{"type": "summary_text", "text": ""},
 	})
@@ -295,15 +289,15 @@ func (rw *ResponsesWriter) closeText() {
 	}
 	rw.text.open = false
 	rw.emit("response.output_text.done", map[string]any{
-		"item_id": rw.text.id, "output_index": rw.textIndex(), "content_index": 0,
+		"item_id": rw.text.id, "output_index": rw.text.out, "content_index": 0,
 		"text": rw.text.text,
 	})
 	rw.emit("response.content_part.done", map[string]any{
-		"item_id": rw.text.id, "output_index": rw.textIndex(), "content_index": 0,
+		"item_id": rw.text.id, "output_index": rw.text.out, "content_index": 0,
 		"part": map[string]any{"type": "output_text", "text": rw.text.text, "annotations": []any{}},
 	})
 	rw.emit("response.output_item.done", map[string]any{
-		"output_index": rw.textIndex(), "item": rw.text.view(),
+		"output_index": rw.text.out, "item": rw.text.view(),
 	})
 }
 
@@ -313,15 +307,15 @@ func (rw *ResponsesWriter) closeReasoning() {
 	}
 	rw.reason.open = false
 	rw.emit("response.reasoning_summary_text.done", map[string]any{
-		"item_id": rw.reason.id, "output_index": rw.reasonIndex(), "summary_index": 0,
+		"item_id": rw.reason.id, "output_index": rw.reason.out, "summary_index": 0,
 		"text": rw.reason.summary,
 	})
 	rw.emit("response.reasoning_summary_part.done", map[string]any{
-		"item_id": rw.reason.id, "output_index": rw.reasonIndex(), "summary_index": 0,
+		"item_id": rw.reason.id, "output_index": rw.reason.out, "summary_index": 0,
 		"part": map[string]any{"type": "summary_text", "text": rw.reason.summary},
 	})
 	rw.emit("response.output_item.done", map[string]any{
-		"output_index": rw.reasonIndex(),
+		"output_index": rw.reason.out,
 		"item": map[string]any{
 			"type": "reasoning", "id": rw.reason.id,
 			"summary": []any{map[string]any{"type": "summary_text", "text": rw.reason.summary}},
@@ -337,11 +331,52 @@ func (rw *ResponsesWriter) closeAllTools() {
 		}
 		item.open = false
 		rw.emit("response.function_call_arguments.done", map[string]any{
-			"item_id": item.id, "output_index": rw.toolIndex(idx), "arguments": item.arguments,
+			"item_id": item.id, "output_index": item.out, "arguments": item.arguments,
 		})
 		rw.emit("response.output_item.done", map[string]any{
-			"output_index": rw.toolIndex(idx), "item": item.view(),
+			"output_index": item.out, "item": item.view(),
 		})
+	}
+}
+
+// addItem 登记一个新 item 并分配全流唯一的 output_index（= 创建顺序）。
+func (rw *ResponsesWriter) addItem(it *responsesItem) *responsesItem {
+	it.out = len(rw.order)
+	rw.order = append(rw.order, it)
+	return it
+}
+
+// closeOpenItems 按 output_index 升序收尾所有未关闭的 item——客户端按
+// output_index 驱动 item 生命周期，乱序 done 会让 UI 提前把后续 item 判成孤儿。
+func (rw *ResponsesWriter) closeOpenItems() {
+	for _, it := range rw.order {
+		if !it.open {
+			continue
+		}
+		it.open = false
+		switch it.kind {
+		case "message":
+			rw.emit("response.output_text.done", map[string]any{
+				"item_id": it.id, "output_index": it.out, "content_index": 0, "text": it.text,
+			})
+			rw.emit("response.content_part.done", map[string]any{
+				"item_id": it.id, "output_index": it.out, "content_index": 0,
+				"part": map[string]any{"type": "output_text", "text": it.text, "annotations": []any{}},
+			})
+		case "reasoning":
+			rw.emit("response.reasoning_summary_text.done", map[string]any{
+				"item_id": it.id, "output_index": it.out, "summary_index": 0, "text": it.summary,
+			})
+			rw.emit("response.reasoning_summary_part.done", map[string]any{
+				"item_id": it.id, "output_index": it.out, "summary_index": 0,
+				"part": map[string]any{"type": "summary_text", "text": it.summary},
+			})
+		case "function_call":
+			rw.emit("response.function_call_arguments.done", map[string]any{
+				"item_id": it.id, "output_index": it.out, "arguments": it.arguments,
+			})
+		}
+		rw.emit("response.output_item.done", map[string]any{"output_index": it.out, "item": it.view()})
 	}
 }
 
@@ -363,9 +398,7 @@ func (rw *ResponsesWriter) finish() {
 		rw.ensureStarted(nil)
 	}
 	rw.finished = true
-	rw.closeText()
-	rw.closeReasoning()
-	rw.closeAllTools()
+	rw.closeOpenItems()
 	resp := map[string]any{
 		"id": rw.respID, "object": "response", "status": "completed",
 		"output": rw.outputItems(),
@@ -385,9 +418,7 @@ func (rw *ResponsesWriter) fail(payload string, e any) {
 		rw.ensureStarted(nil)
 	}
 	rw.finished = true
-	rw.closeText()
-	rw.closeReasoning()
-	rw.closeAllTools()
+	rw.closeOpenItems()
 	errmsg, _ := e.(map[string]any)
 	errObj := map[string]any{
 		"type":    "api_error",
@@ -411,23 +442,11 @@ func (rw *ResponsesWriter) fail(payload string, e any) {
 }
 
 // outputItems 返回已产出的完整 item 数组（response.completed 必须带完整 output）。
+// 按创建顺序（即 output_index 升序）返回，与事件里的 output_index 严格对应。
 func (rw *ResponsesWriter) outputItems() []any {
-	items := make([]any, 0, len(rw.toolKeys)+2)
-	if rw.reason != nil {
-		items = append(items, map[string]any{
-			"type": "reasoning", "id": rw.reason.id,
-			"summary": []any{map[string]any{"type": "summary_text", "text": rw.reason.summary}},
-		})
-	}
-	if rw.text != nil {
-		items = append(items, rw.text.view())
-	}
-	keys := append([]int(nil), rw.toolKeys...)
-	sort.Ints(keys)
-	for _, idx := range keys {
-		if it := rw.tools[idx]; it != nil {
-			items = append(items, it.view())
-		}
+	items := make([]any, 0, len(rw.order))
+	for _, it := range rw.order {
+		items = append(items, it.view())
 	}
 	return items
 }
@@ -452,28 +471,6 @@ func (i *responsesItem) view() map[string]any {
 			"summary": []any{map[string]any{"type": "summary_text", "text": i.summary}},
 		}
 	}
-}
-
-// output_index 顺序：reasoning → message → tool_calls（按 index 升序）。
-func (rw *ResponsesWriter) reasonIndex() int { return 0 }
-
-func (rw *ResponsesWriter) textIndex() int {
-	i := 0
-	if rw.reason != nil {
-		i++
-	}
-	return i
-}
-
-func (rw *ResponsesWriter) toolIndex(idx int) int {
-	i := rw.textIndex()
-	for _, k := range rw.toolKeys {
-		if k >= idx {
-			return i
-		}
-		i++
-	}
-	return i
 }
 
 func (rw *ResponsesWriter) respSuffix() string { return strings.TrimPrefix(rw.respID, "resp_") }
