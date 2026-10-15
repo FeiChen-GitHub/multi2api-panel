@@ -496,6 +496,16 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
+	// providers 的键必须是已实现的 provider（DESIGN §8）：拼错时旧行为是静默忽略——
+	// 那一整块配置（enabled / api_host / work_enabled）全部失效，而用户看不出，
+	// 只会在"为什么 Trae 还是启用的 / 为什么 host 没生效"里绕圈。fail fast 更好。
+	for name := range c.Upstream.Providers {
+		switch name {
+		case "workbuddy", "trae":
+		default:
+			return fmt.Errorf("upstream.providers: 未知 provider %q（仅支持 workbuddy / trae）", name)
+		}
+	}
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}

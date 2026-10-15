@@ -181,19 +181,21 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/login/trae/start", p.withAuth(p.loginTraeStart))
 	p.mux.HandleFunc("GET /panel/api/login/trae/result", p.withAuth(p.loginTraeResult))
 	p.mux.HandleFunc("POST /panel/api/login/trae/cancel", p.withAuth(p.loginTraeCancel))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
-	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.withAuth(p.taskAcceptAll))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/claim", p.withAuth(p.accountTaskClaim))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto", p.withAuth(p.accountTaskAuto))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto_all", p.withAuth(p.accountTaskAutoAll))
+	// 账号路由参数是 AccountKey（UUIDv4，DESIGN §9.2 D5 / §11）：uid 只在单个
+	// provider 内唯一，跨 provider 可能撞号，拿它当路径参数会操作到别的账号。
+	p.mux.HandleFunc("POST /panel/api/accounts/{key}/revive", p.withAuth(p.accountRevive))
+	p.mux.HandleFunc("POST /panel/api/accounts/{key}/disable", p.withAuth(p.accountDisable))
+	p.mux.HandleFunc("POST /panel/api/accounts/{key}/pause", p.withAuth(p.accountPause))
+	p.mux.HandleFunc("POST /panel/api/accounts/{key}/resume", p.withAuth(p.accountResume))
+	p.mux.HandleFunc("POST /panel/api/accounts/{key}/checkin", p.withAuth(p.accountCheckin))
+	p.mux.HandleFunc("POST /panel/api/accounts/{key}/balance", p.withAuth(p.accountBalance))
+	p.mux.HandleFunc("POST /panel/api/accounts/{key}/remove", p.withAuth(p.accountRemove))
+	p.mux.HandleFunc("GET /panel/api/accounts/{key}/tasks", p.withAuth(p.accountTasks))
+	p.mux.HandleFunc("POST /panel/api/accounts/{key}/tasks/accept", p.withAuth(p.accountTaskAccept))
+	p.mux.HandleFunc("POST /panel/api/accounts/{key}/tasks/accept_all", p.withAuth(p.taskAcceptAll))
+	p.mux.HandleFunc("POST /panel/api/accounts/{key}/tasks/claim", p.withAuth(p.accountTaskClaim))
+	p.mux.HandleFunc("POST /panel/api/accounts/{key}/tasks/auto", p.withAuth(p.accountTaskAuto))
+	p.mux.HandleFunc("POST /panel/api/accounts/{key}/tasks/auto_all", p.withAuth(p.accountTaskAutoAll))
 	p.mux.HandleFunc("POST /panel/api/tasks/scan_all", p.withAuth(p.tasksScanAll))
 	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.tasksRunQueue))
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
@@ -483,11 +485,11 @@ func (p *Panel) modelProbes(w http.ResponseWriter, r *http.Request) {
 
 // accountRevive 手动复活：清禁用 + 冷却 + 熔断（运维口径无条件恢复）。
 func (p *Panel) accountRevive(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	if _, ok := p.cfg.Pool.Status(uid); !ok {
-		writeErr(w, http.StatusNotFound, "account not found")
+	a := p.accountByKey(w, r.PathValue("key"))
+	if a == nil {
 		return
 	}
+	uid := a.UID
 	p.cfg.Pool.Revive(uid)
 	log.Printf("panel: revive uid=%s（人工清除禁用/冷却/熔断）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -495,11 +497,11 @@ func (p *Panel) accountRevive(w http.ResponseWriter, r *http.Request) {
 
 // accountDisable 人工禁用（不再参与选号，需面板 revive 或重登恢复）。
 func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	if _, ok := p.cfg.Pool.Status(uid); !ok {
-		writeErr(w, http.StatusNotFound, "account not found")
+	a := p.accountByKey(w, r.PathValue("key"))
+	if a == nil {
 		return
 	}
+	uid := a.UID
 	p.cfg.Pool.Disable(uid, "manual disable (panel)")
 	log.Printf("panel: disable uid=%s（人工禁用）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -509,7 +511,11 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 // 余额刷新。与 disable 的区别：不写 reason、不清冷却域、不重置计数——账号是「临时
 // 让位」而非「判死」，点「恢复选号」即可立刻回到池子（无需重登或解冻）。
 func (p *Panel) accountPause(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
+	a := p.accountByKey(w, r.PathValue("key"))
+	if a == nil {
+		return
+	}
+	uid := a.UID
 	if !p.cfg.Pool.Pause(uid) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
@@ -520,7 +526,11 @@ func (p *Panel) accountPause(w http.ResponseWriter, r *http.Request) {
 
 // accountResume 解除暂停选号（幂等，对未暂停账号为空操作）。
 func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
+	a := p.accountByKey(w, r.PathValue("key"))
+	if a == nil {
+		return
+	}
+	uid := a.UID
 	if !p.cfg.Pool.Resume(uid) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
@@ -532,12 +542,11 @@ func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.cfg.Pool.AuthByUID(uid)
+	a := p.accountByKey(w, r.PathValue("key"))
 	if a == nil {
-		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+	uid := a.UID
 	// provider 分发（DESIGN §11.1）：Trae 走 ChatClient.Checkin，不套 WorkBuddy 的门控与端点。
 	if a.Provider() == auth.ProviderTrae {
 		p.checkinTrae(w, a)
@@ -584,12 +593,11 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 
 // accountBalance 单号余额刷新：更新余额与到期快照，不触碰冷却状态。
 func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.cfg.Pool.AuthByUID(uid)
+	a := p.accountByKey(w, r.PathValue("key"))
 	if a == nil {
-		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+	uid := a.UID
 	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
@@ -601,15 +609,19 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.cfg.Pool.Remove(uid)
+	a := p.accountByKey(w, r.PathValue("key"))
 	if a == nil {
+		return
+	}
+	uid := a.UID
+	removed := p.cfg.Pool.Remove(uid)
+	if removed == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
 	fileMsg := ""
-	if a.FilePath != "" {
-		if err := os.Remove(a.FilePath); err != nil && !os.IsNotExist(err) {
+	if removed.FilePath != "" {
+		if err := os.Remove(removed.FilePath); err != nil && !os.IsNotExist(err) {
 			fileMsg = err.Error()
 		}
 	}

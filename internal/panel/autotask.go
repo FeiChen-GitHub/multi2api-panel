@@ -617,11 +617,11 @@ func runMiniExpert(p *Panel, a *auth.Auth) (string, error) {
 
 // accountTaskAuto 一键完成单个任务：执行对应动作 → 回读进度 → 汇报结果。
 func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
+	a := p.accountByKey(w, r.PathValue("key"))
 	if a == nil {
 		return
 	}
+	uid := a.UID // 上游账号 id：动作、日志与任务锁继续按它走
 	var body struct {
 		TaskCode string `json:"task_code"`
 	}
@@ -1235,11 +1235,11 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 
 // accountTaskAutoAll 一键完成该账号全部可自动任务。
 func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
+	a := p.accountByKey(w, r.PathValue("key"))
 	if a == nil {
 		return
 	}
+	uid := a.UID // 上游账号 id：动作、日志与任务锁继续按它走
 	// per-account 互斥（与单任务动作共用一把锁）：重复点击 409。
 	if !p.tryLockAccount(uid) {
 		writeErr(w, http.StatusConflict, "该账号有任务动作正在执行中，请等本轮结束后再试")

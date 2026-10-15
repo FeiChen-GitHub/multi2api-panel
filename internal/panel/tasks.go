@@ -16,9 +16,16 @@ import (
 // acceptBatchGap 批量接受的批间节流（对齐脚本 1.05s 口径，避免上游风控）。
 var acceptBatchGap = 1050 * time.Millisecond
 
-// accountByUID 取账号凭证；不存在时写 404 并返回 nil。
-func (p *Panel) accountByUID(w http.ResponseWriter, uid string) *auth.Auth {
-	a := p.cfg.Pool.AuthByUID(uid)
+// accountByKey 按池内主键（AccountKey）取账号——面板路由参数的唯一解析入口。
+//
+// DESIGN §9.2 D5 / §11：面板路由参数用 AccountKey 而不是 uid。uid 只在单个
+// provider 内唯一，跨 provider 可能重复（upsert 时 byUID 镜像只保留后进者），
+// 拿 uid 当路由参数会操作到另一个 provider 的同名账号。AccountKey 是自生成
+// UUID，天然跨 provider 唯一，且不含 "/"，可直接作路径段。
+// 拿到账号后，其余逻辑（上游调用、日志、任务锁）继续用 uid——它是上游账号 id，
+// 面板 URL 之外的语义没有变化。
+func (p *Panel) accountByKey(w http.ResponseWriter, key string) *auth.Auth {
+	a := p.cfg.Pool.AuthByKey(auth.AccountKey(key))
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return nil
@@ -26,10 +33,10 @@ func (p *Panel) accountByUID(w http.ResponseWriter, uid string) *auth.Auth {
 	return a
 }
 
-// wbTaskAccount 取账号并确认它属于 WorkBuddy —— 成长任务是 WorkBuddy 专属体系，
-// Trae 上游没有对应端点（DESIGN §11.1）。非 wb 账号明确报错而不是打错上游。
-func (p *Panel) wbTaskAccount(w http.ResponseWriter, uid string) *auth.Auth {
-	a := p.accountByUID(w, uid)
+// wbTaskAccount 按主键取账号并确认它属于 WorkBuddy —— 成长任务是 WorkBuddy 专属
+// 体系，Trae 上游没有对应端点（DESIGN §11.1）。非 wb 账号明确报错而不是打错上游。
+func (p *Panel) wbTaskAccount(w http.ResponseWriter, key string) *auth.Auth {
+	a := p.accountByKey(w, key)
 	if a == nil {
 		return nil
 	}
@@ -42,8 +49,7 @@ func (p *Panel) wbTaskAccount(w http.ResponseWriter, uid string) *auth.Auth {
 
 // accountTasks 查询单账号全量任务（进度/状态/可领取）。
 func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.wbTaskAccount(w, uid)
+	a := p.wbTaskAccount(w, r.PathValue("key"))
 	if a == nil {
 		return
 	}
@@ -71,8 +77,7 @@ func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 
 // accountTaskAccept 接受任务（报名；幂等）。
 func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.wbTaskAccount(w, uid)
+	a := p.wbTaskAccount(w, r.PathValue("key"))
 	if a == nil {
 		return
 	}
@@ -87,7 +92,7 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "accept: "+err.Error())
 		return
 	}
-	log.Printf("panel: 接受任务 uid=%s codes=%v", uid, body.TaskCodes)
+	log.Printf("panel: 接受任务 uid=%s codes=%v", a.UID, body.TaskCodes)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -98,11 +103,11 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 // 上游 scripts 的注释同样建议"先 accept"。
 // 批量提交会分片（上游对 task_codes 数组长度无公开上限，保守每批 20 个）。
 func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.wbTaskAccount(w, uid)
+	a := p.wbTaskAccount(w, r.PathValue("key"))
 	if a == nil {
 		return
 	}
+	uid := a.UID // 上游账号 id：日志继续按它走
 	tasks, err := p.cfg.Upstream.ListTasks(a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
@@ -165,11 +170,11 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 
 // accountTaskClaim 领取任务奖励（未达标时上游返回业务错误，原样透出给前端提示）。
 func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.wbTaskAccount(w, uid)
+	a := p.wbTaskAccount(w, r.PathValue("key"))
 	if a == nil {
 		return
 	}
+	uid := a.UID // 上游账号 id：日志继续按它走
 	var body struct {
 		TaskCode string `json:"task_code"`
 	}

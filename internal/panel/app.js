@@ -440,15 +440,15 @@ function renderAccounts(list) {
         // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
         // upstream 的 get-enterprise-user-usage 口径填充。
         (s.enterprise ? '' :
-          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
-        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
+          '<button class="xs ghost" data-a="checkin" data-k="' + esc(s.key) + '" data-n="' + esc(s.nickname || '') + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
+        '<button class="xs ghost" data-a="balance" data-k="' + esc(s.key) + '" data-n="' + esc(s.nickname || '') + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
         (s.enterprise || s.provider === 'trae' ? '' :
-          '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
-        (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
-                : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
-                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
-        (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
-        '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
+          '<button class="xs ghost" data-a="tasks" data-k="' + esc(s.key) + '" data-n="' + esc(s.nickname || '') + '">任务</button>') +
+        (frozen ? '<button class="xs primary" data-a="revive" data-k="' + esc(s.key) + '">解冻</button>'
+                : (s.paused ? '<button class="xs primary" data-a="resume" data-k="' + esc(s.key) + '">恢复选号</button>'
+                            : '<button class="xs ghost" data-a="pause" data-k="' + esc(s.key) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
+        (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-k="' + esc(s.key) + '">禁用</button>') +
+        '<button class="xs ghost danger" data-a="remove" data-k="' + esc(s.key) + '">移除</button>' +
       '</td></tr>';
   }).join('');
 }
@@ -523,7 +523,9 @@ async function loadOverview(quiet) {
 $('accBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-a]');
   if (!b) return;
-  const u = b.dataset.u, a = b.dataset.a;
+  // data-k 是账号主键（AccountKey）而不是 uid：uid 跨 provider 可能撞号，
+  // 面板路由参数一律用主键（DESIGN §9.2 D5）。data-n 仅供展示用。
+  const u = b.dataset.k, a = b.dataset.a, nick = b.dataset.n || '';
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
   if (a === 'disable' && !confirm('禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
   b.disabled = true;
@@ -547,7 +549,7 @@ $('accBody').addEventListener('click', async ev => {
       await api('accounts/' + encodeURIComponent(u) + '/resume', { method: 'POST' });
       toast('已恢复选号', 'ok');
     } else if (a === 'tasks') {
-      openTasks(u);
+      openTasks(u, nick);
     } else if (a === 'remove') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
@@ -1312,7 +1314,7 @@ async function checkAuthGate() {
 start();
 
 /* ── 积分任务 ─────────────────────────────────────────────────────── */
-let taskUID = null;
+let taskKey = null;
 
 // 可自动完成的任务（与后端 autoActions 表一致）：判据为行为事件、可经网关复现。
 // 其余任务需在官方客户端内交互，面板只展示指引（行 title 提示）。
@@ -1345,24 +1347,25 @@ const AUTO_TASKS = {
   'Sequential_Tasks_7': '体验灵感功能（预留，疑 PC 口径）：accept → 灵感事件组（PC+mp 双形态）→ 领奖（判据待解锁验证）'
 };
 
-function openTasks(uid) {
-  taskUID = uid;
-  $('taskWho').textContent = uid.slice(0, 16);
+// key 是账号主键（面板路由参数），nick 仅用于标题展示。
+function openTasks(key, nick) {
+  taskKey = key;
+  $('taskWho').textContent = (nick && nick.trim()) || key.slice(0, 8);
   $('taskVeil').classList.add('on');
   $('btnTaskReload').hidden = false;
   loadTasks();
 }
-function closeTasks() { $('taskVeil').classList.remove('on'); taskUID = null; }
+function closeTasks() { $('taskVeil').classList.remove('on'); taskKey = null; }
 $('btnCloseTask').onclick = closeTasks;
 $('btnTaskReload').onclick = loadTasks;
 
 // 全部接受：把该账号未接受的任务一次性报名（幂等，跳过已接受/已领取）。
 $('btnTaskAcceptAll').onclick = async () => {
-  if (!taskUID) return;
+  if (!taskKey) return;
   const btn = $('btnTaskAcceptAll');
   btn.disabled = true; btn.textContent = '接受中…';
   try {
-    const r = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks/accept_all', { method: 'POST' });
+    const r = await api('accounts/' + encodeURIComponent(taskKey) + '/tasks/accept_all', { method: 'POST' });
     const n = r.accepted || 0;
     if (r.failed && r.failed.length) {
       toast(`已接受 ${n} 个，${r.failed.length} 个被上游拒绝（可重试）`, 'err');
@@ -1375,12 +1378,12 @@ $('btnTaskAcceptAll').onclick = async () => {
 
 // 一键完成全部可自动任务（耗时较长：含真实对话，逐项回读验证）。
 $('btnTaskAutoAll').onclick = async () => {
-  if (!taskUID) return;
+  if (!taskKey) return;
   const btn = $('btnTaskAutoAll');
   if (!confirm('将依次执行：补报对话事件、领取 Buddy、glm-5.2 对话、尝试上报。\n过程约 1-2 分钟（含真实对话），确认继续？')) return;
   btn.disabled = true; btn.textContent = '执行中…';
   try {
-    const r = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks/auto_all', { method: 'POST' });
+    const r = await api('accounts/' + encodeURIComponent(taskKey) + '/tasks/auto_all', { method: 'POST' });
     const okN = (r.results || []).filter(x => x.status === 'done').length;
     const skipN = (r.results || []).filter(x => x.status === 'skipped').length;
     const errN = (r.results || []).filter(x => x.status === 'error').length;
@@ -1391,14 +1394,14 @@ $('btnTaskAutoAll').onclick = async () => {
 };
 
 async function loadTasks() {
-  if (!taskUID) return;
+  if (!taskKey) return;
   const st = $('taskState'), tb = $('taskTable');
   st.hidden = false;
   st.className = 'state';
   st.innerHTML = '<span class="dots">查询中</span>';
   tb.hidden = true;
   try {
-    const d = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks');
+    const d = await api('accounts/' + encodeURIComponent(taskKey) + '/tasks');
     const list = d.tasks || [];
     if (!list.length) {
       st.className = 'state';
@@ -1445,14 +1448,14 @@ async function loadTasks() {
 
 $('taskBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-t]');
-  if (!b || !taskUID) return;
+  if (!b || !taskKey) return;
   const kind = b.dataset.t, code = b.dataset.c;
   b.disabled = true;
   try {
     if (kind === 'auto') {
       // 一键完成：后端执行动作 → 回读进度 → 汇报（耗时可到分钟级，含真实对话）
       b.textContent = '执行中…';
-      const r = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks/auto', {
+      const r = await api('accounts/' + encodeURIComponent(taskKey) + '/tasks/auto', {
         method: 'POST', body: JSON.stringify({ task_code: code })
       });
       if (r.skipped) {
@@ -1468,7 +1471,7 @@ $('taskBody').addEventListener('click', async ev => {
       }
       loadOverview(true);
     } else {
-      const path = 'accounts/' + encodeURIComponent(taskUID) + '/tasks/' + (kind === 'claim' ? 'claim' : 'accept');
+      const path = 'accounts/' + encodeURIComponent(taskKey) + '/tasks/' + (kind === 'claim' ? 'claim' : 'accept');
       const body = kind === 'claim' ? { task_code: code } : { task_codes: [code] };
       await api(path, { method: 'POST', body: JSON.stringify(body) });
       toast(kind === 'claim' ? '已领取奖励' : '已接受任务', 'ok');
