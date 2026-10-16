@@ -99,9 +99,11 @@ type Status struct {
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
 	Realm string `json:"realm,omitempty"`
-	// Enterprise 企业版账号（auth.EnterpriseID 非空，计算值不落盘）。
-	// 企业版无个人成长体系（签到/成长任务/连登/旅行/夜猫子 上游均拒），
-	// 面板据此隐藏对应按钮；选号、保活、额度展示不受影响。
+	// Enterprise 企业版账号（auth.EnterpriseID 非空且非 Trae，计算值不落盘）。
+	// 「企业版无个人成长体系」是 WorkBuddy 私有规则（签到/成长任务/连登/旅行/
+	// 夜猫子 上游均拒），面板据此隐藏对应按钮；Trae 恒可签到，故不置该标记
+	// （Trae 登录会把 TenantID 记入 EnterpriseID，但那是租户标识而非企业版规则）。
+	// 选号、保活、额度展示不受影响。
 	Enterprise     bool   `json:"enterprise,omitempty"`
 	Disabled       bool   `json:"disabled"`
 	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）

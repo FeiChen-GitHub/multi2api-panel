@@ -178,6 +178,60 @@ func TestTraeQueryCredits(t *testing.T) {
 	}
 }
 
+// CreditPackages / AccountCredits：真实字段名（display_desc、start_time、end_time、
+// product_id）映射为有包名/来源/到期的明细，供面板「积分构成」与到期聚合使用。
+func TestTraeCreditPackagesMapsRealFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != TraeEpEntUsage {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"user_entitlement_pack_list":[` +
+			`{"display_desc":"签到奖励","entitlement_base_info":{"product_id":208,"start_time":1791855046,"end_time":1794533446,"quota":{"credits_limit":100}},"usage":{"credits_amount":30}},` +
+			`{"display_desc":"免费","entitlement_base_info":{"quota":{"credits_limit":0}},"usage":{}}]}`))
+	}))
+	defer srv.Close()
+	c := newTestTraeClient(srv)
+	a := &auth.Auth{AccessToken: "jwt-1", UID: "u1"}
+
+	packs, remain, total, err := c.CreditPackages(context.Background(), a)
+	if err != nil {
+		t.Fatalf("CreditPackages: %v", err)
+	}
+	if len(packs) != 1 {
+		t.Fatalf("packs = %d, want 1（credits_limit<=0 的权益包跳过）", len(packs))
+	}
+	if packs[0].Name != "签到奖励" {
+		t.Errorf("name = %q, want 签到奖励", packs[0].Name)
+	}
+	if packs[0].PackageCode != "trae_208" {
+		t.Errorf("package_code = %q, want trae_208", packs[0].PackageCode)
+	}
+	if packs[0].CreatedAt == "" || packs[0].EndTime == "" {
+		t.Errorf("created_at/end_time 不应为空: %+v", packs[0])
+	}
+	if packs[0].ExpiresAt != 1794533446*1000 {
+		t.Errorf("expires_at = %d, want 毫秒时间戳", packs[0].ExpiresAt)
+	}
+	if remain != 70 || total != 100 {
+		t.Errorf("remain/total = %d/%d, want 70/100", remain, total)
+	}
+
+	rem2, tot2, expiring, earliestAt, _, err := c.AccountCredits(context.Background(), a, 0)
+	if err != nil {
+		t.Fatalf("AccountCredits: %v", err)
+	}
+	if rem2 != 70 || tot2 != 100 {
+		t.Errorf("AccountCredits remain/total = %d/%d, want 70/100", rem2, tot2)
+	}
+	if earliestAt.IsZero() {
+		t.Error("AccountCredits earliestAt 不应为零值（包有 end_time）")
+	}
+	if expiring != 0 {
+		t.Errorf("expiring(soon=0) = %d, want 0（soon=0 不分桶）", expiring)
+	}
+}
+
 // Token 刷新：ExchangeToken 成功要写回 a（持锁），并归一化毫秒级过期时间。
 func TestTraeRefreshTokenUpdatesAuth(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

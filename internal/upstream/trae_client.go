@@ -377,34 +377,45 @@ func (c *TraeClient) Checkin(ctx context.Context, a *auth.Auth) error {
 
 // QueryCredits 聚合账号额度：remain = Σ(credits_limit) - Σ(credits_amount)，total = Σ limits。
 func (c *TraeClient) QueryCredits(ctx context.Context, a *auth.Auth) (remain, total int64, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.UgHost+TraeEpEntUsage, bytes.NewReader([]byte("{}")))
-	if err != nil {
-		return 0, 0, err
-	}
-	traeUgHeaders(req, a)
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode >= 400 {
-		return 0, 0, &Error{Kind: TraeClassify(resp.StatusCode, string(raw)), Status: resp.StatusCode, Msg: truncateText(string(raw), 200)}
-	}
+	_, remain, total, err = c.queryTraeCredits(ctx, a)
+	return remain, total, nil
+}
+
+// traeEntPack 单个 entitlement 包的归一化结构（额度 + 时间 + 来源）。
+type traeEntPack struct {
+	Name      string // display_desc（如「签到奖励」「每月登录赠送」「免费」）
+	Remain    int64
+	Used      int64
+	Size      int64
+	StartAt   int64 // entitlement_base_info.start_time（Unix 秒，发放时刻）
+	EndAt     int64 // entitlement_base_info.end_time（Unix 秒，缺失回落顶层 expire_time）
+	ProductID int64 // entitlement_base_info.product_id（来源标识）
+}
+
+// parseTraeEntUsage 解析 Trae 额度接口（ide_user_ent_usage）的 entitlement 列表，
+// 聚合 remain/total 并保留按包明细（供 CreditPackages 映射）。字段名取自实测样本：
+// display_desc、entitlement_base_info.{quota.credits_limit,start_time,end_time,product_id}、
+// usage.credits_amount（缺省 = 0）。credits_limit<=0 的权益类包（如免费档）跳过。
+func parseTraeEntUsage(raw []byte) (packs []traeEntPack, remain, total int64, err error) {
 	var out struct {
 		UserEntitlementPackList []struct {
+			DisplayDesc         string `json:"display_desc"`
 			EntitlementBaseInfo struct {
-				Quota struct {
+				ProductID int64 `json:"product_id"`
+				StartTime int64 `json:"start_time"`
+				EndTime   int64 `json:"end_time"`
+				Quota     struct {
 					CreditsLimit int64 `json:"credits_limit"`
 				} `json:"quota"`
 			} `json:"entitlement_base_info"`
 			Usage struct {
 				CreditsAmount float64 `json:"credits_amount"`
 			} `json:"usage"`
+			ExpireTime int64 `json:"expire_time"`
 		} `json:"user_entitlement_pack_list"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return 0, 0, fmt.Errorf("ent usage parse: %w", err)
+		return nil, 0, 0, fmt.Errorf("ent usage parse: %w", err)
 	}
 	for _, p := range out.UserEntitlementPackList {
 		limit := p.EntitlementBaseInfo.Quota.CreditsLimit
@@ -414,8 +425,108 @@ func (c *TraeClient) QueryCredits(ctx context.Context, a *auth.Auth) (remain, to
 		used := int64(p.Usage.CreditsAmount)
 		total += limit
 		remain += limit - used
+		end := p.EntitlementBaseInfo.EndTime
+		if end == 0 {
+			end = p.ExpireTime
+		}
+		packs = append(packs, traeEntPack{
+			Name:      p.DisplayDesc,
+			Remain:    limit - used,
+			Used:      used,
+			Size:      limit,
+			StartAt:   p.EntitlementBaseInfo.StartTime,
+			EndAt:     end,
+			ProductID: p.EntitlementBaseInfo.ProductID,
+		})
 	}
-	return remain, total, nil
+	return packs, remain, total, nil
+}
+
+// AccountCredits 带到期明细的聚合余额，口径与 WorkBuddy 的
+// UserResourceDetailedWithExpiry 对齐：expiring = soon 窗口内到期的剩余积分，
+// earliestAt/earliestRemaining = 最早到期包的时刻与剩余（同刻累加）。
+func (c *TraeClient) AccountCredits(ctx context.Context, a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
+	packs, remain, total, err := c.queryTraeCredits(ctx, a)
+	if err != nil {
+		return 0, 0, 0, time.Time{}, 0, err
+	}
+	now := time.Now()
+	for _, p := range packs {
+		if p.Remain <= 0 || p.EndAt <= 0 {
+			continue
+		}
+		end := time.Unix(p.EndAt, 0)
+		if !end.After(now) {
+			continue
+		}
+		if earliestAt.IsZero() || end.Before(earliestAt) {
+			earliestAt = end
+			earliestRemaining = p.Remain
+		} else if end.Equal(earliestAt) {
+			earliestRemaining += p.Remain
+		}
+		if soon > 0 && !end.After(now.Add(soon)) {
+			expiring += p.Remain
+		}
+	}
+	return remain, total, expiring, earliestAt, earliestRemaining, nil
+}
+
+// CreditPackages 套餐明细。复用额度接口的 entitlement 列表映射为 CreditPackage：
+// name 取 display_desc、created_at/end_time 由 start_time/end_time 转 RFC3339、
+// expires_at 用毫秒（前端按毫秒解析）、package_code 用「trae_<product_id>」。
+func (c *TraeClient) CreditPackages(ctx context.Context, a *auth.Auth) ([]CreditPackage, int64, int64, error) {
+	packs, remain, total, err := c.queryTraeCredits(ctx, a)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	out := make([]CreditPackage, 0, len(packs))
+	for _, p := range packs {
+		out = append(out, CreditPackage{
+			Name:        p.Name,
+			Remain:      p.Remain,
+			Used:        p.Used,
+			Size:        p.Size,
+			CreatedAt:   traeUnixRFC3339(p.StartAt),
+			EndTime:     traeUnixRFC3339(p.EndAt),
+			ExpiresAt:   p.EndAt * 1000, // 前端按 Unix 毫秒解析
+			PackageCode: fmt.Sprintf("trae_%d", p.ProductID),
+		})
+	}
+	return out, remain, total, nil
+}
+
+// traeUnixRFC3339 把 Unix 秒转东八区 RFC3339（前端只取日期/时间片段展示）；
+// <=0 返回空串，前端按「无到期」处理。
+func traeUnixRFC3339(sec int64) string {
+	if sec <= 0 {
+		return ""
+	}
+	return time.Unix(sec, 0).In(time.FixedZone("CST", 8*3600)).Format(time.RFC3339)
+}
+
+// queryTraeCredits 拉取并解析 Trae 额度接口，返回明细 + 聚合值（AccountCredits /
+// CreditPackages 共用，避免重复请求）。
+func (c *TraeClient) queryTraeCredits(ctx context.Context, a *auth.Auth) (packs []traeEntPack, remain, total int64, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.UgHost+TraeEpEntUsage, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	traeUgHeaders(req, a)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, 0, 0, &Error{Kind: TraeClassify(resp.StatusCode, string(raw)), Status: resp.StatusCode, Msg: truncateText(string(raw), 200)}
+	}
+	packs, remain, total, err = parseTraeEntUsage(raw)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	return packs, remain, total, nil
 }
 
 // truncateText 截断错误体，避免把整页 HTML 塞进日志/状态。

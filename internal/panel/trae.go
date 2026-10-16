@@ -68,13 +68,13 @@ func (p *Panel) balanceTrae(w http.ResponseWriter, a *auth.Auth) {
 		writeErr(w, http.StatusServiceUnavailable, "Trae provider 未接入或未启用")
 		return
 	}
-	remain, total, err := client.QueryCredits(context.Background(), a)
+	remain, total, expiring, earliestAt, earliestRemaining, err := client.AccountCredits(context.Background(), a, p.expiringSoonWindow())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "trae query credits: "+err.Error())
 		return
 	}
 	p.cfg.Pool.ReenableIfCredits(a.UID, remain, total)
-	p.cfg.Pool.SetCredits(a.UID, remain, total)
+	p.cfg.Pool.SetCreditsDetailed(a.UID, remain, total, expiring, earliestAt, earliestRemaining)
 	log.Printf("panel: trae balance uid=%s credits=%d/%d", a.UID, remain, total)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "credits": remain, "credits_total": total, "provider": string(auth.ProviderTrae),

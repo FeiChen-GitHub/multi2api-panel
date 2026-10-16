@@ -13,6 +13,11 @@ func TestStatusExposesEnterpriseFlag(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "ent", Nickname: "企业号", EnterpriseID: "e1"})
 	p.Add(&auth.Auth{UID: "per", Nickname: "个人号"})
+	// Trae 登录把 TenantID 记入 EnterpriseID，但「企业版」是 WorkBuddy 私有规则，
+	// Trae 恒可签到：不得因此被标成企业版（否则面板隐藏签到按钮）。
+	traeAuth := &auth.Auth{UID: "trae1", Nickname: "Trae号", EnterpriseID: "tenant-1"}
+	auth.SetProvider(traeAuth, auth.ProviderTrae)
+	p.Add(traeAuth)
 
 	ent, ok := p.Status("ent")
 	if !ok {
@@ -28,6 +33,13 @@ func TestStatusExposesEnterpriseFlag(t *testing.T) {
 	if per.Enterprise {
 		t.Error("个人号 Status.Enterprise 应为 false")
 	}
+	tr, ok := p.Status("trae1")
+	if !ok {
+		t.Fatal("trae1 status missing")
+	}
+	if tr.Enterprise {
+		t.Error("Trae 号即使有 TenantID 也不应标企业版（会误藏签到按钮）")
+	}
 
 	// List() 是面板 overview 的数据源，同样要带标志。
 	for _, st := range p.List() {
@@ -39,6 +51,10 @@ func TestStatusExposesEnterpriseFlag(t *testing.T) {
 		case "per":
 			if st.Enterprise {
 				t.Error("List() 误标个人号为企业版")
+			}
+		case "trae1":
+			if st.Enterprise {
+				t.Error("List() 误标 Trae 号为企业版")
 			}
 		}
 	}

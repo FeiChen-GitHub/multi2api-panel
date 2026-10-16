@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -21,11 +22,21 @@ type fakeChatClient struct {
 func (f *fakeChatClient) ChatStream(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta upstream.ChatMeta, ch upstream.Channel) (io.ReadCloser, int, []byte, error) {
 	return nil, 0, nil, nil
 }
-func (f *fakeChatClient) Checkin(ctx context.Context, a *auth.Auth) error      { f.checkinCalls++; return nil }
+func (f *fakeChatClient) Checkin(ctx context.Context, a *auth.Auth) error {
+	f.checkinCalls++
+	return nil
+}
 func (f *fakeChatClient) RefreshToken(ctx context.Context, a *auth.Auth) error { return nil }
 func (f *fakeChatClient) QueryCredits(ctx context.Context, a *auth.Auth) (int64, int64, error) {
 	f.creditsCalls++
 	return f.remain, f.total, nil
+}
+func (f *fakeChatClient) AccountCredits(ctx context.Context, a *auth.Auth, soon time.Duration) (int64, int64, int64, time.Time, int64, error) {
+	f.creditsCalls++
+	return f.remain, f.total, 0, time.Time{}, 0, nil
+}
+func (f *fakeChatClient) CreditPackages(ctx context.Context, a *auth.Auth) ([]upstream.CreditPackage, int64, int64, error) {
+	return nil, f.remain, f.total, nil
 }
 
 // 「全部签到」（RunCheckinNow）必须覆盖 Trae 账号：走 ChatClient.Checkin +

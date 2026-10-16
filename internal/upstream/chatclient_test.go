@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
@@ -18,6 +19,12 @@ func (f *fakeClient) Checkin(ctx context.Context, a *auth.Auth) error      { ret
 func (f *fakeClient) RefreshToken(ctx context.Context, a *auth.Auth) error { return nil }
 func (f *fakeClient) QueryCredits(ctx context.Context, a *auth.Auth) (int64, int64, error) {
 	return 0, 0, nil
+}
+func (f *fakeClient) AccountCredits(ctx context.Context, a *auth.Auth, soon time.Duration) (int64, int64, int64, time.Time, int64, error) {
+	return 0, 0, 0, time.Time{}, 0, nil
+}
+func (f *fakeClient) CreditPackages(ctx context.Context, a *auth.Auth) ([]CreditPackage, int64, int64, error) {
+	return nil, 0, 0, nil
 }
 
 // 现有 WorkBuddy 客户端经适配后必须满足 ChatClient。

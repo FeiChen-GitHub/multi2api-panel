@@ -635,9 +635,12 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
-		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
-		Realm:                    e.a.Realm(),
-		Enterprise:               e.a.IsEnterprise(),
+		RateLimitedModels: p.rateLimitedModelsLocked(e, now),
+		Realm:             e.a.Realm(),
+		// Trae 登录把 TenantID 记入 EnterpriseID，但「企业版」是 WorkBuddy 的
+		// 私有规则（企业号无个人成长体系→面板隐藏签到/任务）；Trae 恒可签到，
+		// 故 Trae 不置该标记，避免面板误藏签到按钮、误标「企业版」。
+		Enterprise:               e.a.IsEnterprise() && e.a.Provider() != auth.ProviderTrae,
 		Nickname:                 e.a.Nickname,
 		Credits:                  e.credits,
 		CreditsTotal:             e.creditsTotal,

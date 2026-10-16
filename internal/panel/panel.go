@@ -936,14 +936,17 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 				out[i] = it
 				return
 			}
-			// 积分包构成是 WorkBuddy 专属端点（Trae 上游没有对应接口）：Trae 号不打
-			// 上游、直接标注，否则会拿它的 token 打 WB 端点拿到 401 并显示成故障。
-			if a.Provider() != auth.ProviderWorkBuddy {
-				it.Error = "该来源不支持积分包构成（仅 WorkBuddy 账号）"
+			// 按 provider 分发：WorkBuddy 走专用端点（WBClient 转发 *Client），Trae 走
+			// ChatClient.CreditPackages（ide_user_ent_usage 的 entitlement 列表，含
+			// display_desc 及各包发放/到期时间）。此前对 Trae 直接判「不支持」是误判——
+			// 该接口实际返回逐包明细；不分发则会拿 Trae token 打 WB 端点拿到 401。
+			client := p.clientFor(a.Provider())
+			if client == nil {
+				it.Error = "该 provider 未接入或未启用"
 				out[i] = it
 				return
 			}
-			packs, remain, size, err := p.cfg.Upstream.CreditPackages(a)
+			packs, remain, size, err := client.CreditPackages(context.Background(), a)
 			if err != nil {
 				it.Error = err.Error()
 				out[i] = it
