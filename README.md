@@ -277,11 +277,11 @@ docker compose down             # 停止并移除容器（数据在 ./auths 与 
 ### 方式二：Windows 单文件运行（无需 Docker）
 
 ```powershell
-# 1) 下载 Release 中的 wb2api.exe，或从源码构建
-go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
+# 1) 下载 Release 中的 multi2api.exe，或从源码构建
+go build -trimpath -ldflags="-s -w" -o multi2api.exe ./cmd/server
 
 # 2) 直接运行：首次启动自动生成 config.json（含随机 api_key，日志打印一次）
-.\wb2api.exe -config config.json
+.\multi2api.exe -config config.json
 
 # 3) 浏览器打开面板添加账号
 #    http://127.0.0.1:7863/panel/
@@ -301,7 +301,7 @@ go run ./cmd/server -config config.json
 构建全部二进制：
 
 ```bash
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o wb2api ./cmd/server
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o multi2api ./cmd/server
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o signin_bin ./cmd/signin
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o login ./cmd/login
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
@@ -772,7 +772,7 @@ http://127.0.0.1:7863/panel/
 
 多阶段镜像（`golang:1.23-alpine` 构建 → `alpine:3.20` 运行）一次编译全部四个二进制并随镜像分发：
 
-- **wb2api**（主服务）、**signin_bin**、**login**、**credit** + 脚本（`login.sh` / `signin.sh` / `credit.sh` / `scripts/probe_active.py`）
+- **multi2api**（主服务）、**signin_bin**、**login**、**credit** + 脚本（`login.sh` / `signin.sh` / `credit.sh` / `scripts/probe_active.py`）
 - 以 `app` 用户（uid 10001）运行，`app/auths` 与 `app/data` 预建
 - 镜像内默认落 `config.example.json` 作为空配置（不含密钥），生产用挂载卷覆盖 `/app/config.json`
 - 内置 `HEALTHCHECK`（`wget /healthz`，30s 间隔）

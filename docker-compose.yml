@@ -1,5 +1,5 @@
 services:
-  wb2api:
+  multi2api:
     build: .
     container_name: workbuddy2api
     restart: unless-stopped

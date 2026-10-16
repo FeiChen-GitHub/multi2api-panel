@@ -17,6 +17,7 @@ data/
 config.json
 
 # Build artifacts
+/build/
 *.tmp
 __pycache__/
 
