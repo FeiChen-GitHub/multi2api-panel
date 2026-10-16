@@ -492,6 +492,9 @@ func panelTraeModelEntry(mi upstream.ModelInfo) map[string]any {
 	if mi.ContextWindow > 0 {
 		entry["context_length"] = mi.ContextWindow
 	}
+	if mi.MaxTokens > 0 {
+		entry["max_output_tokens"] = mi.MaxTokens
+	}
 	return entry
 }
 

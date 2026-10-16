@@ -492,6 +492,9 @@ func (h *Handler) modelList() []map[string]any {
 					if mi.ContextWindow > 0 {
 						entry["context_length"] = mi.ContextWindow
 					}
+					if mi.MaxTokens > 0 {
+						entry["max_output_tokens"] = mi.MaxTokens
+					}
 					if mi.Name != "" {
 						entry["name"] = mi.Name
 					}

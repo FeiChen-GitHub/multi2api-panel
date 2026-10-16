@@ -100,10 +100,23 @@ func (c *TraeClient) FetchModels(ctx context.Context, a *auth.Auth) ([]ModelInfo
 	}
 	var out struct {
 		ConfigInfoList []struct {
-			ConfigName    string `json:"config_name"`
+			ConfigName string `json:"config_name"`
+			IsDefault  bool   `json:"is_default"`
+			// context_window_tokens 形如 {"dev":200000,"max":...}；缺失/为 null 时零值。
+			ContextWindowTokens struct {
+				Dev int64 `json:"dev"`
+				Max int64 `json:"max"`
+			} `json:"context_window_tokens"`
 			DisplayConfig struct {
-				DisplayName string `json:"display_name"`
+				DisplayName     string `json:"display_name"`
+				Multimodal      bool   `json:"multimodal"`
+				ModelCapability string `json:"model_capability"`
 			} `json:"display_config"`
+			// model_detail_list[0].max_tokens 是该模型的输出上限（input 上限见
+			// prompt_max_tokens，二者之和 = context_window_tokens）。
+			ModelDetailList []struct {
+				MaxTokens int64 `json:"max_tokens"`
+			} `json:"model_detail_list"`
 		} `json:"config_info_list"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -111,10 +124,30 @@ func (c *TraeClient) FetchModels(ctx context.Context, a *auth.Auth) ([]ModelInfo
 	}
 	infos := make([]ModelInfo, 0, len(out.ConfigInfoList))
 	for _, cfg := range out.ConfigInfoList {
-		if strings.TrimSpace(cfg.ConfigName) == "" {
+		id := strings.TrimSpace(cfg.ConfigName)
+		if id == "" {
 			continue
 		}
-		infos = append(infos, ModelInfo{ID: cfg.ConfigName, Name: cfg.DisplayConfig.DisplayName})
+		// 上下文窗口：优先 dev，缺失回落 max。此前整段被忽略，导致 /v1/models 的
+		// Trae 条目没有 context_length，客户端只能靠猜——pi-ai/deepseek-harness
+		// 会因此把请求判成「context overflow」。
+		ctx := cfg.ContextWindowTokens.Dev
+		if ctx == 0 {
+			ctx = cfg.ContextWindowTokens.Max
+		}
+		var maxOut int64
+		if len(cfg.ModelDetailList) > 0 {
+			maxOut = cfg.ModelDetailList[0].MaxTokens
+		}
+		infos = append(infos, ModelInfo{
+			ID:                id,
+			Name:              cfg.DisplayConfig.DisplayName,
+			ContextWindow:     ctx,
+			MaxTokens:         maxOut,
+			IsDefault:         cfg.IsDefault,
+			SupportsImages:    cfg.DisplayConfig.Multimodal,
+			SupportsReasoning: cfg.DisplayConfig.ModelCapability == "reasoning_model",
+		})
 	}
 	if len(infos) == 0 {
 		return traeStaticModelInfos(), nil
