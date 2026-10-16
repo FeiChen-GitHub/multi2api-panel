@@ -1248,6 +1248,14 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
+	// 企业上下文门控：与 accountTaskAuto 同口径（企业版 / 企业切换会话下成长任务
+	// 行为事件被上游静默丢弃，跑全量只会白耗真实对话配额）。「一键完成全部」与
+	// 单任务入口共用同一套动作，必须一并挡上（下游 fork 吸收本 PR 时发现的缺口）。
+	if a.IsEnterpriseSession() {
+		writeErr(w, http.StatusUnprocessableEntity,
+			"该账号为企业版/企业切换会话（token_source=enterprise_switch），无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份重新登录")
+		return
+	}
 	uid := a.UID // 上游账号 id：动作、日志与任务锁继续按它走
 	// per-account 互斥（与单任务动作共用一把锁）：重复点击 409。
 	if !p.tryLockAccount(uid) {
