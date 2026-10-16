@@ -62,8 +62,8 @@ type ResponsesWriter struct {
 	usage    map[string]any
 	lastErr  string
 
-	pending []byte // Write 边界之外的分帧缓冲
-	out     []byte // 待写出的事件字节
+	pending []byte           // Write 边界之外的分帧缓冲
+	out     []byte           // 待写出的事件字节
 	order   []*responsesItem // item 创建顺序，决定 output_index 与关闭顺序
 }
 
@@ -110,7 +110,7 @@ func (rw *ResponsesWriter) Write(p []byte) (int, error) {
 		rw.pending = rw.pending[idx+2:]
 		rw.handleFrame(frame)
 	}
-// 极端情况下（帧大于 4 MiB）不至于无限增长：截断并丢弃残帧。
+	// 极端情况下（帧大于 4 MiB）不至于无限增长：截断并丢弃残帧。
 	if len(rw.pending) > 4<<20 {
 		rw.pending = rw.pending[:0]
 	}
@@ -127,25 +127,71 @@ func (rw *ResponsesWriter) emitTo(w io.Writer) {
 }
 
 func (rw *ResponsesWriter) handleFrame(frame []byte) {
-	line := strings.TrimRight(string(frame), "\r\n \t")
-	if !strings.HasPrefix(line, "data: ") {
-		return // 只认 data: 前缀行；其余原样丢弃（我们自己产出的格式）
+	// SSE 帧可能是多行的（Trae 的错误帧是 `event: error\ndata: "..."`）。按行提取
+	// event / data 字段，而不是要求整帧以 "data: " 开头——否则带前导 event: 行的帧
+	// 会被整体丢弃，随后 [DONE] 触发空流兜底，客户端只收到一个空的
+	// response.completed（实测表现为「completed 但没有 content」）。
+	var event, payload string
+	for _, raw := range strings.Split(string(frame), "\n") {
+		line := strings.TrimRight(raw, "\r")
+		i := strings.IndexByte(line, ':')
+		if i < 0 {
+			continue
+		}
+		val := strings.TrimLeft(line[i+1:], " ")
+		switch line[:i] {
+		case "event":
+			event = val
+		case "data":
+			if val != "" {
+				payload = val
+			}
+		}
 	}
-	payload := strings.TrimSpace(line[len("data: "):])
+	if payload == "" {
+		return
+	}
 	if payload == "[DONE]" {
 		rw.finish()
 		return
 	}
-	var obj map[string]any
-	if err := json.Unmarshal([]byte(payload), &obj); err != nil {
+	var parsed any
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		if event == "error" {
+			rw.fail(payload, map[string]any{"message": payload})
+			return
+		}
 		log.Printf("WARN: [upstream] responses stream: bad frame: %v", err)
 		return
+	}
+	if event == "error" {
+		// Trae 的 data 是 JSON 字符串、WorkBuddy/其它可能是 {code,message} 对象，
+		// 统一归一化成 fail() 期待的 {message, code}。
+		rw.fail(payload, normalizeStreamError(parsed, payload))
+		return
+	}
+	obj, ok := parsed.(map[string]any)
+	if !ok {
+		return // 非对象且非错误帧：无内容可翻译
 	}
 	if e, ok := obj["error"]; ok && e != nil {
 		rw.fail(payload, e)
 		return
 	}
 	rw.consumeChunk(obj)
+}
+
+// normalizeStreamError 把错误帧负载归一化成 fail() 需要的 {message, code}：
+// map 原样（含 message/code 时）、JSON 字符串取文本、其它用原文兜底。
+func normalizeStreamError(parsed any, raw string) map[string]any {
+	switch v := parsed.(type) {
+	case map[string]any:
+		return v
+	case string:
+		return map[string]any{"message": v}
+	default:
+		return map[string]any{"message": raw}
+	}
 }
 
 // consumeChunk 把一帧 chat chunk 翻译成事件。
@@ -173,10 +219,10 @@ func (rw *ResponsesWriter) consumeChunk(obj map[string]any) {
 				"item":         rw.text.view(),
 			})
 			rw.emit("response.content_part.added", map[string]any{
-				"item_id":   rw.text.id,
-				"output_index": rw.text.out,
+				"item_id":       rw.text.id,
+				"output_index":  rw.text.out,
 				"content_index": 0,
-				"part":     map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+				"part":          map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 			})
 			rw.text.open = true
 		}
@@ -194,10 +240,10 @@ func (rw *ResponsesWriter) consumeChunk(obj map[string]any) {
 		rw.ensureReasoning()
 		rw.reason.summary += rc
 		rw.emit("response.reasoning_summary_text.delta", map[string]any{
-			"item_id":      rw.reason.id,
-			"output_index": rw.reason.out,
+			"item_id":       rw.reason.id,
+			"output_index":  rw.reason.out,
 			"summary_index": 0,
-			"delta":        rc,
+			"delta":         rc,
 		})
 	}
 
@@ -276,10 +322,10 @@ func (rw *ResponsesWriter) ensureReasoning() {
 		},
 	})
 	rw.emit("response.reasoning_summary_part.added", map[string]any{
-		"item_id":      rw.reason.id,
-		"output_index": rw.reason.out,
+		"item_id":       rw.reason.id,
+		"output_index":  rw.reason.out,
 		"summary_index": 0,
-		"part":         map[string]any{"type": "summary_text", "text": ""},
+		"part":          map[string]any{"type": "summary_text", "text": ""},
 	})
 }
 
@@ -517,4 +563,3 @@ func intOf(v any) int {
 	}
 	return 0
 }
-

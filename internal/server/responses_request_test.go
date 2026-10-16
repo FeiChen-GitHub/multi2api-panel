@@ -84,6 +84,30 @@ func TestResponsesRequestToChatRejectsUnknownItemType(t *testing.T) {
 	}
 }
 
+// type 省略/为空的消息项必须按消息处理：EasyInputMessage 的 type 是可选字段，
+// 若干客户端（含 Codex 的部分版本）发 {"role","content"} 时不带 type。
+func TestResponsesRequestToChatAcceptsMessageWithoutType(t *testing.T) {
+	raw := []byte(`{"model":"trae:cn:glm-5.2","input":[
+		{"role":"user","content":[{"type":"input_text","text":"hi"}]},
+		{"role":"assistant","content":"ok"}]}`)
+	out, err := responsesRequestToChat(raw)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	var got map[string]any
+	_ = json.Unmarshal(out, &got)
+	msgs, ok := got["messages"].([]any)
+	if !ok || len(msgs) != 2 {
+		t.Fatalf("messages = %#v, want 2", got["messages"])
+	}
+	if m := msgs[0].(map[string]any); m["role"] != "user" || m["content"] != "hi" {
+		t.Fatalf("msgs[0] = %#v", m)
+	}
+	if m := msgs[1].(map[string]any); m["role"] != "assistant" || m["content"] != "ok" {
+		t.Fatalf("msgs[1] = %#v", m)
+	}
+}
+
 func TestResponsesRequestToChatInstructionsToolsAndTokens(t *testing.T) {
 	raw := []byte(`{"model":"wb:cn:auto","input":"hi","instructions":"be brief",
 		"tools":[{"type":"function","name":"shell","description":"d","parameters":{"type":"object"}}],

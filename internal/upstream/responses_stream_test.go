@@ -111,6 +111,26 @@ func TestResponsesWriterErrorFrameNoCompleted(t *testing.T) {
 	}
 }
 
+// Trae 的错误帧是多行形态 `event: error\ndata: "<JSON 字符串>"`：必须识别为
+// response.failed，而不是被整体丢弃后回落成空的 response.completed。
+func TestResponsesWriterTraeMultilineErrorFrame(t *testing.T) {
+	rr := httptest.NewRecorder()
+	rw := NewResponsesWriter(rr, nil)
+	write := func(s string) { _, _ = rw.Write([]byte(s)) }
+	write("event: error\ndata: \"trae solo error code=2001 msg=failed to get app config\"\n\n")
+	write("data: [DONE]\n\n")
+	out := rr.Body.String()
+	if !strings.Contains(out, "event: response.failed") {
+		t.Errorf("缺 response.failed:\n%s", out)
+	}
+	if strings.Contains(out, "event: response.completed") {
+		t.Errorf("错误帧后不得发 response.completed:\n%s", out)
+	}
+	if !strings.Contains(out, "code=2001") {
+		t.Errorf("错误信息未透出:\n%s", out)
+	}
+}
+
 // Flusher 必须被转发（Review Focus #1）：没有 Flusher 流式会退化成「等结束才吐」。
 func TestResponsesWriterForwardsFlusher(t *testing.T) {
 	rr := httptest.NewRecorder()

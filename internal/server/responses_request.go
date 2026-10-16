@@ -87,7 +87,11 @@ func responsesInputToMessages(input any) ([]map[string]any, error) {
 			switch typ {
 			case "reasoning":
 				// 我们不产加密推理块，回传的推理内容无法复用，丢弃。
-			case "message":
+			case "message", "":
+				// type 省略/为空按消息处理：OpenAI Responses 的 EasyInputMessage 里
+				// type 是可选字段（role+content 即一条消息）。若干客户端（含 Codex
+				// 的部分版本）发消息项时不带 type，套用严格白名单会把正常请求整条
+				// 422 掉（实测报 unsupported input item type ""）。
 				msg, err := responsesMessageItem(item)
 				if err != nil {
 					return nil, err
@@ -127,7 +131,7 @@ func responsesInputToMessages(input any) ([]map[string]any, error) {
 					fmt.Sprintf("unsupported input item type %q", typ)}
 			}
 		}
-	return msgs, nil
+		return msgs, nil
 	default:
 		return nil, &responsesError{400, "invalid_request", "input must be a string or an array"}
 	}
