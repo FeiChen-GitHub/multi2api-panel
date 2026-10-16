@@ -33,7 +33,11 @@ const (
 	// 网关侧不参与回调解析之外的人机交互。
 	TraeConsoleHost = "https://www.trae.cn"
 	TraeClientID    = "en1oxy7wnw8j9n"
-	TraeAppID       = "6eefa01c-1036-4c7e-9e5a-d891f63bfcd8"
+	// TraeAppID SOLO 应用的 X-App-Id（与 trae2api constants.AppID、本仓库
+	// TraeWorkAppIDChat 一致）。此前误写成 ...-9e5a-...（正确为 ...-9ca5-...），
+	// 后端按 (app_id, app_version_code) 查不到 app 配置记录，SOLO 对话恒报
+	// code=2001 "failed to get app config: record not found"。
+	TraeAppID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 
 	traeIdeVersion     = "0.1.52"
 	traeIdeVersionCode = "20260811"
