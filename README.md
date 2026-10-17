@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>把腾讯 CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关 · 附 Web 管理面板</b><br>
-  Web 面板 · OAuth 浏览器登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时签到 / 活跃 / 旅行 / 保活 · <b>成长任务一键完成（17/18）</b> · 流式 / 非流式
+  Web 面板 · OAuth 浏览器登录 · WorkBuddy + Trae 双上游 · 账号池轮转 · 熔断与冷却 · 会话粘性 · <code>/v1/chat/completions</code> + <code>/v1/responses</code> · 定时签到 / 活跃 / 旅行 / 保活 · <b>成长任务一键完成（17/18）</b> · 流式 / 非流式
 </p>
 
 <p align="center">
@@ -45,9 +45,9 @@
 
 ## 项目简介
 
-WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾讯 CodeBuddy（`copilot.tencent.com`）账号包装为统一的 `/v1/chat/completions` 服务。
+WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，支持 **WorkBuddy（腾讯 CodeBuddy，`copilot.tencent.com`）** 与 **Trae（`trae.cn`）** 双上游，将多来源账号包装为统一的 `/v1/chat/completions` 与 `/v1/responses` 服务。
 
-- 官方不提供 OpenAI 形态的开放 API，本项目通过 **OAuth 设备授权**（面板「添加账号」或 `login.sh`）获取账号凭证，在网关侧做 token 自动刷新、账号池调度与流量治理；
+- 官方不提供 OpenAI 形态的开放 API，本项目通过 **OAuth 设备授权**（面板「添加账号」或 `login.sh`）获取 WorkBuddy 账号凭证；Trae 账号经网页登录回调（`/authorize`）或面板粘贴导入接入；网关侧统一做 token 自动刷新、账号池调度与流量治理；
 - 面向 **个人多账号** 场景：多账号共享、单号故障自动换号、冷却 / 熔断防止雪崩、会话粘性保证多轮上下文不跳号；
 - 对客户端只暴露 OpenAI 兼容接口，现有 SDK / 前端 / 工具 **零改造接入**。
 
@@ -69,8 +69,12 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
 | 🖥️ **Web 管理面板** | 内嵌单页面板（明暗主题，七个视图）：账号运维 / 用量与积分分析 / 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
+| 🌐 **多上游接入** | WorkBuddy（CodeBuddy）之外新增 **Trae** 上游：SOLO / Work 双通道、网页登录回调导入、签到与额度查询、模型带 `trae:` 前缀（`trae:cn:glm-5.2` 等），与既有账号池、粘性、冷却共用同一套调度 |
+| 📡 **OpenAI Responses API** | 新增 `POST /v1/responses`：请求自动转换为 chat/completions 上游调用，SSE 流逐帧翻译回 Responses 事件流，与思维链还原、粘性会话、日志归档天然复用 |
 
-## 🎯 成长任务一键完成（17/18）
+## 🎯 成长任务一键完成（17/18，WorkBuddy 专属）
+
+> 此体系为 **WorkBuddy 上游专属**——Trae 无成长任务体系，面板请求 Trae 账号的 tasks 接口会返回 400。
 
 官方「成长计划」的 18 个成长任务中，**17 个可在面板上一键纯 API 完成**——无需安装官方客户端、无需人工交互，点一下「一键完成」即自动推进进度、等待异步计分落定并**自动领奖**。剩余任务展示操作指引。
 
@@ -168,6 +172,9 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
 | **原生工具调用标记还原** | 上游（DeepSeek 系）的工具调用原生语法是带全角竖线的标记文本，**仅在请求声明了 `tools` 时**才被上游解析成结构化 `tool_calls`。实测 `tools` 声明在中转环节（Responses → chat/completions 等）丢失是常态，此时模型仍想调工具，标记就以纯文本落进 `content`——Codex 这类只执行结构化 `function_call` 的客户端会把它当普通正文写进会话历史，回合直接结束、工具一次都没跑。网关在出站响应里识别并还原成 `tool_calls`（流式与非流式都覆盖） |
+| **多上游架构（Trae）** | 账号凭证新增 `provider` 键（`workbuddy` / `trae`，缺省 `workbuddy`，旧文件零迁移）；账号主键改为自生成 `account_key`（UUIDv4，落盘顶层键）。Trae 走 SOLO / Work 双通道，`work_enabled` 控制 Work 通道；签到与额度走 Trae ChatClient（只查额度不触碰冷却）；签到要求每账号唯一 16 位数字 `X-Device-Id`（`MachineID` / `DeviceID` 字段持久化）；`api_host` 可覆盖该 provider 的主端点 host |
+| **Trae 模型接入** | Trae 模型以 `trae:<realm>:<model>` 形式透出（如 `trae:cn:glm-5.2`），`/v1/models` 附带 `context_length` / `max_output_tokens`；`trae:global:*` 返回 400 `realm_not_supported`（当前仅 cn 域） |
+| **`POST /v1/responses`** | OpenAI Responses API 兼容端点：请求先转换为 chat/completions 再出站（转换发生在粘性键提取之前，粘性照常命中）；chat SSE chunk 逐帧翻译为 Responses 事件流（包装 ResponseWriter，DSML 还原与思维链天然复用）；支持多行 error 帧兼容（Trae 的 `event: error\ndata: "<JSON字符串>"` 形态）；非流式转换；粘性键与 `call_id` 往返；托管工具跳过而非 422；error 帧产出 `response.failed` 带 `error.gateway_hint` |
 
 ### 同步上游
 
@@ -194,7 +201,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 flowchart LR
     Client["客户端 / SDK\nOpenAI 兼容请求"] --> H
 
-    subgraph GWI["WorkBuddy2API 网关 :7863"]
+    subgraph GWI["multi2api 网关 :7863"]
         H["HTTP Handler\n鉴权 · 请求体上限 · 提示词改写 · 轮转"] --> P
         H --> S
         P["账号池\n快过期加权 · 成本分层 · 熔断 · 冷却 · 租约"] --> U
@@ -313,6 +320,8 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 
 打开 `http://127.0.0.1:7863/panel/`，点右上角「**添加账号**」：面板展示授权链接 → 浏览器完成登录 → 自动检测并落盘凭证 → **热加载进池（无需重启）**，顺带完成首次签到。
 
+> **Trae 账号导入**：面板「添加账号」视图选择 Trae 登录后，浏览器完成 Trae 网页登录，回调落在 `trae.callback_port`（默认 18080）由网关接收凭证并热加载进池（`/authorize` 回调路由，仅面板启用 Trae 登录时注册）；也可直接把 trae2api 产出的 JSON 粘贴到面板导入框（`POST /panel/api/import/trae`），凭证落盘 `auths/trae-<uid>.json`，provider=`trae`、realm=`cn`。
+
 **方式 B：命令行脚本（仅 Linux / macOS，依赖 bash + python3）**
 
 ```bash
@@ -344,6 +353,12 @@ curl -s http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
+
+# Responses API（同一上游，事件流返回）
+curl -sN http://localhost:7863/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","input":"hi","stream":true}'
 ```
 
 ## 配置说明
@@ -400,6 +415,10 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `session_sticky.enabled` | `true` | 会话粘性路由开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
+| `upstream.providers.<name>.enabled` | `true` | provider 开关；键仅接受 `workbuddy` / `trae`，未知键启动报错。`false` 时该 provider 请求返回 503，**不回落**其它 provider |
+| `upstream.providers.<name>.api_host` | 空 | 覆盖该 provider 的 token 刷新 / 主端点 host（空 = 内置默认） |
+| `upstream.providers.trae.work_enabled` | `true` | Trae Work 通道开关（仅 Trae 有意义） |
+| `trae.callback_port` | `"18080"` | Trae 网页登录回调监听端口（登录页要求回调落固定端口）；`"0"` = 不起回调 server（只能粘贴导入）；端口被占只 WARN 降级为粘贴导入，不阻断主服务 |
 
 ### 上游超时语义（三段各归其位）
 
@@ -418,6 +437,14 @@ curl -s http://localhost:7863/v1/chat/completions \
 `WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
 
 ## 核心行为语义
+
+### 多上游选号与 Responses 端点
+
+**Provider 分流**：请求按模型前缀路由到对应 provider 的账号子池——`trae:` 前缀进 Trae 池，其余进 WorkBuddy 池。选号、粘性、冷却、熔断在各自池内独立运作，互不串扰；会话粘性键带 provider 维度，同一会话不会在两个上游之间跳号。
+
+**`POST /v1/responses`**：与 `/v1/chat/completions` 同 Bearer 鉴权、同 8 MiB 请求体上限、同请求级日志。请求体先转换为 chat/completions 格式再走既有出站管线（提示词改写、指纹脱敏、思维链注入照常生效），转换发生在粘性键提取之前，粘性照常命中。上游返回的 chat SSE chunk 经翻译器逐帧还原为 Responses 事件流；上游 error 帧（含 Trae 的字符串化 JSON error 形态）统一翻译为 `response.failed` 事件并附 `error.gateway_hint`。
+
+Trae 上游无成长任务体系，面板请求 Trae 账号的 tasks 接口返回 400；Trae 账号的签到与额度查询走独立 ChatClient，只查额度不触碰冷却。
 
 ### 系统提示词体系
 
@@ -673,6 +700,7 @@ http://127.0.0.1:7863/panel/
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
 | 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` |
+| Trae 导入 | `POST import/trae`（粘贴 trae2api JSON 凭证，落盘 + 热加载） · `GET /authorize`（Trae 网页登录回调，免鉴权，仅启用 Trae 登录时注册） |
 | 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
@@ -688,7 +716,8 @@ http://127.0.0.1:7863/panel/
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
-| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
+| `POST /v1/responses` | Bearer（`api_key` 非空时） | OpenAI Responses API 兼容；内部转换为 chat/completions 出站、SSE 逐帧翻译回事件流；同鉴权、同 8 MiB 上限、同请求级日志 |
+| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；Trae 模型以 `trae:<realm>:<model>` 前缀透出（`trae:global:*` 返回 400 `realm_not_supported`，当前仅 cn 域）。每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
@@ -747,7 +776,7 @@ http://127.0.0.1:7863/panel/
 
 ## 请求级日志
 
-每个 `/v1/chat/completions` 请求结束时输出一行表格日志（stdout）：
+每个 `/v1/chat/completions` 或 `/v1/responses` 请求结束时输出一行表格日志（stdout）：
 
 ```text
 | #001 | 18:31:31 | deepseek-v4 | stream | 200 | uid=0851ce35 | TTFB=801ms | tok=60 | 23.5tok/s | total=2.6s |
