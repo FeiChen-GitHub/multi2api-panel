@@ -245,10 +245,12 @@ const time = new Date(2026, 8, 28, 14, 5, 6).toISOString();
 const good = { time, status: 200, outcome: 'success', model: 'glm-5.3', account: '账号(uid8)', duration_ms: 1250, total_tokens: 2300, credit_known: true, credit: 0.12, request_id: 'req-1', client_ip: '203.0.113.7', user_agent: 'python-requests/2.31.0' };
 const noSource = { ...good, request_id: 'req-3', client_ip: '', user_agent: '' };
 const cached = { ...good, request_id: 'req-2', cache_hit_tokens: 2257, cache_miss_tokens: 43 };
+const failed = { ...good, status: 503, outcome: 'http_error', request_id: 'req-4', error_code: 'soft_rate', error_message: 'trae solo error code=4011 msg=too many' };
 process.stdout.write(JSON.stringify({
   good: ctx.requestLogText(good),
   noSource: ctx.requestLogText(noSource),
   cached: ctx.requestLogText(cached),
+  failed: ctx.requestLogText(failed),
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "request-log-format-*.cjs")
 	if err != nil {
@@ -265,7 +267,8 @@ process.stdout.write(JSON.stringify({
 	text := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 203.0.113.7 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | req-1"
 	noSource := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | — | — | 1.25s | 2.3k tok | 0.12 credit | req-3"
 	cached := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 203.0.113.7 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | 命中 98.1% | req-2"
-	want := `{"good":` + strconv.Quote(text) + `,"noSource":` + strconv.Quote(noSource) + `,"cached":` + strconv.Quote(cached) + `}`
+	failed := "14:05:06 | 503 HTTP 错误 | glm-5.3 | 账号(uid8) | 203.0.113.7 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | 错误 soft_rate · trae solo error code=4011 msg=too many | req-4"
+	want := `{"good":` + strconv.Quote(text) + `,"noSource":` + strconv.Quote(noSource) + `,"cached":` + strconv.Quote(cached) + `,"failed":` + strconv.Quote(failed) + `}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("request log formatting=%s want %s", out, want)
 	}
@@ -287,7 +290,7 @@ const ctx = {};
 vm.createContext(ctx);
 vm.runInContext(src.slice(start, end) + '\nthis.reqMatch=reqMatch;', ctx);
 const base = { outcome: 'success', client_ip: '203.0.113.7', user_agent: 'python-requests/2.31.0', model: 'cn:glm-5.3', account: '示例(uid8)', request_id: 'req-1' };
-const other = { outcome: 'http_error', client_ip: '198.51.100.4', user_agent: 'Mozilla/5.0 Chrome/120', model: 'global:hy3', account: '甲(uid9)', request_id: 'req-2' };
+const other = { outcome: 'http_error', client_ip: '198.51.100.4', user_agent: 'Mozilla/5.0 Chrome/120', model: 'global:hy3', account: '甲(uid9)', request_id: 'req-2', error_code: 'soft_rate', error_message: 'trae solo error code=4011 msg=too many' };
 const rows = [base, other];
 const pick = f => rows.filter(e => ctx.reqMatch(e, f)).map(e => e.request_id);
 process.stdout.write(JSON.stringify({
@@ -299,6 +302,7 @@ process.stdout.write(JSON.stringify({
   multiMiss: pick({ q: 'glm chrome', outcome: '' }),
   byOutcome: pick({ q: '', outcome: 'http_error' }),
   combined: pick({ q: '198.51', outcome: 'http_error' }),
+  byError: pick({ q: 'code=4011', outcome: '' }),
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "request-filter-*.cjs")
 	if err != nil {
@@ -313,7 +317,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatalf("request filter node test failed: %v\n%s", err, out)
 	}
 	// q 对 outcome 不参与匹配（outcome 有独立下拉），multiKw 里的 success 命中不了任何字段。
-	const want = `{"all":["req-1","req-2"],"byIP":["req-1"],"byUA":["req-2"],"byModel":["req-1"],"multiKw":[],"multiMiss":[],"byOutcome":["req-2"],"combined":["req-2"]}`
+	const want = `{"all":["req-1","req-2"],"byIP":["req-1"],"byUA":["req-2"],"byModel":["req-1"],"multiKw":[],"multiMiss":[],"byOutcome":["req-2"],"combined":["req-2"],"byError":["req-2"]}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("request filter=%s want %s", out, want)
 	}

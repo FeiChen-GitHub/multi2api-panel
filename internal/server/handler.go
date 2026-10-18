@@ -1054,6 +1054,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 			if isUpstreamTimeout(terr, r.Context().Err() != nil) {
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 				st.status = http.StatusServiceUnavailable
+				setChatStatError(st, "upstream_timeout", terr.Error())
 				lastErr = fmt.Errorf("%w: %v", errUpstreamTimeout, terr)
 				log.Printf("WARN: [server] upstream timeout acct=%s: %v (rotation stopped, account not penalized)",
 					logfmt.Label(acct.UID, acct.Nickname), terr)
@@ -1065,6 +1066,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 			// 上游 client 已打 transport error 日志。
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 			st.status = http.StatusServiceUnavailable
+			setChatStatError(st, "transport_error", terr.Error())
 			lastErr = terr
 			h.cfg.Pool.NoteFailures(acct.UID)
 			fail(acct.Key())
@@ -1082,6 +1084,18 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 			} else {
 				kind = h.classifyForChannel(provider, chatChannel, status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+			}
+			errBody := string(respBody)
+			if strings.TrimSpace(errBody) == "" && uerr != nil {
+				errBody = uerr.Msg
+			}
+			setChatStatError(st, kind.String(), errBody)
+			if isTrae {
+				// TraeClient 的非 2xx 只回 status+body，不像 WorkBuddy 客户端那样在
+				// upstream 层打 WARN。这里补一行，面板「运行日志」可直接看到上游
+				// 业务码与原文，而不是只剩最终 503。
+				log.Printf("WARN: [server] trae upstream acct=%s model=%s status=%d kind=%s body=%s",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, status, kind, logfmt.Truncate(errBody, 200))
 			}
 			// Trae：SOLO 撞权益/配额不足（1005/4008）→ 同一账号降级到 Work 通道重试一次
 			// （trae2api 的 executeWorkRequest 语义）。此时响应首字节尚未写出，可以安全切换；
@@ -1122,6 +1136,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 					// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
 					msg = "content blocked by upstream content firewall"
 				}
+				setChatStatError(st, "content_blocked", msg)
 				chatErr(w, proto, http.StatusBadRequest, "content_blocked", msg,
 					h.hintOf(upstream.ErrContentBlocked, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
@@ -1137,7 +1152,9 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 			if kind == upstream.ErrPromptTooLong {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.Key())
-				chatErr(w, proto, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
+				msg := promptTooLongMessage(string(respBody))
+				setChatStatError(st, "prompt_too_long", msg)
+				chatErr(w, proto, http.StatusBadRequest, "prompt_too_long", msg,
 					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
@@ -1152,6 +1169,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 				if strings.TrimSpace(msg) == "" {
 					msg = "image request was rejected by upstream"
 				}
+				setChatStatError(st, "image_invalid", msg)
 				chatErr(w, proto, http.StatusBadRequest, "image_invalid", msg,
 					h.hintOf(upstream.ErrImageInvalid, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
@@ -1170,6 +1188,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 				if strings.TrimSpace(msg) == "" {
 					msg = "chat request body was rejected by upstream"
 				}
+				setChatStatError(st, "bad_params", msg)
 				chatErr(w, proto, http.StatusBadRequest, "bad_params", msg,
 					h.hintOf(upstream.ErrBadParams, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
@@ -1246,6 +1265,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 				// 502 观测没有意义）。
 				st.status = http.StatusBadGateway
 				st.outcome = reqlog.OutcomeStreamError
+				setChatStatError(st, "empty_upstream_stream", "upstream returned 200 but no SSE frames")
 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			case errFrame != "":
 				// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并
@@ -1256,12 +1276,14 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 				h.applyErrorPolicy(acct.UID, kind, errFrame, bareModel, nil)
 				st.status = http.StatusServiceUnavailable
 				st.outcome = reqlog.OutcomeStreamError
+				setChatStatError(st, kind.String(), errFrame)
 				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(errFrame, 200))
 			case sErr != nil:
 				// 客户端写失败（断连）：上游帧无恙，账号健康——账号侧照常记成功
 				// （与 default 同语义），请求日志归为 Interrupted（人已走，未完成）。
 				st.outcome = reqlog.OutcomeInterrupted
+				clearChatStatError(st)
 				h.cfg.Pool.NoteSuccess(acct.UID)
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 				if sessKey != "" && h.cfg.Session != nil {
@@ -1270,6 +1292,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 			default:
 				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
 				st.outcome = reqlog.OutcomeSuccess
+				clearChatStatError(st)
 				h.cfg.Pool.NoteSuccess(acct.UID)
 				// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 				// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
@@ -1327,6 +1350,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 			chatErr(w, proto, http.StatusBadGateway, "upstream_parse", err.Error(), "")
 			st.status = http.StatusBadGateway
 			st.outcome = reqlog.OutcomeHTTPError
+			setChatStatError(st, "upstream_parse", err.Error())
 			return
 		}
 		// 标记修复（非流式）：把正文里的原生工具调用标记还原成 message.tool_calls。
@@ -1357,6 +1381,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.outcome = reqlog.OutcomeSuccess
+		clearChatStatError(st)
 		st.toks = completionTokens(resp)
 		// 非流式同理：聚合成功（无 error 帧、非空流）才算这一跳成功，事后才记成功/绑粘性。
 		h.cfg.Pool.NoteSuccess(acct.UID)
@@ -1450,6 +1475,9 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 	chatErr(w, proto, status, code, msg, hint)
 	st.status = status
 	st.outcome = reqlog.OutcomeHTTPError
+	if st.errorCode == "" {
+		setChatStatError(st, code, msg)
+	}
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。

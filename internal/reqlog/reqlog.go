@@ -82,8 +82,13 @@ type Event struct {
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
 	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`
 	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
-	ClientIP         string    `json:"client_ip,omitempty"`
-	UserAgent        string    `json:"user_agent,omitempty"`
+	// ErrorCode / ErrorMessage 失败摘要：只记分类码与截断后的上游原文，不记
+	// 提示词/响应正文/凭证。成功请求为空（omitempty）。二者让面板无需翻 stdout
+	// 就能回答「这次 503 到底是限流、权益不足还是连接断开」。
+	ErrorCode    string `json:"error_code,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	ClientIP     string `json:"client_ip,omitempty"`
+	UserAgent    string `json:"user_agent,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），

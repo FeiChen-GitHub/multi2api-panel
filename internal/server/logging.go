@@ -65,11 +65,16 @@ type chatStat struct {
 	cacheMiss int64
 	hasCache  bool
 
+	// 失败摘要：分类码（如 soft_rate / hard_credit / client）与截断后的上游原文。
+	// 成功请求保持空串；不记提示词/完整响应正文/凭证。供请求归档与面板排障。
+	errorCode string
+	errorMsg  string
+
 	// 调用来源（客户端 IP / User-Agent）。空 = 未采集（logging.request_client_info
 	// 关闭，或非 chat 路径），展示层一律以 "-" 兜底。
 	clientIP  string
 	userAgent string
-	logged bool
+	logged    bool
 }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
@@ -79,6 +84,30 @@ func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 		mode = "stream"
 	}
 	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+}
+
+// maxChatErrorSummaryLen 请求归档里保留的失败摘要上限。错误原文可能带整页
+// HTML/长 JSON，落盘与面板展示都只保留可定位问题的最小片段。
+const maxChatErrorSummaryLen = 300
+
+// setChatStatError 记录一次失败的分类码与单行化、截断后的上游原文。
+// 成功请求不调用；不写提示词、完整响应正文或凭证。
+func setChatStatError(s *chatStat, code, msg string) {
+	if s == nil {
+		return
+	}
+	s.errorCode = strings.TrimSpace(code)
+	s.errorMsg = logfmt.Truncate(strings.Join(strings.Fields(msg), " "), maxChatErrorSummaryLen)
+}
+
+// clearChatStatError 在最终成功/客户端中断时清掉先前失败尝试的摘要。
+// 轮转中的失败是中间态，不能落到最终成功请求的归档行上。
+func clearChatStatError(s *chatStat) {
+	if s == nil {
+		return
+	}
+	s.errorCode = ""
+	s.errorMsg = ""
 }
 
 // done 幂等落一行表格日志。
@@ -423,6 +452,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.HasCredit = s.hasCredit
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
+		e.ErrorCode = s.errorCode
+		e.ErrorMessage = s.errorMsg
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent

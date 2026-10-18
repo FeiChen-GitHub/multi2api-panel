@@ -18,6 +18,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -778,6 +779,77 @@ func TestChatSessionDeadDisables(t *testing.T) {
 	st, _ := p.Status("u1")
 	if !st.Disabled {
 		t.Errorf("account should be disabled: %+v", st)
+	}
+}
+
+// 失败摘要必须进入请求归档：面板要能区分连接失败/限流/权益不足，
+// 而不是只看到最终 503。
+func TestRequestMetricsCapturesFailureSummary(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, errors.New("connection refused")
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	reqLog := reqlog.New(reqlog.Config{})
+	h := NewHandler(Config{Pool: p, Upstream: up, RequestLog: reqLog})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	s := reqLog.Snapshot()
+	if len(s.Recent) != 1 {
+		t.Fatalf("recent = %+v", s.Recent)
+	}
+	e := s.Recent[0]
+	if e.ErrorCode != "transport_error" || !strings.Contains(e.ErrorMessage, "connection refused") {
+		t.Fatalf("failure summary = code %q msg %q", e.ErrorCode, e.ErrorMessage)
+	}
+	if e.OK {
+		t.Fatalf("failed request marked OK: %+v", e)
+	}
+}
+
+// 轮转中的失败是中间态：最终成功时归档不能残留上一次尝试的错误摘要。
+func TestRequestMetricsClearsIntermediateFailureOnSuccess(t *testing.T) {
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	calls := 0
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return nil, errors.New("connection reset")
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	reqLog := reqlog.New(reqlog.Config{})
+	h := NewHandler(Config{Pool: p, Upstream: up, RequestLog: reqLog})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"wb:glm-5.2","stream":true,"messages":[]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	s := reqLog.Snapshot()
+	if len(s.Recent) != 1 {
+		t.Fatalf("recent = %+v", s.Recent)
+	}
+	if s.Recent[0].ErrorCode != "" || s.Recent[0].ErrorMessage != "" {
+		t.Fatalf("successful request kept intermediate failure summary: %+v", s.Recent[0])
 	}
 }
 

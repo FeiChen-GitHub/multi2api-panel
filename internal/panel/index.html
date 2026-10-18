@@ -560,7 +560,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .vtabs button.on .cnt { color: var(--ink-2); }
 
   /* ── 请求记录表（运行日志）────────────────────────────────────────── */
-  .acc.req { min-width: 1080px; }
+  .acc.req { min-width: 1200px; }
   .acc.req th, .acc.req td { padding: 8px 10px; }
   .acc.req tbody tr { cursor: default; }
   /* 请求记录最多可读 1000 条，不限高会把下面的「运行日志」推到很远的地方。
@@ -570,6 +570,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .clip { display: block; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .clip.ip { max-width: 150px; font-family: var(--mono); font-size: 12.5px; }
   .clip.rid { max-width: 150px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
+  .clip.err { max-width: 180px; font-family: var(--mono); font-size: 11.5px; color: var(--bad); }
   .acc.req .muted { color: var(--ink-3); }
   .src-off { color: var(--warn); }
 
@@ -1114,7 +1115,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="note" id="reqNote">—</span>
         </header>
         <div class="fbar" id="reqFilter">
-          <input id="reqQ" type="search" placeholder="搜索 IP / UA / 模型 / 账号 / 请求 ID" aria-label="搜索请求记录">
+          <input id="reqQ" type="search" placeholder="搜索 IP / UA / 模型 / 账号 / 请求 ID / 错误" aria-label="搜索请求记录">
           <select id="reqOutcome" aria-label="按结果筛选">
             <option value="">全部结果</option>
             <option value="success">成功</option>
@@ -1135,7 +1136,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="tbl-wrap req-wrap">
           <table class="acc req">
             <thead><tr>
-              <th>时间</th><th>结果</th><th>模型</th><th>账号</th>
+              <th>时间</th><th>结果</th><th>错误</th><th>模型</th><th>账号</th>
               <th>来源 IP</th><th>User-Agent</th>
               <th class="num">耗时</th><th class="num">Token</th><th class="num">积分</th><th>请求 ID</th>
             </tr></thead>

@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -51,8 +52,8 @@ func (h *Handler) applyTraeStreamError(acct *auth.Auth, model string, se *upstre
 	default:
 		h.cfg.Pool.NoteError(acct.UID)
 	}
-	log.Printf("WARN: [server] trae stream acct=%s model=%s kind=%v: %v",
-		logfmt.Label(acct.UID, acct.Nickname), model, se.Kind(), se)
+	log.Printf("WARN: [server] trae stream acct=%s model=%s code=%d kind=%s message=%s",
+		logfmt.Label(acct.UID, acct.Nickname), model, se.Code, se.Kind(), logfmt.Truncate(se.Msg, 200))
 }
 
 // applyTraeWorkStreamError 把 Work 通道的流内错误落到池上（DESIGN §6.6 + D8）。
@@ -71,8 +72,8 @@ func (h *Handler) applyTraeWorkStreamError(acct *auth.Auth, model string, se *up
 	default:
 		h.cfg.Pool.NoteError(acct.UID)
 	}
-	log.Printf("WARN: [server] trae work stream acct=%s model=%s kind=%v: %v",
-		logfmt.Label(acct.UID, acct.Nickname), model, se.Kind(), se)
+	log.Printf("WARN: [server] trae work stream acct=%s model=%s code=%d kind=%s message=%s",
+		logfmt.Label(acct.UID, acct.Nickname), model, se.Code, se.Kind(), logfmt.Truncate(se.Msg, 200))
 }
 
 // serveTraeSuccess 处理 Trae 的一次 200 响应：
@@ -117,12 +118,14 @@ func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct 
 		if err != nil {
 			// 客户端写失败（断连）：上游帧无恙，账号照常记成功（与 WorkBuddy 同口径）。
 			st.outcome = reqlog.OutcomeInterrupted
+			clearChatStatError(st)
 			h.cfg.Pool.NoteSuccess(acct.UID)
 			return
 		}
 		if streamErr != nil {
 			st.status = http.StatusServiceUnavailable
 			st.outcome = reqlog.OutcomeStreamError
+			setChatStatError(st, fmt.Sprintf("trae_stream_%d", streamErr.Code), streamErr.Error())
 			return
 		}
 		h.markTraeSuccess(acct, model, st, sessKey)
@@ -145,11 +148,13 @@ func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct 
 			handleErr(se)
 			st.status = http.StatusServiceUnavailable
 			st.outcome = reqlog.OutcomeStreamError
+			setChatStatError(st, fmt.Sprintf("trae_stream_%d", se.Code), se.Error())
 			chatErr(w, proto, http.StatusServiceUnavailable, "trae_upstream_error", se.Error(), "")
 			return
 		}
 		st.status = http.StatusBadGateway
 		st.outcome = reqlog.OutcomeStreamError
+		setChatStatError(st, "trae_upstream_parse", err.Error())
 		chatErr(w, proto, http.StatusBadGateway, "upstream_parse", err.Error(), "")
 		return
 	}
@@ -194,6 +199,7 @@ func (h *Handler) probeTraeWorkCredits(acct *auth.Auth) {
 func (h *Handler) markTraeSuccess(acct *auth.Auth, model string, st *chatStat, sessKey string) {
 	st.status = http.StatusOK
 	st.outcome = reqlog.OutcomeSuccess
+	clearChatStatError(st)
 	h.cfg.Pool.NoteSuccess(acct.UID)
 	h.cfg.Pool.BlockModelClear(acct.UID, model)
 	if sessKey != "" && h.cfg.Session != nil {

@@ -850,7 +850,8 @@ function reqMatch(e, f) {
   f = f || reqFilter;
   if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
   if (f.q) {
-    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
+    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id,
+      e && e.error_code, e && e.error_message]
       .filter(Boolean).join(' ').toLowerCase();
     for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
       if (!text.includes(kw)) return false;
@@ -891,9 +892,14 @@ function renderRequestTable() {
     const ip = e && e.client_ip ? e.client_ip : '';
     const ua = e && e.user_agent ? e.user_agent : '';
     const rid = e && e.request_id ? e.request_id : '';
+    const err = e && (e.error_code || e.error_message)
+      ? '<span class="clip err" title="' + esc([e.error_code, e.error_message].filter(Boolean).join(' · ')) + '">' +
+        esc(e.error_code || e.error_message) + '</span>'
+      : '<span class="muted">—</span>';
     return '<tr title="' + esc(requestLogText(e)) + '">' +
       '<td class="num">' + esc(when) + '</td>' +
       '<td>' + reqOutcomeTag(e) + '</td>' +
+      '<td>' + err + '</td>' +
       '<td>' + esc(e && e.model || '—') + '</td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
@@ -903,7 +909,7 @@ function renderRequestTable() {
       '<td class="num">' + reqCreditCell(e) + '</td>' +
       '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '</tr>';
-  }).join('') || '<tr><td colspan="10" class="empty">' +
+  }).join('') || '<tr><td colspan="11" class="empty">' +
       (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
 
   const filtered = list.length !== reqEntries.length;
@@ -955,6 +961,7 @@ function requestLogText(e) {
     fmtTok(token) + ' tok',
     credit,
     cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens) === '—' ? '' : '命中 ' + cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens),
+    e && (e.error_code || e.error_message) ? '错误 ' + [e.error_code, e.error_message].filter(Boolean).join(' · ') : '',
     e && e.request_id || '—',
   ].filter(Boolean).join(' | ');
 }

@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -214,5 +217,235 @@ func TestResponsesRequestToChatOnlyHostedTools(t *testing.T) {
 	_ = json.Unmarshal(out, &got)
 	if _, ok := got["tools"]; ok {
 		t.Fatalf("只剩托管工具时不应写 tools 键: %s", out)
+	}
+}
+
+// function_call_output 携带图片 part 时：文本留 tool、图片挂到最后一条 user 消息。
+//
+// 2026-10-18 实案（11115 prompt is too long: 2059849 > 1048576）：
+// Codex 的 view_image 把 2.4MB base64 作为 input_image 回传，旧实现 json.Marshal
+// 成字符串 → 上游按文本分词 ≈ 2.05M token，一张截图顶爆 1M 上下文。
+// 且实测上游只编码「最后一条消息」里的图，tool/历史消息里的图静默丢弃。
+func TestResponsesRequestToChatFunctionCallOutputImagePart(t *testing.T) {
+	const dataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	raw := []byte(`{"model":"wb:glm-5.3-flash","input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"看图"}]},
+		{"type":"function_call","call_id":"call_img","name":"view_image","arguments":"{}"},
+		{"type":"function_call_output","call_id":"call_img","output":[{"type":"input_image","image_url":"` + dataURL + `"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"这是什么"}]}]}`)
+	out, err := responsesRequestToChat(raw)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	// 硬性回归守卫：base64 绝不能以序列化文本进 prompt（旧实现的形态）。
+	if bytes.Contains(out, []byte(`\"input_image\"`)) {
+		t.Fatalf("图片 part 被序列化成文本塞进 content: %s", out)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs := got["messages"].([]any)
+	if len(msgs) != 4 {
+		t.Fatalf("messages len = %d, want 4（不额外插消息）: %s", len(msgs), out)
+	}
+	if msgs[2].(map[string]any)["role"] != "tool" {
+		t.Fatalf("msgs[2].role = %v, want tool", msgs[2].(map[string]any)["role"])
+	}
+	if msgs[2].(map[string]any)["content"] != "" {
+		t.Fatalf("tool content = %#v, want 空串（图片不进 tool 文本）", msgs[2].(map[string]any)["content"])
+	}
+	// 图片必须挂在最后一条 user 消息上（上游只编码末条消息的图）。
+	lastMsg := msgs[len(msgs)-1].(map[string]any)
+	if lastMsg["role"] != "user" {
+		t.Fatalf("末条 role = %v, want user", lastMsg["role"])
+	}
+	parts, ok := lastMsg["content"].([]any)
+	if !ok {
+		t.Fatalf("末条 content = %#v, want parts 数组", lastMsg["content"])
+	}
+	var found bool
+	for _, p := range parts {
+		pm, _ := p.(map[string]any)
+		if pm["type"] != "image_url" {
+			continue
+		}
+		found = true
+		img, _ := pm["image_url"].(map[string]any)
+		if img["url"] != dataURL {
+			t.Fatalf("image url 丢失或改写")
+		}
+	}
+	if !found {
+		t.Fatalf("图片 part 未出现在末条 user 消息里: %#v", lastMsg["content"])
+	}
+}
+
+// function_call_output 的图片以裸 data URL 字符串回传时同样要挪到 user 消息。
+func TestResponsesRequestToChatFunctionCallOutputImageString(t *testing.T) {
+	const dataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	raw := []byte(`{"model":"wb:glm-5.3-flash","input":[
+		{"type":"function_call","call_id":"c1","name":"view_image","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":"` + dataURL + `"}]}`)
+	out, err := responsesRequestToChat(raw)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs := got["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages len = %d, want 3（assistant/tool/图片 user）: %s", len(msgs), out)
+	}
+	toolMsg := msgs[1].(map[string]any)
+	if toolMsg["content"] != "" {
+		t.Fatalf("tool content = %#v, want 空串（图片不进 tool 文本）", toolMsg["content"])
+	}
+	lastMsg := msgs[2].(map[string]any)
+	parts, ok := lastMsg["content"].([]any)
+	if !ok {
+		t.Fatalf("图片消息 content = %#v, want parts 数组", lastMsg["content"])
+	}
+	var found bool
+	for _, p := range parts {
+		if pm, _ := p.(map[string]any); pm["type"] == "image_url" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("裸 data URL 未转成 image part: %#v", lastMsg["content"])
+	}
+}
+
+// 纯文本 function_call_output（字符串 / {"text":...} / 多段文本数组）仍走字符串，
+// 保持既有 chat 路径与 DSML 修复的字符串口径（回归守卫）。
+func TestResponsesRequestToChatFunctionCallOutputTextUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"字符串", `{"type":"function_call_output","call_id":"c1","output":"a.txt"}`, "a.txt"},
+		{"text 对象", `{"type":"function_call_output","call_id":"c1","output":{"text":"b.txt"}}`, "b.txt"},
+		{"文本数组", `{"type":"function_call_output","call_id":"c1","output":[{"type":"input_text","text":"c1"},{"type":"input_text","text":"c2"}]}`, "c1\nc2"},
+	} {
+		raw := []byte(`{"model":"wb:glm-5.3-flash","input":[{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},` + tc.input + `]}`)
+		out, err := responsesRequestToChat(raw)
+		if err != nil {
+			t.Fatalf("%s: err = %v", tc.name, err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("%s: unmarshal: %v", tc.name, err)
+		}
+		toolMsg := got["messages"].([]any)[1].(map[string]any)
+		if toolMsg["content"] != tc.want {
+			t.Fatalf("%s: content = %#v, want %q", tc.name, toolMsg["content"], tc.want)
+		}
+	}
+}
+
+// 同一张图在历史里出现多次时只挂一次（上游每图按 ~1-2k token 计，重复纯浪费）。
+func TestResponsesRequestToChatDedupesImages(t *testing.T) {
+	const dataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	raw := []byte(`{"model":"wb:glm-5.3-flash","input":[
+		{"type":"function_call","call_id":"c1","name":"view_image","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":[{"type":"input_image","image_url":"` + dataURL + `"}]},
+		{"type":"function_call","call_id":"c2","name":"view_image","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c2","output":[{"type":"input_image","image_url":"` + dataURL + `"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"两张图一样吗"}]}]}`)
+	out, err := responsesRequestToChat(raw)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs := got["messages"].([]any)
+	parts, _ := msgs[len(msgs)-1].(map[string]any)["content"].([]any)
+	n := 0
+	for _, p := range parts {
+		if pm, _ := p.(map[string]any); pm["type"] == "image_url" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("末条 user 图片数 = %d, want 1（同 URL 去重）: %s", n, out)
+	}
+}
+// input_file 附件必须内联成文本，不能静默丢弃（否则模型答「附件呢？」）。
+func TestResponsesRequestToChatInputFileText(t *testing.T) {
+	body := "订单号 A12345，金额 99 元。"
+	dataURL := "data:text/plain;base64," + base64.StdEncoding.EncodeToString([]byte(body))
+	raw := []byte(`{"model":"wb:glm-5.3-flash","input":[
+		{"type":"message","role":"user","content":[
+			{"type":"input_text","text":"看附件"},
+			{"type":"input_file","filename":"order.txt","file_data":"` + dataURL + `"}]}]}`)
+	out, err := responsesRequestToChat(raw)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if !bytes.Contains(out, []byte("A12345")) {
+		t.Fatalf("附件正文未内联进请求: %s", out)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msg := got["messages"].([]any)[0].(map[string]any)
+	content, _ := msg["content"].(string)
+	if !strings.Contains(content, "A12345") {
+		t.Fatalf("content = %q, want 含附件正文", content)
+	}
+}
+
+// 二进制附件（PDF/图片）不能内联，但必须留下可诊断的说明，而不是静默消失。
+func TestResponsesRequestToChatInputFileBinary(t *testing.T) {
+	raw := []byte(`{"model":"wb:glm-5.3-flash","input":[
+		{"type":"message","role":"user","content":[
+			{"type":"input_file","filename":"doc.pdf","file_data":"data:application/pdf;base64,JVBERi0xLjQK"},
+			{"type":"input_text","text":"总结一下"}]}]}`)
+	out, err := responsesRequestToChat(raw)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if !bytes.Contains(out, []byte("doc.pdf")) {
+		t.Fatalf("二进制附件没有任何说明（会被当成不存在）: %s", out)
+	}
+}
+
+// 超长附件必须截断并标注，不能原样内联（会直接顶爆上下文 → 11115）。
+func TestResponsesRequestToChatInputFileTruncated(t *testing.T) {
+	big := strings.Repeat("x", filePartMaxBytes+5000)
+	dataURL := "data:text/plain;base64," + base64.StdEncoding.EncodeToString([]byte(big))
+	raw := []byte(`{"model":"wb:glm-5.3-flash","input":[
+		{"type":"message","role":"user","content":[{"type":"input_file","filename":"big.txt","file_data":"` + dataURL + `"}]}]}`)
+	out, err := responsesRequestToChat(raw)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(out) > filePartMaxBytes*2 {
+		t.Fatalf("超长附件未截断：out=%d bytes", len(out))
+	}
+	if !bytes.Contains(out, []byte("已截断")) {
+		t.Fatalf("截断未标注（模型会以为内容完整）: %s", out[len(out)-200:])
+	}
+}
+// 工具结果里的 input_file 同样要内联（read_file 类工具回传文件）。
+func TestResponsesRequestToChatToolOutputFile(t *testing.T) {
+	dataURL := "data:text/plain;base64," + base64.StdEncoding.EncodeToString([]byte("订单号 A12345"))
+	raw := []byte(`{"model":"wb:glm-5.3-flash","input":[
+		{"type":"function_call","call_id":"c1","name":"read_file","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":[{"type":"input_file","filename":"order.txt","file_data":"` + dataURL + `"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"读到了什么"}]}]}`)
+	out, err := responsesRequestToChat(raw)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if !bytes.Contains(out, []byte("A12345")) {
+		t.Fatalf("工具结果的附件未内联: %s", out)
 	}
 }

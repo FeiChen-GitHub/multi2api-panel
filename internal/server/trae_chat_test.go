@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -366,5 +367,79 @@ func TestChatTraeFallsBackToWorkOnPlanLimit(t *testing.T) {
 	}
 	if soloHits != 1 || workHits != 1 {
 		t.Fatalf("soloHits=%d workHits=%d, want 1/1", soloHits, workHits)
+	}
+}
+
+// Trae HTTP 非 2xx 的失败摘要必须落到请求归档：业务码/原文是区分限流、
+// 权益不足和参数错误的关键，不能只剩一个 503。
+func TestTraeHTTPErrorCapturesFailureSummary(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	tc := upstream.NewTraeClient()
+	tc.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 429,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"code":4011,"message":"too many requests"}`)),
+		}, nil
+	})}
+	tc.StreamHTTP = tc.HTTP
+
+	traeAuth, err := auth.Parse([]byte(`{"provider":"trae","auth":{"accessToken":"trae-at","expiresAt":9999999999},"account":{"uid":"trae1"}}`))
+	if err != nil {
+		t.Fatalf("parse trae auth: %v", err)
+	}
+	p := testPoolWith(traeAuth)
+	reqLog := reqlog.New(reqlog.Config{})
+	h := NewHandler(Config{Pool: p, Upstream: up, RequestLog: reqLog,
+		Dispatcher: upstream.NewDispatcher(upstream.NewWBClient(up), tc), TraeWorkDisabled: true})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"trae:cn:glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s, want 429", rec.Code, rec.Body)
+	}
+	s := reqLog.Snapshot()
+	if len(s.Recent) != 1 {
+		t.Fatalf("recent = %+v", s.Recent)
+	}
+	e := s.Recent[0]
+	if e.ErrorCode != "soft_rate" || !strings.Contains(e.ErrorMessage, "4011") {
+		t.Fatalf("failure summary = code %q msg %q", e.ErrorCode, e.ErrorMessage)
+	}
+}
+
+// Trae 流内业务错误也要带具体业务码（如 4011 限流），而不是统一 503。
+func TestTraeStreamErrorCapturesFailureSummary(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	tc := upstream.NewTraeClient()
+	tc.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("event:error\ndata:{\"code\":4011,\"message\":\"too many\"}\n\n")),
+		}, nil
+	})}
+	tc.StreamHTTP = tc.HTTP
+
+	traeAuth, err := auth.Parse([]byte(`{"provider":"trae","auth":{"accessToken":"trae-at","expiresAt":9999999999},"account":{"uid":"trae1"}}`))
+	if err != nil {
+		t.Fatalf("parse trae auth: %v", err)
+	}
+	p := testPoolWith(traeAuth)
+	reqLog := reqlog.New(reqlog.Config{})
+	h := NewHandler(Config{Pool: p, Upstream: up, RequestLog: reqLog,
+		Dispatcher: upstream.NewDispatcher(upstream.NewWBClient(up), tc), TraeWorkDisabled: true})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"trae:cn:glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	s := reqLog.Snapshot()
+	if len(s.Recent) != 1 {
+		t.Fatalf("recent = %+v", s.Recent)
+	}
+	e := s.Recent[0]
+	if e.ErrorCode != "trae_stream_4011" || !strings.Contains(e.ErrorMessage, "too many") {
+		t.Fatalf("failure summary = code %q msg %q", e.ErrorCode, e.ErrorMessage)
 	}
 }

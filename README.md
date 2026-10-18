@@ -927,6 +927,57 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 - **切模型立即可用**：冷却由 6004 触发时会记录触发模型；同一账号改用**其他模型**请求时视为可用。同模型或未记录模型的冷却回到现状
 - **退回指数退避**：6004 无「将在 … 重置」文案，或非 6004 的普通软限流 → 仍是 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）
 
+### 为什么官方模型没事，走反代却报 `11115 prompt is too long`？
+
+典型报错：
+
+```
+{"code":11115,"msg":"prompt is too long: 2059849 tokens > 1048576 maximum"}
+```
+
+**根因（2026-10-18 实案，已修）**：Codex 的 `view_image` / 截图类工具把图片以 Responses 的
+content part 数组回传：
+
+```json
+"output": [{"type":"input_image","image_url":"data:image/png;base64,<2.4MB>"}]
+```
+
+旧版 `responses_request.go` 的 `function_call_output` 分支只认 `{"text": ...}` 对象形态，
+数组一律 `json.Marshal` 成字符串塞进 `role:tool` 的 content——**2.4MB base64 以纯文本出站**。
+base64 分词约 1.2 字符/token，`2464566 / 1.2 ≈ 2053805`，加上会话历史正好 2059849。
+一张截图顶爆 1M 上下文。同一张图走 `image_url` part 时上游只算约 1k token
+（实测 730KB 图：part 形态 2884，文本形态 530206，差 180 倍）。
+
+**修复后的行为**：
+
+- tool 结果里的图片 part 不再序列化成文本，而是从 `role:tool` 抽出来，**挂到最后一条 user 消息**
+  的 content parts 上（文本仍留在 tool 消息里）
+- 裸 `data:image/...;base64,...` 字符串形态同样识别并转 part
+- 上游实测只编码「最后一条消息」里的图：图在 tool content 或历史 user 消息里都会被静默丢弃
+  （prompt 只算 2950、模型答「看不到图」），所以必须落在末条 user 消息
+
+改完后同一个 2MB 截图请求：`input_tokens` 从约 234 万降到约 6000。
+
+### 添加附件（文件）会不会也触发 `11115`？
+
+**不会因为附件本身炸上下文，但旧版会把附件整个丢掉**（模型回「附件呢？」）。两条路径都已处理：
+
+| 附件位置 | 旧行为 | 现在 |
+|---|---|---|
+| 消息里的 `input_file`（`file_data` 为 text data URL） | 被忽略（`switch` 无该分支） | 解码成文本内联，加「[附件 x 的内容如下]」标识 |
+| 工具结果里的 `input_file`（`read_file` 类） | 同样被忽略 | 同上 |
+| 二进制附件（PDF / 图片 / 压缩包） | 被忽略 | 内联一条明确说明（「网关无法转换为文本」），不再静默消失 |
+| 只有 `file_id` / `file_url` 的附件 | 被忽略 | 内联说明（本网关不代理文件存储） |
+
+防炸上下文的两道闸：
+
+- 单个附件内联上限 `filePartMaxBytes = 256 KiB`，超限截断并在文末标注原始字节数（模型知道内容不完整，不会瞎猜）
+- 只内联 `text/*`、`application/json`、`+json`、`+xml` 等文本 MIME；二进制一律走说明文本，绝不 base64 塞进 prompt
+
+实测：392KB 文本附件 → `input_tokens=113108`（正常计入，未触发 11115）；2.6MB 纯文本 → 截断到 256KB 后再内联。
+
+> 注：`view_image` 之类的图片工具走的是 `input_image` part 通道，见上一节；两者互不影响。
+
 ### 多图会话请求体超限怎么办？
 
 网关**不再设请求体上限**（`server.max_body_mb` 已移除，对齐上游）：任意大小的请求体都会完整读入并转发上游，超限类问题由上游自然返回错误——其响应信息量更大（能看到上游的真实策略），网关不再以 413 提前拦截。
