@@ -1480,9 +1480,10 @@ func TestPersonaCustomModeReplacesSystem(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{
 		Pool: p, Upstream: up,
-		PromptMode:  "custom",
-		PromptText:  "工程提示词（应被人格取代）",
-		PersonaText: personaFixture(t),
+		PromptMode:     "custom",
+		PromptText:     "工程提示词（应被人格取代）",
+		PersonaText:    personaFixture(t),
+		PersonaReplace: true, // replace = 人格覆盖，客户端 system 被替换
 	})
 
 	rec := httptest.NewRecorder()
@@ -1517,9 +1518,10 @@ func TestPersonaAppendModeKeepsClientSystem(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{
 		Pool: p, Upstream: up,
-		PromptMode:  "append",
-		PromptText:  "工程提示词",
-		PersonaText: personaFixture(t),
+		PromptMode:     "append",
+		PromptText:     "工程提示词",
+		PersonaText:    personaFixture(t),
+		PersonaReplace: false, // append = 人格追加，保留客户端 system
 	})
 
 	rec := httptest.NewRecorder()
@@ -1579,8 +1581,9 @@ func TestPersonaSurvivesMultiTurn(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{
 		Pool: p, Upstream: up,
-		PromptMode:  "custom",
-		PersonaText: personaFixture(t),
+		PromptMode:     "custom",
+		PersonaText:    personaFixture(t),
+		PersonaReplace: true,
 	})
 
 	// 模拟第 5 轮：历史里已有 4 组 user/assistant，且客户端每轮都自带 system。
@@ -1624,8 +1627,9 @@ func TestPersonaDegradeStillWins(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{
 		Pool: p, Upstream: up,
-		PromptMode:  "custom",
-		PersonaText: personaFixture(t),
+		PromptMode:     "custom",
+		PersonaText:    personaFixture(t),
+		PersonaReplace: true,
 	})
 	h.degrade.Trigger() // 手动进入降级期
 
@@ -1643,6 +1647,40 @@ func TestPersonaDegradeStillWins(t *testing.T) {
 	}
 	if !strings.Contains(sys, "helpful assistant") {
 		t.Errorf("degrade period should inject Degraded prompt: %s", sys)
+	}
+}
+
+// TestPersonaModeDecoupledFromPromptMode 人格注入方式只认 PersonaReplace，
+// 与 PromptMode 解耦。这是"覆盖/追加"显式化的核心断言：
+// prompt.mode=append 但 persona_mode=replace 时，人格必须覆盖客户端 system。
+func TestPersonaModeDecoupledFromPromptMode(t *testing.T) {
+	var sent []byte
+	up := personaTestUpstream(t, &sent)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool: p, Upstream: up,
+		PromptMode:     "append", // 工程提示词层要用 append
+		PersonaText:    personaFixture(t),
+		PersonaReplace: true, // 但人格层要覆盖 —— 两者互不影响
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"wb:glm-5.2",
+		"messages":[
+			{"role":"system","content":"客户端工程规范（应被覆盖）"},
+			{"role":"user","content":"hi"}
+		]
+	}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	out := string(sent)
+	if strings.Contains(out, "客户端工程规范（应被覆盖）") {
+		t.Error("persona_mode=replace 应覆盖客户端 system，但客户端内容残留")
+	}
+	if !strings.Contains(out, "海鸥在线，你要整点薯条吗？") {
+		t.Error("人格未注入")
 	}
 }
 

@@ -494,6 +494,8 @@ Trae 上游无成长任务体系，面板请求 Trae 账号的 tasks 接口返�
 - 启动日志会打出实际来源：`[config] persona "haiou" loaded from disk (9122 bytes)`，磁盘版与快照分叉时这是唯一排查线索
 - Docker：镜像已 `COPY internal/prompt/personas /app/personas` 并预设 `WB2A_PERSONAS_DIR=/app/personas`；想直接在宿主机编辑，把 `./internal/prompt/personas:/app/personas` 挂进去即可
 
+人格注入方式（`prompt.persona_mode`）与全部 prompt 字段的逐项说明见 [docs/config-guide.md](docs/config-guide.md)——`config.json` 不支持注释，那份文档即注释。
+
 ### 内容拦截误报与降级重试
 
 `passthrough` 模式请求被上游内容策略拦截（HTTP 400 + `blocked by security policy` / `unapproved channel` / `illegal api invocation` 文案）时，判定为 system 指纹误报：**同请求内**换 Degraded 中性提示词重试一次；第二次仍被拦（用户内容本身触发审核）→ 走既有错误路径返回客户端，并如实报给调用方。

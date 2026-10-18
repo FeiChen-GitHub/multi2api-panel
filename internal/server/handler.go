@@ -63,15 +63,18 @@ type Config struct {
 	PromptText string
 	// PersonaText 人格提示词文本（haio 分支；空 = 人格层关闭）。
 	//
-	// 人格层与 PromptMode 的关系（优先级从高到低）：
-	//   - PersonaText 非空 → 人格层接管出站 system，无视 PromptMode：
-	//     custom 语义（替换客户端 system/developer）+ append 语义（保留客户端
-	//     system 后插入）都由 Mode 决定，人格只是替换掉"注入哪段文本"。
-	//   - PersonaText 空 → 走原有 PromptMode 分支，行为与本功能引入前逐字一致。
+	// PersonaReplace 人格层注入方式（haio 分支）：true=覆盖 / false=追加。
+	//   - true ：人格替换掉客户端所有 system/developer（prompt.Rewrite）
+	//   - false：保留客户端 system，人格插在其后（prompt.Append）
 	//
-	// 为什么人格不单独设 Mode：人格覆写与"替换还是并用"是两个正交维度，
-	// 拆成独立开关会让配置面翻倍，且绝大多数场景人格就是要替换（custom）。
+	// 人格层与工程提示词层完全解耦：人格开启时 PersonaText 接管注入内容，
+	// 注入方式由 PersonaReplace 决定，**不再看 PromptMode**。PromptMode 继续
+	// 只管工程提示词（人格关闭时的行为逐字不变）。
+	// 配置键是 prompt.persona_mode（replace / append），归一后经
+	// config.PersonaReplace 传入。
 	PersonaText string
+	// PersonaReplace 见 PersonaText 说明；人格层关闭时无意义。
+	PersonaReplace bool
 
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
@@ -886,15 +889,16 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 	degradedApplied := false
 	if h.cfg.PersonaText != "" {
 		// 人格层（haio 分支）：人格文本取代 PromptText 作为注入内容，
-		// 替换/并用语义仍由 PromptMode 决定。降级期同样让位给 Degraded——
-		// 带指纹原文重试是确定性再撞墙，与 append 的降级裁决同口径。
+		// 注入方式由 PersonaReplace 决定，与 PromptMode 解耦。
+		// 降级期同样让位给 Degraded——带指纹原文重试是确定性再撞墙，
+		// 与 append 的降级裁决同口径（覆盖/追加在降级期都退化为 replace）。
 		if h.degrade.Active() {
 			body = prompt.Rewrite(body, prompt.Degraded)
 			degradedApplied = true
-		} else if h.cfg.PromptMode == "append" {
-			body = prompt.Append(body, h.cfg.PersonaText)
-		} else {
+		} else if h.cfg.PersonaReplace {
 			body = prompt.Rewrite(body, h.cfg.PersonaText)
+		} else {
+			body = prompt.Append(body, h.cfg.PersonaText)
 		}
 	} else if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)

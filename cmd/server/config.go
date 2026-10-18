@@ -192,12 +192,27 @@ type Config struct {
 		// 对既有部署是行为变更。缺省关闭保证老配置零影响；需要人格的用户
 		// 显式打开。人格文件本身随时可改，但要不要用它由这个开关决定。
 		PersonaEnabled bool `json:"persona_enabled"`
+		// PersonaMode 人格层注入方式（haio 分支），缺省空 = "replace"（覆盖）。
+		//
+		//	"replace" = 人格**覆盖**：删掉客户端所有 system/developer，替换为人格文本
+		//	"append"  = 人格**追加**：保留客户端 system，人格插在其后
+		//
+		// 为什么单独一个键而不复用 prompt.mode：prompt.mode 的三个值
+		// （passthrough/custom/append）管的是「工程提示词怎么注入」，与人格是
+		// 两个正交维度。早期版本让人格去蹭 prompt.mode，结果是三个值只表达两种
+		// 人格语义、且"覆盖"没有对应词——用户问"覆盖模式填什么"得不到单一答案。
+		// 显式的两值键消除这个歧义；缺省 replace 让人格开启后就是覆盖（人格
+		// 就是要说了算），需要保留客户端指令的人显式填 append。
+		PersonaMode string `json:"persona_mode"`
 	} `json:"prompt"`
 
 	// PromptText 解析后的系统提示词文本（custom/append 模式使用）。
 	PromptText string `json:"-"`
 	// PersonaText 解析后的人格提示词文本（haio 分支；人格层关闭时为空串）。
 	PersonaText string `json:"-"`
+	// PersonaReplace 人格层是否覆盖客户端 system（true=replace，false=append）。
+	// 由 normalizePersona 从 PersonaMode 归一而来，供 handler 直接判断。
+	PersonaReplace bool `json:"-"`
 
 	Upstash struct {
 		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
@@ -708,6 +723,14 @@ func (c *Config) normalizePrompt() error {
 // 加载失败一律报错而不回落到"无人格"：人格覆写是本功能的核心效果，
 // 静默失效比启动失败更难排查（用户看到的是"人格时灵时不灵"）。
 func (c *Config) normalizePersona() error {
+	// 无论人格层开不开，mode 都要归一：关的时候也得把 PersonaReplace 置成
+	// 确定值，避免上一轮配置的残留影响下一轮（面板保存是整份 config 重载）。
+	replace, err := c.normalizePersonaMode()
+	if err != nil {
+		return err
+	}
+	c.PersonaReplace = replace
+
 	if !c.Prompt.PersonaEnabled {
 		c.PersonaText = ""
 		return nil
@@ -721,10 +744,42 @@ func (c *Config) normalizePersona() error {
 		return err
 	}
 	c.PersonaText = text
-	// 数据来源只在启动日志里露一次面：磁盘版与 embed 快照分叉时
-	// （改了 md 却看到 embed）这是唯一的排查线索。
-	log.Printf("[config] persona %q loaded from %s (%d bytes)", c.Prompt.Persona, source, len(text))
+	// 数据来源与注入方式都在启动日志里露一次面：磁盘版与 embed 快照分叉时
+	// （改了 md 却看到 embed）source 是唯一排查线索；mode 则是确认
+	// "我到底覆盖了还是追加了"的直接证据。
+	log.Printf("[config] persona %q loaded from %s (%d bytes, mode=%s)",
+		c.Prompt.Persona, source, len(text), personaModeName(replace))
 	return nil
+}
+
+// normalizePersonaMode 归一 prompt.persona_mode，返回 true=覆盖 / false=追加。
+//
+//	空 / "replace" / "override" / "cover" → true（覆盖，缺省）
+//	"append" / "keep"                     → false（追加）
+//	其它                                  → 启动报错
+//
+// 收下多个同义写法而不是只认一个：用户在配置里写 cover/override 是很自然的
+// 猜测，逐个报错逼人去查文档的体验很差；同义词在错误信息里列明即可。
+// 但绝不静默回落到默认——拼错（如 replcae）必须炸出来，否则用户以为
+// 配了覆盖实际走了追加（或反之），而这种偏差在对话里极难察觉。
+func (c *Config) normalizePersonaMode() (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(c.Prompt.PersonaMode)) {
+	case "", "replace", "override", "cover":
+		return true, nil
+	case "append", "keep":
+		return false, nil
+	default:
+		return false, fmt.Errorf("prompt.persona_mode: %q 不是合法值（replace = 覆盖 / append = 追加；缺省 replace）",
+			c.Prompt.PersonaMode)
+	}
+}
+
+// personaModeName 归一后的布尔还原成规范名，仅供日志与错误信息使用。
+func personaModeName(replace bool) string {
+	if replace {
+		return "replace"
+	}
+	return "append"
 }
 
 // validateScheduleHours 校验排程小时落在 0-23。

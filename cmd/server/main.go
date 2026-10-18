@@ -344,6 +344,7 @@ func main() {
 		PromptMode:       cfg.Prompt.Mode,
 		PromptText:       cfg.PromptText,
 		PersonaText:      cfg.PersonaText,
+		PersonaReplace:   cfg.PersonaReplace,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
@@ -603,7 +604,8 @@ func restartRequiredFields(c *Config) []string {
 	// haio 分支：prompt.mode / prompt.file / prompt.persona* 在 NewHandler 装配期
 	// 从 cfg 拷入 handler 静态字段，saveConfig 的热应用段没有重设它们的通路，
 	// 改完不重启不生效。列入重启清单，避免面板显示"已保存"而实际没变。
-	out = append(out, "prompt.mode", "prompt.file", "prompt.persona", "prompt.persona_enabled")
+	out = append(out, "prompt.mode", "prompt.file",
+		"prompt.persona", "prompt.persona_enabled", "prompt.persona_mode")
 	return out
 }
 

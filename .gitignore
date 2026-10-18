@@ -30,13 +30,14 @@ backups/
 LOOP.md
 PLAN.md
 SPEC.md
-docs/
 
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
 # agent 协作约定（同 README 一并进版本库）
 !AGENTS.md
+# 配置说明文档（config.json 不支持注释，逐字段说明）
+!docs/config-guide.md
 # 人格提示词文件必须进版本库：persona.go 用 //go:embed 嵌入，
 # 漏提交会导致 clone 后编译失败（embed 找不到文件）。
 !internal/prompt/personas/*.md
@@ -55,3 +56,5 @@ docs/
 *.zip
 server.exe
 .DS_Store
+# docs/ 全部进版本库（配置说明等人格/部署文档）
+!docs/**

@@ -902,6 +902,83 @@ func TestRestartRequiredFieldsIncludePrompt(t *testing.T) {
 	}
 }
 
+// ===== haio 分支：人格注入方式（persona_mode）配置层测试 =====
+
+// writePersonaCfg 写一份最小配置并 Load，返回解析结果或 error。
+func writePersonaCfg(t *testing.T, promptJSON string) (*Config, error) {
+	t.Helper()
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":`+promptJSON+`}`), 0o600)
+	return Load(fp)
+}
+
+// TestPersonaModeDefaultsToReplace 缺省 = 覆盖（replace）。
+// 人格开启后就是要说了算，不需要用户显式指定；需要保留客户端指令的人
+// 才显式填 append。
+func TestPersonaModeDefaultsToReplace(t *testing.T) {
+	c, err := writePersonaCfg(t, `{"mode":"custom","persona_enabled":true,"persona":"haiou"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.PersonaReplace {
+		t.Error("persona_mode 缺省应为 replace（覆盖），got append")
+	}
+}
+
+// TestPersonaModeExplicitValues persona_mode 显式取值。
+func TestPersonaModeExplicitValues(t *testing.T) {
+	cases := []struct {
+		mode   string
+		replace bool
+	}{
+		{`"replace"`, true},
+		{`"override"`, true},  // 同义词
+		{`"cover"`, true},     // 同义词
+		{`"append"`, false},
+		{`"keep"`, false},     // 同义词
+		{`"REPLACE"`, true},   // 大小写不敏感
+		{`" append "`, false}, // 首尾空白容忍
+	}
+	for _, tc := range cases {
+		c, err := writePersonaCfg(t,
+			`{"mode":"custom","persona_enabled":true,"persona":"haiou","persona_mode":`+tc.mode+`}`)
+		if err != nil {
+			t.Fatalf("persona_mode=%s should load: %v", tc.mode, err)
+		}
+		if c.PersonaReplace != tc.replace {
+			t.Errorf("persona_mode=%s → PersonaReplace=%v want %v", tc.mode, c.PersonaReplace, tc.replace)
+		}
+	}
+}
+
+// TestPersonaModeInvalidRejected 非法值启动报错，不静默回落。
+// 拼错（如 replcae）若被静默当成默认，用户以为配了覆盖实际走追加，
+// 而这种偏差在对话里极难察觉。
+func TestPersonaModeInvalidRejected(t *testing.T) {
+	if _, err := writePersonaCfg(t,
+		`{"mode":"custom","persona_enabled":true,"persona":"haiou","persona_mode":"replcae"}`); err == nil {
+		t.Fatal("persona_mode 拼错应启动报错，不得静默回落默认")
+	}
+}
+
+// TestPersonaModeNormalizedWhenDisabled 人格关闭时 mode 也归一。
+// 面板保存是整份 config 重载，若关闭时不清 PersonaReplace，上一轮的
+// append 可能残留到下一轮（下次开启时行为与配置不符）。
+func TestPersonaModeNormalizedWhenDisabled(t *testing.T) {
+	c, err := writePersonaCfg(t,
+		`{"mode":"custom","persona_enabled":false,"persona":"haiou","persona_mode":"append"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PersonaReplace {
+		t.Error("persona_mode=append 应归一为 PersonaReplace=false，即使人格层关闭")
+	}
+	if c.PersonaText != "" {
+		t.Error("人格关闭时 PersonaText 应为空")
+	}
+}
+
 // TestUpstreamUserAgentConfig 配置 upstream.user_agent 与 env WB2A_USER_AGENT 均生效，
 // 缺省空串保持现状（headers 层回落到 clientUA）。
 func TestUpstreamUserAgentConfig(t *testing.T) {
