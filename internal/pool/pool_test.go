@@ -1094,10 +1094,13 @@ func TestAutoFlush(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
+	defer p.Close() // 停掉后台 flusher，避免 goroutine 泄漏影响后续用例
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetCredits("u1", 77, 0)
 
-	deadline := time.Now().Add(2 * time.Second)
+	// 等待窗口放宽到 10s：CI/并行全仓跑时进程被调度抢走是常态，2s 的固定超时
+	// 会把「这一轮机器慢」误报成「flusher 坏了」。超时后仍按失败处理，不静默通过。
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if _, err := os.Stat(fp); err == nil {
 			break
@@ -1108,6 +1111,7 @@ func TestAutoFlush(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	p2 := New(fp)
+	defer p2.Close()
 	p2.Add(&auth.Auth{UID: "u1"})
 	st, ok := p2.Status("u1")
 	if !ok || st.Credits != 77 {

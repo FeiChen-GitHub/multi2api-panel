@@ -261,16 +261,19 @@ func TestLoadPersonaDiskBeatsEmbed(t *testing.T) {
 	if personasDir == "" {
 		t.Skip("personasDir 不可解析（trimpath 构建），磁盘优先不适用")
 	}
-	diskPath := filepath.Join(personasDir, "haiou.md")
-	orig, err := os.ReadFile(diskPath)
-	if err != nil {
-		t.Fatalf("read disk persona: %v", err)
-	}
+	// 在临时目录上验证「磁盘优先」，**不改写仓库内 personas/haiou.md**：
+	// 那是 go:embed 与多个包（cmd/server、internal/server）共享的源文件，
+	// 并行测试下改写它会让其它包读到半成品（空文件 → 启动报错），表现为随机 flake。
+	dir := t.TempDir()
+	diskPath := filepath.Join(dir, "haiou.md")
 	marker := "DISK-VERSION-MARKER-" + t.Name()
 	if err := os.WriteFile(diskPath, []byte(marker), 0o600); err != nil {
 		t.Fatalf("write disk persona: %v", err)
 	}
-	t.Cleanup(func() { os.WriteFile(diskPath, orig, 0o600) })
+	t.Setenv(EnvPersonasDir, dir)
+	prev := personasDir
+	personasDir = resolvePersonasDir()
+	t.Cleanup(func() { personasDir = prev })
 
 	text, source, err := LoadPersona("haiou")
 	if err != nil {
@@ -295,15 +298,16 @@ func TestLoadPersonaDiskEmptyFileErrors(t *testing.T) {
 	if personasDir == "" {
 		t.Skip("personasDir 不可解析（trimpath 构建），磁盘优先不适用")
 	}
-	diskPath := filepath.Join(personasDir, "haiou.md")
-	orig, err := os.ReadFile(diskPath)
-	if err != nil {
-		t.Fatalf("read disk persona: %v", err)
-	}
+	// 同上：只操作临时目录，不碰仓库内的共享 personas/haiou.md。
+	dir := t.TempDir()
+	diskPath := filepath.Join(dir, "haiou.md")
 	if err := os.WriteFile(diskPath, []byte("   \n\t  "), 0o600); err != nil {
 		t.Fatalf("write disk persona: %v", err)
 	}
-	t.Cleanup(func() { os.WriteFile(diskPath, orig, 0o600) })
+	t.Setenv(EnvPersonasDir, dir)
+	prev := personasDir
+	personasDir = resolvePersonasDir()
+	t.Cleanup(func() { personasDir = prev })
 
 	if _, _, err := LoadPersona("haiou"); err == nil {
 		t.Fatal("empty disk persona should error, not silently fall back to embed")
