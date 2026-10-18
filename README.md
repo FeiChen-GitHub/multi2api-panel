@@ -479,7 +479,20 @@ Trae 上游无成长任务体系，面板请求 Trae 账号的 tasks 接口返�
 - 人格文件不可读 / 内容为空 → **启动报错**，不回落"无人格"
 - 降级期人格让位给 Degraded 中性提示词（带指纹原文重试只会确定性再撞 400，与 append 同口径）
 
-内置人格在 `internal/prompt/personas/haiou.md`，**纯文本文件、随时可改、改完重启即生效**，不需要重新编译。它是从 61KB 原始配置裁剪而来（约 9KB），保留了人格稳定性的承重墙：身份锁定、强制问候语、十条性格规则、应答句式、挑衅回应、结尾性格锁；裁剪掉的是 558 组高度冗余的 few-shot 示例。体积由 `TestPersonaSizeBudget` 兜底（上限 16KB）——人格每个请求都全额注入，体积直接等于每轮固定 token 开销。
+内置人格在 `internal/prompt/personas/haiou.md`，**纯文本文件、随时可改，改完重启进程即生效，不需要重新编译**。它是从 61KB 原始配置裁剪而来（约 9KB），保留了人格稳定性的承重墙：身份锁定、强制问候语、十条性格规则、应答句式、挑衅回应、结尾性格锁；裁剪掉的是 558 组高度冗余的 few-shot 示例。体积由 `TestPersonaSizeBudget` 兜底（上限 16KB）——人格每个请求都全额注入，体积直接等于每轮固定 token 开销。
+
+加载策略是**磁盘优先、`//go:embed` 兜底**（`internal/prompt/persona.go`）：
+
+| 场景 | 数据来源 | 改 md 后如何生效 |
+|---|---|---|
+| 源码运行 / `go run` / 非 trimpath 构建 | 磁盘 `personas/haiou.md` | 重启进程即可 |
+| `-trimpath` 发布产物（含 Docker 镜像） + `WB2A_PERSONAS_DIR` | 磁盘（指向的目录） | 重启进程即可 |
+| `-trimpath` 发布产物，未设 `WB2A_PERSONAS_DIR` | embed 编译期快照 | **需重新编译** |
+
+- 磁盘文件被清空 → **启动报错**，不静默回落 embed（否则"改了没生效"无法解释）
+- 磁盘目录整体缺失 → 回落 embed 快照，保证部署裁剪时网关仍能启动
+- 启动日志会打出实际来源：`[config] persona "haiou" loaded from disk (9122 bytes)`，磁盘版与快照分叉时这是唯一排查线索
+- Docker：镜像已 `COPY internal/prompt/personas /app/personas` 并预设 `WB2A_PERSONAS_DIR=/app/personas`；想直接在宿主机编辑，把 `./internal/prompt/personas:/app/personas` 挂进去即可
 
 ### 内容拦截误报与降级重试
 

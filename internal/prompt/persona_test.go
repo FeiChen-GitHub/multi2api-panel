@@ -12,15 +12,15 @@ import (
 // 调用方（normalizePersona）靠空串判断关不关，若这里报错会导致
 // 「没配人格」被当成配置错误，老部署全部启动失败。
 func TestLoadPersonaEmptyReturnsNoError(t *testing.T) {
-	text, builtin, err := LoadPersona("")
+	text, source, err := LoadPersona("")
 	if err != nil {
 		t.Fatalf("empty name should not error: %v", err)
 	}
 	if text != "" {
 		t.Errorf("empty name should return empty text, got %d bytes", len(text))
 	}
-	if builtin {
-		t.Error("empty name should not be reported as builtin")
+	if source != "" {
+		t.Errorf("empty name should report no source, got %q", source)
 	}
 	if text, _, _ := LoadPersona("   "); text != "" {
 		t.Error("whitespace-only name should also return empty text")
@@ -31,12 +31,12 @@ func TestLoadPersonaEmptyReturnsNoError(t *testing.T) {
 // 断言关键锚点串而非全文 hash——人格文件会持续演进，但"身份锁定/问候语/
 // 性格锁"这三块是人格稳定性的承重墙，缺任何一块都算回归。
 func TestLoadPersonaBuiltinHaiou(t *testing.T) {
-	text, builtin, err := LoadPersona("haiou")
+	text, source, err := LoadPersona("haiou")
 	if err != nil {
 		t.Fatalf("builtin haio should load: %v", err)
 	}
-	if !builtin {
-		t.Error("haiou should be reported as builtin")
+	if source != "disk" && source != "embed" {
+		t.Errorf("haiou source=%q want disk or embed", source)
 	}
 	if len(text) < 4000 {
 		t.Fatalf("haiou persona suspiciously small: %d bytes", len(text))
@@ -59,12 +59,12 @@ func TestLoadPersonaBuiltinHaiou(t *testing.T) {
 // TestLoadPersonaTrimsName 名字带空白时按 trim 后匹配，
 // 配置里手写 " haio " 不该落到文件路径分支。
 func TestLoadPersonaTrimsName(t *testing.T) {
-	text, builtin, err := LoadPersona("  haiou  ")
+	text, source, err := LoadPersona("  haiou  ")
 	if err != nil {
 		t.Fatalf("padded builtin name should load: %v", err)
 	}
-	if !builtin {
-		t.Error("padded builtin name should still hit builtin table")
+	if source != "disk" && source != "embed" {
+		t.Errorf("padded builtin name source=%q want disk or embed", source)
 	}
 	if !strings.Contains(text, "海鸥在线") {
 		t.Error("padded builtin name returned wrong content")
@@ -80,12 +80,12 @@ func TestLoadPersonaCustomFile(t *testing.T) {
 	if err := os.WriteFile(fp, []byte(want), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	text, builtin, err := LoadPersona(fp)
+	text, source, err := LoadPersona(fp)
 	if err != nil {
 		t.Fatalf("custom file should load: %v", err)
 	}
-	if builtin {
-		t.Error("file path should not be reported as builtin")
+	if source != "path" {
+		t.Errorf("file path source=%q want path", source)
 	}
 	if text != want {
 		t.Errorf("text=%q want %q", text, want)
@@ -241,7 +241,7 @@ func TestPersonaSizeBudget(t *testing.T) {
 	}
 }
 
-// TestBuiltinPersonaEmbedNotEmpty //go:embed 契约：内置人格必须非空。
+// TestBuiltinPersonaEmbedNotEmpty //go:embed 兜底快照必须非空。
 //
 // 为什么值得单测：internal/prompt/personas/*.md 曾被 .gitignore 的 *.md 规则
 // 挡住，clone 后 embed 直接编译失败。编译期能发现，但错误信息指向 embed 指令
@@ -250,12 +250,113 @@ func TestBuiltinPersonaEmbedNotEmpty(t *testing.T) {
 	if len(builtinHaiou) == 0 {
 		t.Fatal("builtinHaiou embed is empty — personas/haiou.md 可能未被 git 追踪（.gitignore 的 *.md 规则）")
 	}
-	// 与 LoadPersona 返回的文本一致（embed 是唯一数据源，不该有第二份拷贝）。
-	text, _, err := LoadPersona("haiou")
+}
+
+// TestLoadPersonaDiskBeatsEmbed 磁盘优先：改了 personas/haiou.md 重启即生效，
+// 不需要重新编译。这是本功能对用户的核心承诺，必须有专项用例钉住。
+//
+// 做法：把磁盘文件换成带标记的内容，断言 LoadPersona 返回磁盘版且 source="disk"，
+// 测完还原。磁盘版与 embed 快照不同 → 证明没走 embed。
+func TestLoadPersonaDiskBeatsEmbed(t *testing.T) {
+	if personasDir == "" {
+		t.Skip("personasDir 不可解析（trimpath 构建），磁盘优先不适用")
+	}
+	diskPath := filepath.Join(personasDir, "haiou.md")
+	orig, err := os.ReadFile(diskPath)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read disk persona: %v", err)
+	}
+	marker := "DISK-VERSION-MARKER-" + t.Name()
+	if err := os.WriteFile(diskPath, []byte(marker), 0o600); err != nil {
+		t.Fatalf("write disk persona: %v", err)
+	}
+	t.Cleanup(func() { os.WriteFile(diskPath, orig, 0o600) })
+
+	text, source, err := LoadPersona("haiou")
+	if err != nil {
+		t.Fatalf("LoadPersona: %v", err)
+	}
+	if source != "disk" {
+		t.Fatalf("source=%q want disk — 磁盘优先失效，改 md 必须重编才能生效", source)
+	}
+	if text != marker {
+		t.Errorf("text=%q want disk content %q", text, marker)
+	}
+	if text == builtinHaiou {
+		t.Error("returned embed snapshot instead of disk version")
+	}
+}
+
+// TestLoadPersonaDiskEmptyFileErrors 磁盘文件存在但内容为空 → 报错，不静默回落 embed。
+//
+// 用户清空 personas/haiou.md 想调人格时，静默用 embed 会让"我的修改没生效"
+// 变得无法解释；空文件是明确的配置错误，应该炸出来。
+func TestLoadPersonaDiskEmptyFileErrors(t *testing.T) {
+	if personasDir == "" {
+		t.Skip("personasDir 不可解析（trimpath 构建），磁盘优先不适用")
+	}
+	diskPath := filepath.Join(personasDir, "haiou.md")
+	orig, err := os.ReadFile(diskPath)
+	if err != nil {
+		t.Fatalf("read disk persona: %v", err)
+	}
+	if err := os.WriteFile(diskPath, []byte("   \n\t  "), 0o600); err != nil {
+		t.Fatalf("write disk persona: %v", err)
+	}
+	t.Cleanup(func() { os.WriteFile(diskPath, orig, 0o600) })
+
+	if _, _, err := LoadPersona("haiou"); err == nil {
+		t.Fatal("empty disk persona should error, not silently fall back to embed")
+	}
+}
+
+// TestLoadPersonaEmbedFallback 磁盘目录整体消失 → 回落 embed 快照。
+//
+// 部署裁剪场景（镜像没带 personas/）：人格是可选功能，不该让网关起不来。
+// 做法：把 personasDir 临时指向不存在的位置，断言 source="embed" 且内容非空。
+func TestLoadPersonaEmbedFallback(t *testing.T) {
+	orig := personasDir
+	personasDir = filepath.Join(t.TempDir(), "nonexistent")
+	t.Cleanup(func() { personasDir = orig })
+
+	text, source, err := LoadPersona("haiou")
+	if err != nil {
+		t.Fatalf("LoadPersona should fall back to embed, got err: %v", err)
+	}
+	if source != "embed" {
+		t.Errorf("source=%q want embed", source)
 	}
 	if text != builtinHaiou {
-		t.Error("LoadPersona(haiou) 与 embed 变量不一致 — 出现了第二份人格拷贝")
+		t.Error("embed fallback returned content different from embed snapshot")
+	}
+	if !strings.Contains(text, "海鸥在线，你要整点薯条吗？") {
+		t.Error("embed fallback lost persona anchors")
+	}
+}
+
+// TestEnvPersonasDirOverride trimpath 发布产物（含 Docker 镜像）靠环境变量
+// 指定人格目录，让磁盘优先在容器里也成立。
+func TestEnvPersonasDirOverride(t *testing.T) {
+	dir := t.TempDir()
+	marker := "ENV-DIR-MARKER"
+	if err := os.WriteFile(filepath.Join(dir, "haiou.md"), []byte(marker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvPersonasDir, dir)
+
+	// personasDir 是包级变量，测试里重新解析以反映 env 覆盖。
+	prev := personasDir
+	personasDir = resolvePersonasDir()
+	t.Cleanup(func() { personasDir = prev })
+
+	text, source, err := LoadPersona("haiou")
+	if err != nil {
+		t.Fatalf("LoadPersona: %v", err)
+	}
+	if source != "disk" {
+		t.Errorf("source=%q want disk", source)
+	}
+	if text != marker {
+		t.Errorf("text=%q want %q", text, marker)
 	}
 }

@@ -24,6 +24,10 @@ COPY --from=build /out/signin_bin /app/signin_bin
 COPY --from=build /out/login /app/login
 COPY --from=build /out/credit /app/credit
 COPY login.sh signin.sh credit.sh /app/
+# 人格提示词文件必须随镜像分发：persona.go 磁盘优先读 personas/*.md，
+# 缺了会静默回落到 embed 编译期快照——容器里改 md 不生效，且无从察觉。
+# 放 /app/personas/ 而非 internal/prompt/personas/：容器内不该出现源码树结构。
+COPY internal/prompt/personas /app/personas/
 COPY scripts/probe_active.py /app/scripts/probe_active.py
 RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh && chmod 755 /app/login.sh /app/signin.sh /app/credit.sh
 # 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）

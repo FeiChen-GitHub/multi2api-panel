@@ -13,6 +13,10 @@ services:
     user: "${PUID:-10001}:${PGID:-10001}"
     environment:
       - TZ=Asia/Shanghai
+      # 人格提示词目录。镜像已带 /app/personas（Dockerfile COPY），此变量让
+      # persona.go 在 trimpath 构建下也走磁盘优先——容器内改人格不用重新构建镜像。
+      # 挂载宿主机目录即可在容器外直接编辑：- ./internal/prompt/personas:/app/personas
+      - WB2A_PERSONAS_DIR=/app/personas
     ports:
       - "7863:7863"
     volumes:

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -715,11 +716,14 @@ func (c *Config) normalizePersona() error {
 		return fmt.Errorf("prompt.persona_enabled=true 但 prompt.persona 为空：请指定人格名（内置: %s）或自定义文件路径",
 			strings.Join(prompt.BuiltinPersonaNames(), ", "))
 	}
-	text, _, err := prompt.LoadPersona(c.Prompt.Persona)
+	text, source, err := prompt.LoadPersona(c.Prompt.Persona)
 	if err != nil {
 		return err
 	}
 	c.PersonaText = text
+	// 数据来源只在启动日志里露一次面：磁盘版与 embed 快照分叉时
+	// （改了 md 却看到 embed）这是唯一的排查线索。
+	log.Printf("[config] persona %q loaded from %s (%d bytes)", c.Prompt.Persona, source, len(text))
 	return nil
 }
 
