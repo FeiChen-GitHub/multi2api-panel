@@ -84,7 +84,7 @@ func (h *Handler) applyTraeWorkStreamError(acct *auth.Auth, model string, se *up
 // ch 决定用哪套解析器：Work 的事件是 payload 包裹的 plan_item/output/done 且
 // output 是累积全文，SOLO 是扁平的 response/reasoning_content —— 两套形状不能
 // 互相套用（套错的一侧会输出空内容）。
-func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct *auth.Auth, rc io.ReadCloser, model string, stream bool, st *chatStat, sessKey string, ch upstream.Channel, proto protocol) {
+func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct *auth.Auth, rc io.ReadCloser, model string, stream bool, st *chatStat, sessKey string, ch upstream.Channel, proto protocol, started time.Time) {
 	defer rc.Close()
 
 	work := ch == upstream.ChannelWork
@@ -98,8 +98,11 @@ func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct 
 	if stream {
 		st.status = http.StatusOK
 		var streamErr *upstream.TraeStreamError
+		var usageSeen map[string]any
 		var err error
 		// Responses：包一层事件翻译器（转发 Flusher），两个 Trae 写入点本身不改。
+		// 统计 reader 放在归一化层之前：Trae 原生 token_usage 事件不是 OpenAI
+		// usage 帧，必须由转换器显式回传，不能靠通用的 chatStatsReader 解析。
 		out := w
 		if proto == protoResponses {
 			out = upstream.NewResponsesWriter(w, nil)
@@ -108,11 +111,15 @@ func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct 
 			err = upstream.TraeStreamWorkToOpenAI(out, rc, model, func(se *upstream.TraeStreamError) {
 				streamErr = se
 				onWorkErr(se)
+			}, func(u map[string]any) {
+				usageSeen = u
 			})
 		} else {
 			err = upstream.TraeStreamToOpenAI(out, rc, model, func(se *upstream.TraeStreamError) {
 				streamErr = se
 				onErr(se)
+			}, func(u map[string]any) {
+				usageSeen = u
 			})
 		}
 		if err != nil {
@@ -129,6 +136,7 @@ func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct 
 			return
 		}
 		h.markTraeSuccess(acct, model, st, sessKey)
+		h.recordTraeAttempt(acct, model, st, usageSeen, started)
 		if work {
 			h.probeTraeWorkCredits(acct)
 		}
@@ -159,6 +167,11 @@ func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct 
 		return
 	}
 	h.markTraeSuccess(acct, model, st, sessKey)
+	if usage, ok := resp["usage"].(map[string]any); ok {
+		h.recordTraeAttempt(acct, model, st, usage, started)
+	} else {
+		h.recordTraeAttempt(acct, model, st, nil, started)
+	}
 	if work {
 		h.probeTraeWorkCredits(acct)
 	}
@@ -166,6 +179,24 @@ func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct 
 		resp = chatCompletionToResponse(resp)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// recordTraeAttempt 把 Trae 的 token_usage 写入账号累计器与面板用量账本。
+// Trae 实测 token_usage 只有 prompt/completion/total（无 credit），所以这里
+// 不传 hasCredit；将来上游若真回传 credit，usageCreditFromMap 会自动采信。
+func (h *Handler) recordTraeAttempt(acct *auth.Auth, model string, st *chatStat, u map[string]any, started time.Time) {
+	if acct == nil || st == nil {
+		return
+	}
+	delta := usageDeltaFromMap(u)
+	credit, hasCredit := usageCreditFromMap(u)
+	modelRate := ""
+	if h.cfg.Upstream != nil {
+		modelRate = h.cfg.Upstream.ModelRate(acct.Realm(), model)
+	}
+	// 非流式没有 TTFB 观测；流式的 TTFB 由转换器按首帧单独记录，这里保持 0
+	// 以免把整个上游耗时误当作「首 token 等待」。速率仍按端到端口径计算。
+	h.recordAttempt(st, acct.UID, model, model, modelRate, delta, credit, hasCredit, started, 0)
 }
 
 // probeTraeWorkCredits 异步刷新账号的 work_credits（DESIGN §6.6 ProbeCredits）。

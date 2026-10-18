@@ -285,7 +285,7 @@ func traeSortInts(a []int) {
 // TraeStreamToOpenAI 把 SOLO 流式转换成 OpenAI SSE chunk，每 chunk flush，
 // 保证至少一个 [DONE]。onErr 在遇到 event:error 时回调（供上层冷却账号），
 // 错误信息同时注入 SSE 事件流。调用方负责已写好 status 200 与响应头。
-func TraeStreamToOpenAI(w http.ResponseWriter, r io.Reader, model string, onErr func(*TraeStreamError)) error {
+func TraeStreamToOpenAI(w http.ResponseWriter, r io.Reader, model string, onErr func(*TraeStreamError), onUsage ...func(map[string]any)) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -372,6 +372,9 @@ func TraeStreamToOpenAI(w http.ResponseWriter, r io.Reader, model string, onErr 
 				}
 			case "token_usage":
 				pendingUsage = ev.Usage
+				if len(onUsage) > 0 && onUsage[0] != nil {
+					onUsage[0](ev.Usage)
+				}
 			case "done":
 				if err := writeChunk(map[string]any{}, ev.FinishReason); err != nil {
 					return err

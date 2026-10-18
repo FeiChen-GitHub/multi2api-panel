@@ -11,6 +11,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
 // 一段最简 SOLO 流：一条 output + done。
@@ -441,5 +442,168 @@ func TestTraeStreamErrorCapturesFailureSummary(t *testing.T) {
 	e := s.Recent[0]
 	if e.ErrorCode != "trae_stream_4011" || !strings.Contains(e.ErrorMessage, "too many") {
 		t.Fatalf("failure summary = code %q msg %q", e.ErrorCode, e.ErrorMessage)
+	}
+}
+
+const traeUsageSSE = "event:output\ndata:{\"response\":\"ok\"}\n\n" +
+	"event:token_usage\ndata:{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}\n\n" +
+	"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+
+func traeClientReturning(body string) *upstream.TraeClient {
+	tc := upstream.NewTraeClient()
+	tc.AgentHost = "https://trae.fake"
+	tc.UgHost = "https://trae.fake"
+	tc.OAuthHost = "https://trae.fake"
+	fake := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+	tc.HTTP = fake
+	tc.StreamHTTP = fake
+	return tc
+}
+
+// Trae 的 token_usage 必须进入账号累计器与面板用量账本。上游实测没有
+// credit 字段，因此只能记 Token 历史，不能伪造积分扣除行。
+func TestTraeUsageRecordedWithoutCredit(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "sync"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+			tc := traeClientReturning(traeUsageSSE)
+			a, err := auth.Parse([]byte(`{"provider":"trae","auth":{"accessToken":"trae-at","expiresAt":9999999999},"account":{"uid":"trae1"}}`))
+			if err != nil {
+				t.Fatalf("parse trae auth: %v", err)
+			}
+			p := testPoolWith(a)
+			rec := usage.New("")
+			h := NewHandler(Config{
+				Pool:             p,
+				Upstream:         up,
+				Dispatcher:       upstream.NewDispatcher(upstream.NewWBClient(up), tc),
+				Usage:            rec,
+				TraeWorkDisabled: true,
+			})
+			body := `{"model":"trae:cn:glm-5.2","messages":[{"role":"user","content":"hi"}]}`
+			if stream {
+				body = `{"model":"trae:cn:glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+			}
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+			if rr.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+			}
+
+			st, ok := p.Status("trae1")
+			if !ok {
+				t.Fatal("trae account missing from pool")
+			}
+			if st.TokenUsage.RequestCount != 1 || st.TokenUsage.UsageCount != 1 ||
+				st.TokenUsage.PromptTokens != 11 || st.TokenUsage.CompletionTokens != 7 ||
+				st.TokenUsage.TotalTokens != 18 || st.TokenUsage.LastModel != "glm-5.2" {
+				t.Fatalf("pool token usage = %+v", st.TokenUsage)
+			}
+
+			snap := rec.Snapshot(24, nil)
+			if snap.Totals.Requests != 1 || snap.Totals.PromptTokens != 11 ||
+				snap.Totals.CompletionTok != 7 || snap.Totals.TotalTokens != 18 {
+				t.Fatalf("usage totals = %+v", snap.Totals)
+			}
+			if snap.Totals.CreditSamples != 0 || snap.Totals.Credits != 0 ||
+				len(snap.CreditByAccount) != 0 || len(snap.CreditByModel) != 0 {
+				t.Fatalf("Trae 无 credit 时不得生成积分扣除行: totals=%+v account=%+v model=%+v",
+					snap.Totals, snap.CreditByAccount, snap.CreditByModel)
+			}
+			if len(snap.ByAccount) != 1 || snap.ByAccount[0].Key != "trae1" ||
+				len(snap.ByModel) != 1 || snap.ByModel[0].Key != "glm-5.2" {
+				t.Fatalf("usage dimensions = account %+v model %+v", snap.ByAccount, snap.ByModel)
+			}
+		})
+	}
+}
+
+// 若未来 Trae 上游确实回传单次 credit，必须按真实值累计；不能因为当前
+// Trae 默认没有该字段就永久丢弃它。
+func TestTraeUsageHonorsExplicitCredit(t *testing.T) {
+	const body = "event:output\ndata:{\"response\":\"ok\"}\n\n" +
+		"event:token_usage\ndata:{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"credit\":0.75}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	tc := traeClientReturning(body)
+	a, err := auth.Parse([]byte(`{"provider":"trae","auth":{"accessToken":"trae-at","expiresAt":9999999999},"account":{"uid":"trae1"}}`))
+	if err != nil {
+		t.Fatalf("parse trae auth: %v", err)
+	}
+	p := testPoolWith(a)
+	rec := usage.New("")
+	h := NewHandler(Config{
+		Pool:             p,
+		Upstream:         up,
+		Dispatcher:       upstream.NewDispatcher(upstream.NewWBClient(up), tc),
+		Usage:            rec,
+		TraeWorkDisabled: true,
+	})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"trae:cn:glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	snap := rec.Snapshot(24, nil)
+	if snap.Totals.Credits != 0.75 || snap.Totals.CreditSamples != 1 || snap.Totals.CreditTokens != 15 {
+		t.Fatalf("explicit credit totals = %+v", snap.Totals)
+	}
+	if len(snap.CreditByAccount) != 1 || snap.CreditByAccount[0].Key != "trae1" {
+		t.Fatalf("credit_by_account = %+v", snap.CreditByAccount)
+	}
+}
+
+// Work 通道的 token_usage 藏在 payload 里，也必须走同一用量账本。
+func TestTraeWorkUsageRecordedWithoutCredit(t *testing.T) {
+	const workSSE = "data: {\"event\":\"output\",\"payload\":{\"choices\":[{\"text\":\"ok\"}]}}\n\n" +
+		"data: {\"event\":\"token_usage\",\"payload\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}\n\n" +
+		"data: {\"event\":\"done\",\"payload\":{}}\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	tc := upstream.NewTraeClient()
+	tc.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body := workSSE
+		if r.URL.Path == upstream.TraeEpChat {
+			// Work 成功后异步探测 work_credits；给一个合法快照，避免测试日志噪音。
+			body = "data: {\"cn_credits_remain_info\":{\"ide_credits\":1,\"work_credits\":2}}\n\n"
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	tc.StreamHTTP = tc.HTTP
+	a, err := auth.Parse([]byte(`{"provider":"trae","auth":{"accessToken":"trae-at","expiresAt":9999999999},"account":{"uid":"trae1"}}`))
+	if err != nil {
+		t.Fatalf("parse trae auth: %v", err)
+	}
+	p := testPoolWith(a)
+	rec := usage.New("")
+	h := NewHandler(Config{
+		Pool:       p,
+		Upstream:   up,
+		Dispatcher: upstream.NewDispatcher(upstream.NewWBClient(up), tc),
+		Usage:      rec,
+	})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"trae:cn:DeepSeek-V4-Flash-Official","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	st, _ := p.Status("trae1")
+	if st.TokenUsage.RequestCount != 1 || st.TokenUsage.UsageCount != 1 || st.TokenUsage.TotalTokens != 8 {
+		t.Fatalf("pool token usage = %+v", st.TokenUsage)
+	}
+	snap := rec.Snapshot(24, nil)
+	if snap.Totals.TotalTokens != 8 || snap.Totals.CreditSamples != 0 {
+		t.Fatalf("usage totals = %+v", snap.Totals)
 	}
 }

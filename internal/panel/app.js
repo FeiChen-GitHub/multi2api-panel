@@ -2072,7 +2072,7 @@ function cacheRateCell(hit, miss) {
 function renderCreditDim() {
   const d = usageData || {};
   $('usCreditHead').innerHTML = usCreditHead(usCreditDim);
-  const empty = '暂无积分扣除记录；升级前仅含 Token 的历史不会伪造积分。';
+  const empty = '暂无积分扣除记录；Trae 上游 token_usage 不返回单次 credit，只记 Token 用量、不伪造积分扣除；升级前仅含 Token 的历史同样不会伪造。';
   if (usCreditDim === 'model') {
     const models = d.credit_by_model || [];
     $('usCreditBody').innerHTML = models.map(row =>
@@ -2163,7 +2163,8 @@ function renderUsage(d) {
       '上游前缀缓存命中 / (命中+未命中)；低命中意味着费用数倍放大');
   $('usCreditNote').textContent =
     (usageData.credit_by_account || []).length + ' 个账号 · ' +
-    (usageData.credit_by_model || []).length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token';
+    (usageData.credit_by_model || []).length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token · ' +
+    'Trae 上游不返回单次 credit，故不生成扣除行';
 
   renderUsageDim();
   renderCreditDim();

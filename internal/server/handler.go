@@ -652,6 +652,86 @@ func chatErr(w http.ResponseWriter, proto protocol, status int, code, msg, hint 
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 }
 
+// recordAttempt 记录一次上游尝试到账号累计器与面板用量账本。WorkBuddy 与
+// Trae 共用这一入口，避免两套响应归一化各记一份导致口径漂移。
+//
+// credit/hasCredit 只表示上游明确回传的本次扣费。Trae 的 token_usage 实测不含
+// credit 字段，因此 hasCredit=false；不能用签到余额差估算单请求扣费（并发请求
+// 与后台刷新都会污染差值），否则会伪造历史。
+func (h *Handler) recordAttempt(st *chatStat, uid, bareModel, fallbackModel, modelRate string,
+	delta pool.TokenUsageDelta, credit float64, hasCredit bool, started time.Time, ttfb time.Duration) {
+	if st == nil {
+		return
+	}
+	st.attempts++
+	if delta.HasPromptTokens {
+		st.promptTokens = delta.PromptTokens
+	}
+	if delta.HasCompletionTokens {
+		st.completionTokens = delta.CompletionTokens
+	}
+	if delta.HasTotalTokens {
+		st.totalTokens = delta.TotalTokens
+	} else if delta.HasPromptTokens || delta.HasCompletionTokens {
+		st.totalTokens = st.promptTokens + st.completionTokens
+	}
+	delta.Model = bareModel
+	if delta.Model == "" {
+		delta.Model = fallbackModel
+	}
+	latency := time.Since(started)
+	latencyMs := latency.Milliseconds()
+	if latencyMs < 1 {
+		latencyMs = 1
+	}
+	delta.HasLatencyMs = true
+	delta.LatencyMs = latencyMs
+
+	// HasCompletionTokens 是「本次有没有 token 观测」的独立判断，与速率怎么算
+	// 无关，所以留在调用点；速率本身的边界（TTFB 缺失/超界）收在 tokensPerSecond。
+	if delta.HasCompletionTokens {
+		if tps, ok := tokensPerSecond(delta.CompletionTokens,
+			time.Duration(latencyMs)*time.Millisecond, ttfb); ok {
+			delta.HasTokensPerSecond = true
+			delta.TokensPerSecond = tps
+		}
+	}
+	if h.cfg.Pool != nil {
+		h.cfg.Pool.RecordTokenUsage(uid, delta)
+	}
+
+	// 用量时序记录。ok 以「上游是否给了 usage」判定：空 delta 意味着这次尝试
+	// 没拿到任何 token 统计（传输错误 / >=400 / 解析失败），计为失败尝试。
+	// 失败也计入请求数——否则重试放大在「用量」视图里看不见。
+	if h.cfg.Usage == nil {
+		return
+	}
+	realm := "cn"
+	if h.cfg.Pool != nil {
+		if a, ok := h.cfg.Pool.Status(uid); ok && a.Realm != "" {
+			realm = a.Realm
+		}
+	}
+	h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, usage.Delta{
+		PromptTokens:     delta.PromptTokens,
+		HasPromptTokens:  delta.HasPromptTokens,
+		CompletionTokens: delta.CompletionTokens,
+		HasCompletion:    delta.HasCompletionTokens,
+		TotalTokens:      delta.TotalTokens,
+		HasTotal:         delta.HasTotalTokens,
+		Credit:           credit,
+		HasCredit:        hasCredit,
+		HasCacheTokens:   st.hasCache,
+		CacheHitTokens:   st.cacheHit,
+		CacheMissTokens:  st.cacheMiss,
+		ModelRate:        modelRate,
+		LatencyMs:        delta.LatencyMs,
+		HasLatency:       delta.HasLatencyMs,
+		TokensPerSecond:  delta.TokensPerSecond,
+		HasTPS:           delta.HasTokensPerSecond,
+	}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
+}
+
 // chatCore 两条路由共用的核心链路。body 是出站用的 chat 形状请求体；
 // rawBody 是客户端原始 body（仅供观测），proto 决定响应形状。
 // 会话键提取（session.ExtractKey）作用于 body——Responses 转换已在
@@ -814,68 +894,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 	// 显式入参而不是读 st.ttfb：后者在流式分支里是**调用之后**才赋值的，
 	// 靠顺序传递会让将来重排代码时静默把速率算回旧的错口径。
 	recordAttempt := func(uid string, delta pool.TokenUsageDelta, credit float64, hasCredit bool, started time.Time, ttfb time.Duration) {
-		st.attempts++
-		if delta.HasPromptTokens {
-			st.promptTokens = delta.PromptTokens
-		}
-		if delta.HasCompletionTokens {
-			st.completionTokens = delta.CompletionTokens
-		}
-		if delta.HasTotalTokens {
-			st.totalTokens = delta.TotalTokens
-		} else if delta.HasPromptTokens || delta.HasCompletionTokens {
-			st.totalTokens = st.promptTokens + st.completionTokens
-		}
-		delta.Model = bareModel
-		if delta.Model == "" {
-			delta.Model = peek.Model
-		}
-		latency := time.Since(started)
-		latencyMs := latency.Milliseconds()
-		if latencyMs < 1 {
-			latencyMs = 1
-		}
-		delta.HasLatencyMs = true
-		delta.LatencyMs = latencyMs
-
-		// HasCompletionTokens 是「本次有没有 token 观测」的独立判断，与速率怎么算
-		// 无关，所以留在调用点；速率本身的边界（TTFB 缺失/超界）收在 tokensPerSecond。
-		if delta.HasCompletionTokens {
-			if tps, ok := tokensPerSecond(delta.CompletionTokens,
-				time.Duration(latencyMs)*time.Millisecond, ttfb); ok {
-				delta.HasTokensPerSecond = true
-				delta.TokensPerSecond = tps
-			}
-		}
-		h.cfg.Pool.RecordTokenUsage(uid, delta)
-
-		// 用量时序记录。ok 以「上游是否给了 usage」判定：空 delta 意味着这次尝试
-		// 没拿到任何 token 统计（传输错误 / >=400 / 解析失败），计为失败尝试。
-		// 失败也计入请求数——否则重试放大在「用量」视图里看不见。
-		if h.cfg.Usage != nil {
-			realm := "cn"
-			if a, ok := h.cfg.Pool.Status(uid); ok && a.Realm != "" {
-				realm = a.Realm
-			}
-			h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, usage.Delta{
-				PromptTokens:     delta.PromptTokens,
-				HasPromptTokens:  delta.HasPromptTokens,
-				CompletionTokens: delta.CompletionTokens,
-				HasCompletion:    delta.HasCompletionTokens,
-				TotalTokens:      delta.TotalTokens,
-				HasTotal:         delta.HasTotalTokens,
-				Credit:           credit,
-				HasCredit:        hasCredit,
-				HasCacheTokens:   st.hasCache,
-				CacheHitTokens:   st.cacheHit,
-				CacheMissTokens:  st.cacheMiss,
-				ModelRate:        modelRate,
-				LatencyMs:        delta.LatencyMs,
-				HasLatency:       delta.HasLatencyMs,
-				TokensPerSecond:  delta.TokensPerSecond,
-				HasTPS:           delta.HasTokensPerSecond,
-			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
-		}
+		h.recordAttempt(st, uid, bareModel, peek.Model, modelRate, delta, credit, hasCredit, started, ttfb)
 	}
 
 	// 系统提示词改写（出站前、轮转前；每个请求一次）。
@@ -1219,7 +1238,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 		if isTrae {
 			// Trae 成功路径（SOLO 原生流）：格式归一化与错误处置都在 serveTraeSuccess 内，
 			// 不落入下方 WorkBuddy 专属的 StreamHint / markup repair / 统计路径。
-			h.serveTraeSuccess(w, r, acct, rc, bareModel, peek.Stream, st, stickySessKey, chatChannel, proto)
+			h.serveTraeSuccess(w, r, acct, rc, bareModel, peek.Stream, st, stickySessKey, chatChannel, proto, attemptStarted)
 			return
 		}
 		if peek.Stream {
@@ -1538,12 +1557,18 @@ func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) 
 	if usage == nil {
 		return 0, 0, false
 	}
-	c, _ := usage["credit"].(float64)
-	t, _ := usage["total_tokens"].(float64)
-	if t <= 0 {
+	c, hasCredit := usageCreditFromMap(usage)
+	t, hasTotal := usageInt64(usage, "total_tokens")
+	if !hasCredit || !hasTotal || t <= 0 {
 		return 0, 0, false
 	}
 	return c, int(t), true
+}
+
+// usageCreditFromMap 读取上游明确回传的单次扣费 credit。
+// 缺失/非法 → false：调用方必须保留「未观测」语义，不能按余额差估算。
+func usageCreditFromMap(usage map[string]any) (float64, bool) {
+	return usageFloat64(usage, "credit")
 }
 
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2）：第 i 次轮转失败

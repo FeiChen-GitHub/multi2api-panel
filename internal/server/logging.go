@@ -308,42 +308,74 @@ func parseModelFromBody(body []byte) string {
 
 // usageDeltaFromResponse 从非流式聚合响应中提取明确存在的 token 字段。
 func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
-	delta := pool.TokenUsageDelta{}
 	u, ok := resp["usage"].(map[string]any)
 	if !ok {
-		return delta
+		return pool.TokenUsageDelta{}
 	}
-	read := func(key string) (int64, bool) {
-		v, ok := u[key]
-		if !ok {
-			return 0, false
-		}
-		switch n := v.(type) {
-		case float64:
-			return int64(n), true
-		case float32:
-			return int64(n), true
-		case int:
-			return int64(n), true
-		case int64:
-			return n, true
-		case json.Number:
-			i, err := n.Int64()
-			return i, err == nil
-		default:
-			return 0, false
-		}
-	}
-	if n, ok := read("prompt_tokens"); ok {
+	return usageDeltaFromMap(u)
+}
+
+// usageDeltaFromMap 从 usage 对象提取明确存在的 token 字段。
+// WorkBuddy 的流式/非流式与 Trae 的 token_usage 都归一到同一口径。
+func usageDeltaFromMap(u map[string]any) pool.TokenUsageDelta {
+	delta := pool.TokenUsageDelta{}
+	if n, ok := usageInt64(u, "prompt_tokens"); ok {
 		delta.HasPromptTokens, delta.PromptTokens = true, n
 	}
-	if n, ok := read("completion_tokens"); ok {
+	if n, ok := usageInt64(u, "completion_tokens"); ok {
 		delta.HasCompletionTokens, delta.CompletionTokens = true, n
 	}
-	if n, ok := read("total_tokens"); ok {
+	if n, ok := usageInt64(u, "total_tokens"); ok {
 		delta.HasTotalTokens, delta.TotalTokens = true, n
 	}
 	return delta
+}
+
+// usageInt64 读取 usage 中的整数型字段；JSON 数字可能被解码成 float64 或
+// json.Number，非数字/缺失返回 false（不把缺失伪造成 0）。
+func usageInt64(u map[string]any, key string) (int64, bool) {
+	v, ok := u[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case float32:
+		return int64(n), true
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	case json.Number:
+		i, err := n.Int64()
+		return i, err == nil
+	default:
+		return 0, false
+	}
+}
+
+// usageFloat64 读取 usage 中的浮点型字段（credit 等），缺失/非法返回 false。
+func usageFloat64(u map[string]any, key string) (float64, bool) {
+	v, ok := u[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	default:
+		return 0, false
+	}
 }
 
 // completionTokens 从 Aggregate 返回的响应中提取 usage.completion_tokens；缺失返回 -1。

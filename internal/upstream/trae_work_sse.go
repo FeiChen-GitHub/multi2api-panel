@@ -180,7 +180,7 @@ func traeWorkDelta(full *string, text string) string {
 // 事件序列结束（done / [DONE] / EOF）保证写且仅写一个 [DONE]。
 // onErr 在遇到 error 事件时回调（供上层冷却该账号的 Work 通道）。
 // 调用方负责已写好 status 200 与响应头。
-func TraeStreamWorkToOpenAI(w http.ResponseWriter, r io.Reader, model string, onErr func(*TraeStreamError)) error {
+func TraeStreamWorkToOpenAI(w http.ResponseWriter, r io.Reader, model string, onErr func(*TraeStreamError), onUsage ...func(map[string]any)) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -294,6 +294,9 @@ func TraeStreamWorkToOpenAI(w http.ResponseWriter, r io.Reader, model string, on
 			default:
 				if u := traeWorkUsageOf(ev); u != nil {
 					pendingUsage = u
+					if len(onUsage) > 0 && onUsage[0] != nil {
+						onUsage[0](u)
+					}
 				}
 				text, _ := traeWorkTextOf(ev)
 				if text == "" {
