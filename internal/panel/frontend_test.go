@@ -746,6 +746,8 @@ const cfgForm = { elements: {
   api_key: mk('secret'),
   user_agent: mk(''),
   prompt_file: mk(''),
+  prompt_persona: mk(''),
+  prompt_persona_enabled: { type: 'checkbox', checked: false },
   checkin_hours: mk(''),
 }};
 const ctx = {
@@ -760,6 +762,8 @@ const has = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
 process.stdout.write(JSON.stringify([
   has(out.upstream, 'user_agent'), (out.upstream || {}).user_agent,
   has(out.prompt, 'file'), (out.prompt || {}).file,
+  has(out.prompt, 'persona'), (out.prompt || {}).persona,
+  has(out.prompt, 'persona_enabled'), (out.prompt || {}).persona_enabled,
   has(out, 'listen'),
   has(out.schedule, 'checkin_hours'),
   out.api_key
@@ -777,7 +781,10 @@ process.stdout.write(JSON.stringify([
 		t.Fatalf("collectConfig node test failed: %v\n%s", err, out)
 	}
 	// [user_agent 已发, 其值, prompt.file 已发, 其值, listen 未发, checkin_hours 未发, api_key]
-	const want = `[true,"",true,"",false,false,"secret"]`
+	// prompt_persona 是覆盖型字段（CLEARABLE_CFG）：清空 = 明确关闭人格层，
+	// 必须照发。若它被移出 CLEARABLE_CFG，用户清空后 config.json 里仍是旧人格名，
+	// 人格关不掉——正是 issue #102 那个坑的翻版。
+	const want = `[true,"",true,"",true,"",true,false,false,false,"secret"]`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("collectConfig=%s want %s", strings.TrimSpace(string(out)), want)
 	}

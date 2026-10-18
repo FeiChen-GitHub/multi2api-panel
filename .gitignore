@@ -37,8 +37,12 @@ docs/
 !README.md
 # agent 协作约定（同 README 一并进版本库）
 !AGENTS.md
+# 人格提示词文件必须进版本库：persona.go 用 //go:embed 嵌入，
+# 漏提交会导致 clone 后编译失败（embed 找不到文件）。
+!internal/prompt/personas/*.md
 
 # Windows binaries
+/multi2api.exe
 /wb2api.exe
 /signin_bin.exe
 /login.exe

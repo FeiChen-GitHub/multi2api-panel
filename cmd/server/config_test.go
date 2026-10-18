@@ -764,6 +764,144 @@ func TestPromptLegacyConfigNoImpact(t *testing.T) {
 	}
 }
 
+// ===== haio 分支：人格提示词（persona）配置层测试 =====
+
+// TestPersonaDisabledByDefault 老配置/新配置缺省都不启用人格层。
+// 这是零影响承诺的承重墙：任何既有部署升级到本分支后行为必须逐字不变。
+func TestPersonaDisabledByDefault(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"listen":":7863","api_key":"k","prompt":{"mode":"custom"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Prompt.PersonaEnabled {
+		t.Error("persona_enabled must default to false")
+	}
+	if c.PersonaText != "" {
+		t.Errorf("PersonaText must stay empty when disabled, got %d bytes", len(c.PersonaText))
+	}
+	// PromptText 仍按原语义加载（人格层不干扰既有提示词路径）。
+	if c.PromptText == "" {
+		t.Error("PromptText should still load in custom mode")
+	}
+}
+
+// TestPersonaEnabledWithoutNameFailsFast 开了开关却没指名人格 → 启动报错。
+// 静默放过会让用户以为人格生效，实际出站的是工程提示词。
+func TestPersonaEnabledWithoutNameFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"custom","persona_enabled":true}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("persona_enabled=true with empty persona should fail fast")
+	}
+}
+
+// TestPersonaBuiltinLoaded persona_enabled=true + persona="haiou" → 人格文本加载完成。
+func TestPersonaBuiltinLoaded(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"custom","persona_enabled":true,"persona":"haiou"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Prompt.PersonaEnabled {
+		t.Fatal("persona_enabled not parsed")
+	}
+	if c.Prompt.Persona != "haiou" {
+		t.Errorf("persona=%q want haiou", c.Prompt.Persona)
+	}
+	if c.PersonaText == "" {
+		t.Fatal("PersonaText empty — builtin persona not loaded")
+	}
+	if !strings.Contains(c.PersonaText, "海鸥在线，你要整点薯条吗？") {
+		t.Error("PersonaText missing greeting anchor")
+	}
+}
+
+// TestPersonaCustomFilePath persona 指向自定义文件 → 读该文件。
+// 支持外挂人格而不改仓库、不重新编译。
+func TestPersonaCustomFilePath(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	personaPath := filepath.Join(dir, "my.md")
+	os.WriteFile(personaPath, []byte("自定义人格内容"), 0o600)
+	// JSON 里路径要转义反斜杠
+	esc := strings.ReplaceAll(personaPath, `\`, `\\`)
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"custom","persona_enabled":true,"persona":"`+esc+`"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PersonaText != "自定义人格内容" {
+		t.Errorf("PersonaText=%q want 自定义人格内容", c.PersonaText)
+	}
+}
+
+// TestPersonaMissingFileFailsFast persona 指向不存在的路径 → 启动报错，不回落。
+func TestPersonaMissingFileFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"custom","persona_enabled":true,"persona":"/no/such/persona.md"}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("missing persona file should fail fast, not silently disable persona")
+	}
+}
+
+// TestPersonaEnabledFalseIgnoresName enabled=false 时 persona 名被忽略。
+// 便于临时关掉人格而不删配置（显式关优先级最高）。
+func TestPersonaEnabledFalseIgnoresName(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"custom","persona_enabled":false,"persona":"haiou"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PersonaText != "" {
+		t.Errorf("PersonaText must stay empty when enabled=false, got %d bytes", len(c.PersonaText))
+	}
+}
+
+// TestPersonaWorksInPassthroughMode 人格层不依赖 prompt.mode=custom。
+// passthrough + persona 开启时人格仍生效——人格覆写是独立维度，
+// 用户不该为了开人格被迫改 mode。
+func TestPersonaWorksInPassthroughMode(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"passthrough","persona_enabled":true,"persona":"haiou"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PersonaText == "" {
+		t.Fatal("persona should load even in passthrough mode")
+	}
+}
+
+
+// TestRestartRequiredFieldsIncludePrompt haio 分支：prompt.* 改动必须列入重启清单。
+// saveConfig 的热应用段没有重设 handler 的 PromptMode/PromptText/PersonaText
+// （它们在 NewHandler 装配期从 cfg 拷入），改完不重启不生效。漏列会让面板
+// 显示"已保存"而行为没变。
+func TestRestartRequiredFieldsIncludePrompt(t *testing.T) {
+	c := &Config{}
+	fields := restartRequiredFields(c)
+	want := []string{"prompt.mode", "prompt.file", "prompt.persona", "prompt.persona_enabled"}
+	got := map[string]bool{}
+	for _, f := range fields {
+		got[f] = true
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Errorf("restartRequiredFields missing %q — 面板会谎称已生效", w)
+		}
+	}
+}
+
 // TestUpstreamUserAgentConfig 配置 upstream.user_agent 与 env WB2A_USER_AGENT 均生效，
 // 缺省空串保持现状（headers 层回落到 clientUA）。
 func TestUpstreamUserAgentConfig(t *testing.T) {

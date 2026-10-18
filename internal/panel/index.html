@@ -1061,6 +1061,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <span class="hint">需重启</span></label>
             </div>
             <div class="hr"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">人格提示词</span>
+                <input name="prompt_persona" placeholder="haiou = 内置人格；或填文件路径">
+                <span class="hint">内置 haiuo；留空 = 关闭人格层</span></label>
+              <label class="fld switch"><span class="lb">启用人格层</span>
+                <input type="checkbox" name="prompt_persona_enabled">
+                <span class="hint">开启后人格文本覆写出站 system</span></label>
+            </div>
+            <div class="hr"></div>
             <div class="switch"><span class="lb">出站请求指纹脱敏</span>
               <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
             <div class="switch"><span class="lb">会话粘性路由</span>

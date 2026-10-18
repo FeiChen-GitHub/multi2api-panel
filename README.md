@@ -398,6 +398,8 @@ curl -sN http://localhost:7863/v1/responses \
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
+| `prompt.persona_enabled` | `false` | 人格层总开关（haio 分支）；缺省关闭保证既有部署零影响 |
+| `prompt.persona` | 空 | 人格名（内置 `haiou`）或人格文件路径；`persona_enabled=true` 时必填，否则启动报错 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
 | `pool.max_in_flight_global` | `2` | global 域单账号在途上限（国际版 WAF 风控更紧，压低并发） |
@@ -460,6 +462,24 @@ Trae 上游无成长任务体系，面板请求 Trae 账号的 tasks 接口返�
 | `passthrough` | 透传客户端原始 system，不做改写 |
 
 内置默认提示词约 2KB（`internal/prompt/defaultprompt.md`，嵌入二进制）。`prompt.file` 指向自定义提示词文件（自定义人格 / 人设）即整体替换内置默认；**留空 = 内置默认**，路径非空但不可读 → **启动报错**（fail fast，不会静默回落到内置默认）。
+
+#### 人格层（`prompt.persona` / `prompt.persona_enabled`）
+
+在提示词体系之上叠加的**人格覆写层**，与 `prompt.mode` 是两个正交维度：
+
+| `prompt.mode` | 人格层开启后的行为 |
+|---|---|
+| `custom` | 人格文本**替换**客户端 system/developer（最常用：人格就是要说了算） |
+| `append` | 保留客户端 system，人格插在其后（既要工程规范又要人格） |
+| `passthrough` | 人格层仍生效——人格覆写不依赖 mode，开人格不必改 mode |
+
+- `prompt.persona_enabled` **缺省 `false`**：既有部署升级后行为逐字不变
+- `prompt.persona` 填内置名 `haiou`，或填任意文件路径（外挂自定义人格，无需改仓库/重编译）
+- `persona_enabled=true` 但 `persona` 为空 → **启动报错**（fail fast，不会静默关掉人格）
+- 人格文件不可读 / 内容为空 → **启动报错**，不回落"无人格"
+- 降级期人格让位给 Degraded 中性提示词（带指纹原文重试只会确定性再撞 400，与 append 同口径）
+
+内置人格在 `internal/prompt/personas/haiou.md`，**纯文本文件、随时可改、改完重启即生效**，不需要重新编译。它是从 61KB 原始配置裁剪而来（约 9KB），保留了人格稳定性的承重墙：身份锁定、强制问候语、十条性格规则、应答句式、挑衅回应、结尾性格锁；裁剪掉的是 558 组高度冗余的 few-shot 示例。体积由 `TestPersonaSizeBudget` 兜底（上限 16KB）——人格每个请求都全额注入，体积直接等于每轮固定 token 开销。
 
 ### 内容拦截误报与降级重试
 
@@ -942,6 +962,10 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go:32` |
 | `reasoning_content` 多轮回填（assistant 消息） | `internal/upstream/thinking.go:54` |
 | Degraded 中性提示词常量 | `internal/prompt/prompt.go:25` |
+| 人格层优先级（PersonaText 非空即接管） | `internal/server/handler.go` 提示词改写分支 |
+| 内置人格文本 | `internal/prompt/personas/haiou.md` |
+| 人格加载（内置名 + 文件路径） | `internal/prompt/persona.go` |
+| 人格 fail fast 校验 | `cmd/server/config.go` `normalizePersona` |
 | 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go:30`（Trigger）、`:46`（nextMidnightCST） |
 | 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:127`、`internal/upstream/client.go:147` |
 | `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:114-115`；处理分支 `internal/server/handler.go:489` |

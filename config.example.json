@@ -58,7 +58,9 @@
   },
   "prompt": {
     "mode": "passthrough",
-    "file": ""
+    "file": "",
+    "persona": "haiou",
+    "persona_enabled": false
   },
   "upstash": {
     "url": "",

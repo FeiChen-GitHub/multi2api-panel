@@ -1002,6 +1002,7 @@ const CFG_MAP = {
   timeout_seconds: ['upstream', 'timeout_seconds'], header_timeout_seconds: ['upstream', 'header_timeout_seconds'],
   idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'], user_agent: ['upstream', 'user_agent'],
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
+  prompt_persona: ['prompt', 'persona'], prompt_persona_enabled: ['prompt', 'persona_enabled'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
@@ -1017,7 +1018,7 @@ const CFG_MAP = {
  * 刻意不含 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
  * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
  */
-const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
+const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file', 'prompt_persona']);
 
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {

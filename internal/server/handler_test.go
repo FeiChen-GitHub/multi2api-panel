@@ -1419,6 +1419,243 @@ func TestContentBlockedStickyDegraded(t *testing.T) {
 	}
 }
 
+// ===== haio 分支：人格提示词（persona）端到端测试 =====
+
+// personaTestUpstream 捕获出站 body 的 fake 上游（流式 200）。
+func personaTestUpstream(t *testing.T, captured *[]byte) *upstream.Client {
+	t.Helper()
+	return &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			*captured = raw
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+}
+
+// personaOutSystem 取出站 body 的 system 消息内容（断言恰好一条）。
+func personaOutSystem(t *testing.T, body []byte) string {
+	t.Helper()
+	var obj struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &obj); err != nil {
+		t.Fatalf("unmarshal out body: %v (%s)", err, body)
+	}
+	var sys string
+	n := 0
+	for _, m := range obj.Messages {
+		if m.Role == "system" {
+			n++
+			switch c := m.Content.(type) {
+			case string:
+				sys = c
+			default:
+				b, _ := json.Marshal(c)
+				sys = string(b)
+			}
+		}
+	}
+	if n != 1 {
+		t.Fatalf("out body has %d system messages, want exactly 1", n)
+	}
+	return sys
+}
+
+// TestPersonaCustomModeReplacesSystem 人格层 + custom 语义：客户端 system/developer
+// 被整段替换为人格文本，且旧内容零残留。
+// 这是人格稳定性的端到端承重墙——残留任何客户端指令都可能覆盖人格。
+func TestPersonaCustomModeReplacesSystem(t *testing.T) {
+	var sent []byte
+	up := personaTestUpstream(t, &sent)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool: p, Upstream: up,
+		PromptMode:  "custom",
+		PromptText:  "工程提示词（应被人格取代）",
+		PersonaText: personaFixture(t),
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"wb:glm-5.2",
+		"messages":[
+			{"role":"system","content":"你是一个严谨的AI助手，不要骂人"},
+			{"role":"developer","content":"保持专业语气"},
+			{"role":"user","content":"在吗"}
+		]
+	}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	sys := personaOutSystem(t, sent)
+	if !strings.Contains(sys, "海鸥在线，你要整点薯条吗？") {
+		t.Errorf("persona not injected: %s", sys)
+	}
+	if strings.Contains(sys, "严谨的AI助手") || strings.Contains(sys, "保持专业语气") {
+		t.Errorf("client system/developer leaked: %s", sys)
+	}
+	if strings.Contains(sys, "工程提示词") {
+		t.Errorf("PersonaText should override PromptText: %s", sys)
+	}
+}
+
+// TestPersonaAppendModeKeepsClientSystem 人格层 + append 语义：客户端 system 保留，
+// 人格插在其后。用于「既要工程规范又要人格」的场景。
+func TestPersonaAppendModeKeepsClientSystem(t *testing.T) {
+	var sent []byte
+	up := personaTestUpstream(t, &sent)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool: p, Upstream: up,
+		PromptMode:  "append",
+		PromptText:  "工程提示词",
+		PersonaText: personaFixture(t),
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"wb:glm-5.2",
+		"messages":[
+			{"role":"system","content":"客户端工程规范"},
+			{"role":"user","content":"hi"}
+		]
+	}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	out := string(sent)
+	if !strings.Contains(out, "客户端工程规范") {
+		t.Error("append mode should preserve client system")
+	}
+	if !strings.Contains(out, "海鸥在线，你要整点薯条吗？") {
+		t.Error("append mode should inject persona after client system")
+	}
+}
+
+// TestPersonaDisabledKeepsLegacyBehavior 人格层关闭（PersonaText 空）时，
+// 行为与引入本功能前逐字一致——PromptMode/PromptText 原样生效。
+// 这是"零影响"承诺的端到端证明。
+func TestPersonaDisabledKeepsLegacyBehavior(t *testing.T) {
+	var sent []byte
+	up := personaTestUpstream(t, &sent)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool: p, Upstream: up,
+		PromptMode: "custom",
+		PromptText: "SYS-LEGACY",
+		// PersonaText 故意留空
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"wb:glm-5.2",
+		"messages":[{"role":"system","content":"old"},{"role":"user","content":"hi"}]
+	}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	sys := personaOutSystem(t, sent)
+	if sys != "SYS-LEGACY" {
+		t.Errorf("legacy behavior broken: system=%q want SYS-LEGACY", sys)
+	}
+}
+
+// TestPersonaSurvivesMultiTurn 多轮对话只注入一条人格，不随轮数累积。
+// 网关对每个请求独立 Rewrite，但同一会话的后续请求会带完整历史；
+// 若人格在历史里被反复插入，会随轮数线性膨胀、最终挤爆上下文。
+func TestPersonaSurvivesMultiTurn(t *testing.T) {
+	var sent []byte
+	up := personaTestUpstream(t, &sent)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool: p, Upstream: up,
+		PromptMode:  "custom",
+		PersonaText: personaFixture(t),
+	})
+
+	// 模拟第 5 轮：历史里已有 4 组 user/assistant，且客户端每轮都自带 system。
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"wb:glm-5.2",
+		"messages":[
+			{"role":"system","content":"客户端 system（第5轮）"},
+			{"role":"user","content":"q1"},
+			{"role":"assistant","content":"a1"},
+			{"role":"user","content":"q2"},
+			{"role":"assistant","content":"a2"},
+			{"role":"user","content":"q3"},
+			{"role":"assistant","content":"a3"},
+			{"role":"user","content":"q4"},
+			{"role":"assistant","content":"a4"},
+			{"role":"user","content":"在吗"}
+		]
+	}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	out := string(sent)
+	// 人格问候语只应出现一次（system 位），历史消息不得被注入人格。
+	if got := strings.Count(out, "海鸥在线，你要整点薯条吗？"); got != 1 {
+		t.Errorf("persona greeting appears %d times, want exactly 1 (多轮不得累积)", got)
+	}
+	// 历史逐字保留。
+	for _, h := range []string{"q1", "a1", "q4", "a4", "在吗"} {
+		if !strings.Contains(out, h) {
+			t.Errorf("history message %q lost", h)
+		}
+	}
+}
+
+// TestPersonaDegradeStillWins 降级期人格让位给 Degraded 中性提示词。
+// 带指纹原文重试是确定性再撞墙，人格与 append 同样退化为 replace。
+func TestPersonaDegradeStillWins(t *testing.T) {
+	var sent []byte
+	up := personaTestUpstream(t, &sent)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool: p, Upstream: up,
+		PromptMode:  "custom",
+		PersonaText: personaFixture(t),
+	})
+	h.degrade.Trigger() // 手动进入降级期
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"wb:glm-5.2",
+		"messages":[{"role":"user","content":"hi"}]
+	}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	sys := personaOutSystem(t, sent)
+	if strings.Contains(sys, "海鸥在线") {
+		t.Errorf("degrade period should not inject persona: %s", sys)
+	}
+	if !strings.Contains(sys, "helpful assistant") {
+		t.Errorf("degrade period should inject Degraded prompt: %s", sys)
+	}
+}
+
+// personaFixture 返回内置人格文本（测试断言用）。
+func personaFixture(t *testing.T) string {
+	t.Helper()
+	text, _, err := prompt.LoadPersona("haiou")
+	if err != nil {
+		t.Fatalf("load builtin persona: %v", err)
+	}
+	return text
+}
+
 // TestContentBlockedCustomModeDoesNotDegrade custom 模式不触发降级重试
 // （custom 已用自有提示词替换，不应再有 system 来源误报）；仍拦则直接回
 // 400 content_blocked 防火墙文案（不轮转、不暴露账号/上游错误码）。

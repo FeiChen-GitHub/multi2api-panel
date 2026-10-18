@@ -175,10 +175,28 @@ type Config struct {
 		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
 		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
 		File string `json:"file"`
+		// Persona 人格提示词名（haio 分支）。空 = 不启用人格层（默认，零影响）。
+		//
+		// 取值语义：
+		//   - 空：人格层关闭，PromptText 原样作为出站 system（与引入本功能前一致）；
+		//   - 内置名（"haiou"）：读仓库内 internal/prompt/personas/<name>.md 覆写出站 system；
+		//   - 其它字符串：当文件路径读，支持外挂自定义人格而不改仓库。
+		//
+		// PersonaEnabled=false 时 Persona 被忽略（显式关优先级最高，便于临时
+		// 关掉人格而不删配置）。两者都满足才启用人格层。
+		Persona string `json:"persona"`
+		// PersonaEnabled 人格层总开关，缺省 false。
+		//
+		// 为什么缺省 false 而不是 true：本功能会整体替换出站 system 提示词，
+		// 对既有部署是行为变更。缺省关闭保证老配置零影响；需要人格的用户
+		// 显式打开。人格文件本身随时可改，但要不要用它由这个开关决定。
+		PersonaEnabled bool `json:"persona_enabled"`
 	} `json:"prompt"`
 
 	// PromptText 解析后的系统提示词文本（custom/append 模式使用）。
 	PromptText string `json:"-"`
+	// PersonaText 解析后的人格提示词文本（haio 分支；人格层关闭时为空串）。
+	PersonaText string `json:"-"`
 
 	Upstash struct {
 		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
@@ -674,6 +692,34 @@ func (c *Config) normalizePrompt() error {
 		}
 		c.PromptText = text
 	}
+	return c.normalizePersona()
+}
+
+// normalizePersona 校验 prompt.persona_enabled / prompt.persona 并加载人格文本。
+//
+// 语义矩阵（enabled × persona）：
+//
+//	enabled=false           → 人格层关闭，PersonaText 清空（零影响，老配置默认态）
+//	enabled=true  persona="" → 报错：开了开关却没指名人格，属于配置疏漏，
+//	                           静默放过会让用户以为人格生效（fail fast）
+//	enabled=true  persona=X  → 加载 X；内置名走 embed，其它当文件路径读
+//
+// 加载失败一律报错而不回落到"无人格"：人格覆写是本功能的核心效果，
+// 静默失效比启动失败更难排查（用户看到的是"人格时灵时不灵"）。
+func (c *Config) normalizePersona() error {
+	if !c.Prompt.PersonaEnabled {
+		c.PersonaText = ""
+		return nil
+	}
+	if strings.TrimSpace(c.Prompt.Persona) == "" {
+		return fmt.Errorf("prompt.persona_enabled=true 但 prompt.persona 为空：请指定人格名（内置: %s）或自定义文件路径",
+			strings.Join(prompt.BuiltinPersonaNames(), ", "))
+	}
+	text, _, err := prompt.LoadPersona(c.Prompt.Persona)
+	if err != nil {
+		return err
+	}
+	c.PersonaText = text
 	return nil
 }
 

@@ -61,6 +61,17 @@ type Config struct {
 	PromptMode string
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
 	PromptText string
+	// PersonaText 人格提示词文本（haio 分支；空 = 人格层关闭）。
+	//
+	// 人格层与 PromptMode 的关系（优先级从高到低）：
+	//   - PersonaText 非空 → 人格层接管出站 system，无视 PromptMode：
+	//     custom 语义（替换客户端 system/developer）+ append 语义（保留客户端
+	//     system 后插入）都由 Mode 决定，人格只是替换掉"注入哪段文本"。
+	//   - PersonaText 空 → 走原有 PromptMode 分支，行为与本功能引入前逐字一致。
+	//
+	// 为什么人格不单独设 Mode：人格覆写与"替换还是并用"是两个正交维度，
+	// 拆成独立开关会让配置面翻倍，且绝大多数场景人格就是要替换（custom）。
+	PersonaText string
 
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
@@ -873,7 +884,19 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
 	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
 	degradedApplied := false
-	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
+	if h.cfg.PersonaText != "" {
+		// 人格层（haio 分支）：人格文本取代 PromptText 作为注入内容，
+		// 替换/并用语义仍由 PromptMode 决定。降级期同样让位给 Degraded——
+		// 带指纹原文重试是确定性再撞墙，与 append 的降级裁决同口径。
+		if h.degrade.Active() {
+			body = prompt.Rewrite(body, prompt.Degraded)
+			degradedApplied = true
+		} else if h.cfg.PromptMode == "append" {
+			body = prompt.Append(body, h.cfg.PersonaText)
+		} else {
+			body = prompt.Rewrite(body, h.cfg.PersonaText)
+		}
+	} else if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)
 	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
 		body = prompt.Append(body, h.cfg.PromptText)
