@@ -329,7 +329,8 @@ func traeNormalizeExpiresAt(v int64) int64 {
 	return v
 }
 
-// Checkin 执行每日签到：先查 status，未签到且 enable 才 claim（幂等）。
+// Checkin 执行每日签到：status 只用于判断是否已签到/是否开放；未签到且 enable
+// 时 claim。claim 只执行一次，失败立即返回。
 func (c *TraeClient) Checkin(ctx context.Context, a *auth.Auth) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.UgHost+TraeEpCheckinStatus, bytes.NewReader([]byte("{}")))
 	if err != nil {
@@ -368,36 +369,59 @@ func (c *TraeClient) Checkin(ctx context.Context, a *auth.Auth) error {
 		}
 		return &Error{Kind: kind, Status: resp.StatusCode, Msg: msg}
 	}
-	if st.CheckedIn || !st.Enable {
-		return nil // 已签到 / 签到未开放：幂等成功
+	if st.CheckedIn {
+		return nil // 今天已签到：幂等成功
 	}
+	if !st.Enable {
+		msg := st.Message
+		if msg == "" {
+			msg = truncateText(string(raw), 200)
+		}
+		return fmt.Errorf("checkin status: enable=false（签到未开放，未完成）: %s", msg)
+	}
+
+	_, err = c.claimCheckin(ctx, a)
+	return err
+}
+
+// claimCheckin 单次 claim。9074 仍归类为 ErrSoftRate，但调用方不重试。
+// 只有可解析且 code=0 才算成功。
+func (c *TraeClient) claimCheckin(ctx context.Context, a *auth.Auth) (retry bool, err error) {
 	claimReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.UgHost+TraeEpCheckinClaim, bytes.NewReader([]byte(`{"req_source":2}`)))
 	if err != nil {
-		return err
+		return false, err
 	}
 	traeUgHeaders(claimReq, a)
 	claimResp, err := c.HTTP.Do(claimReq)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer claimResp.Body.Close()
 	claimRaw, _ := io.ReadAll(io.LimitReader(claimResp.Body, 1<<20))
 	if claimResp.StatusCode >= 400 {
-		return &Error{Kind: TraeClassify(claimResp.StatusCode, string(claimRaw)), Status: claimResp.StatusCode, Msg: truncateText(string(claimRaw), 200)}
+		return false, &Error{Kind: TraeClassify(claimResp.StatusCode, string(claimRaw)), Status: claimResp.StatusCode, Msg: truncateText(string(claimRaw), 200)}
 	}
 	var out struct {
-		Code    int    `json:"code"`
+		Code    *int   `json:"code"`
 		Message string `json:"message"`
 	}
-	if err := json.Unmarshal(claimRaw, &out); err == nil && out.Code != 0 {
-		kind := TraeClassify(claimResp.StatusCode, string(claimRaw))
-		if out.Code == 1001 {
-			kind = ErrSessionDead
-		}
-		return &Error{Kind: kind, Status: claimResp.StatusCode,
-			Msg: fmt.Sprintf("checkin claim: %d %s", out.Code, out.Message)}
+	if err := json.Unmarshal(claimRaw, &out); err != nil {
+		return false, fmt.Errorf("checkin claim parse: %w（body=%s）", err, truncateText(string(claimRaw), 200))
 	}
-	return nil
+	if out.Code == nil {
+		return false, fmt.Errorf("checkin claim: missing code（body=%s）", truncateText(string(claimRaw), 200))
+	}
+	if *out.Code == 0 {
+		return false, nil
+	}
+	kind := TraeClassify(claimResp.StatusCode, string(claimRaw))
+	if *out.Code == 1001 {
+		kind = ErrSessionDead
+	} else if *out.Code == 9074 {
+		kind = ErrSoftRate
+	}
+	return *out.Code == 9074, &Error{Kind: kind, Status: claimResp.StatusCode,
+		Msg: fmt.Sprintf("checkin claim: %d %s", *out.Code, out.Message)}
 }
 
 // QueryCredits 聚合账号额度：remain = Σ(credits_limit) - Σ(credits_amount)，total = Σ limits。

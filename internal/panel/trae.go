@@ -103,7 +103,9 @@ func (p *Panel) checkinTrae(w http.ResponseWriter, a *auth.Auth) {
 		writeErr(w, http.StatusServiceUnavailable, "Trae provider 未接入或未启用")
 		return
 	}
-	resp := map[string]any{"ok": true, "provider": string(auth.ProviderTrae)}
+	resp := map[string]any{
+		"ok": true, "provider": string(auth.ProviderTrae), "checkin_done": false,
+	}
 
 	if err := client.Checkin(ctx, a); err != nil {
 		// 9074「当前使用人数太多」等拥挤错误：如实回报，不罚号。

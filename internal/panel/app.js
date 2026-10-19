@@ -520,6 +520,17 @@ async function loadOverview(quiet) {
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 
+function checkinOutcome(r) {
+  const credits = r && r.credits != null
+    ? '积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '')
+    : '';
+  const detail = r && r.checkin_message ? '（' + r.checkin_message + '）' : '';
+  if (r && r.checkin_done === true) {
+    return { msg: '签到完成' + (credits ? '，' + credits : '') + detail, cls: 'ok' };
+  }
+  return { msg: '签到未完成' + (credits ? '，' + credits : '') + detail, cls: 'err' };
+}
+
 $('accBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-a]');
   if (!b) return;
@@ -532,7 +543,8 @@ $('accBody').addEventListener('click', async ev => {
   try {
     if (a === 'checkin') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/checkin', { method: 'POST' });
-      toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
+      const o = checkinOutcome(r);
+      toast(o.msg, o.cls);
     } else if (a === 'balance') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
       toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
