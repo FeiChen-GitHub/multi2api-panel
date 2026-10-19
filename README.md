@@ -314,6 +314,37 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o login ./cmd/login
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 ```
 
+**Windows 本地编译（三个辅助程序）：**
+
+```powershell
+go build -o signin_bin.exe .\cmd\signin
+go build -o login.exe .\cmd\login
+go build -o credit.exe .\cmd\credit
+```
+
+### 辅助程序：签到 / 登录 / 积分
+
+三个独立小工具，均可单独编译、单独运行，**全部支持 WorkBuddy 与 Trae 两种 provider**：
+
+| 程序 | 作用 | WorkBuddy | Trae |
+|---|---|---|---|
+| `signin_bin.exe [auths_dir]` | 遍历 `auths/workbuddy-*.json` 与 `auths/trae-*.json`：token 过期（Trae 阈值 2 小时）先刷新并原子落盘 → 每日签到 → 查积分余额；输出 `uid / provider / nick / status / remain / detail` 表；凭证失效标 `AUTH_INVALID` | ✅ | ✅ |
+| `login.exe [--realm=cn\|global] <url\|poll\|realm>` | WorkBuddy 设备授权登录（取授权链接 / 轮询 token / 落盘 auth） | ✅ | — |
+| `login.exe trae [--port=18080]` | Trae 网页登录：本地起 `127.0.0.1:18080` 回调页 → 浏览器完成登录 → 自动换取凭证 → 落盘 `auths/trae-<uid>.json`（provider=`trae`、realm=`cn`，补 `device_id` 与 `account_key`） | — | ✅ |
+| `credit.exe [-pretty]` | 积分日报：按 realm 选择 CN / Global 计费端点，逐号查积分；Trae 走 `CreditPackages`（`used = total - remain`）；默认输出 JSON，`-pretty` 输出人类可读汇总（含 provider 分布） | ✅ | ✅ |
+
+运行方式（Windows）：
+
+```powershell
+.\login.exe trae --port=18080      # 登录 Trae，凭证写入 auths\trae-<uid>.json
+.\signin_bin.exe                   # 默认扫 auths\ 目录，批量签到（WorkBuddy + Trae）
+.\signin_bin.exe .\auths           # 也可显式指定凭证目录
+.\credit.exe -pretty               # 积分日报（美化为带 provider 统计的表格）
+```
+
+> `signin_bin.exe` 只接受一个可选位置参数（凭证目录，默认 `auths`）；`credit.exe` 只认 `-pretty`；`login.exe` 子命令见上表。Trae 凭证由 `login.exe trae` 或面板「添加账号 → Trae」产生，两种方式落盘格式一致。
+
+
 ### 添加账号（登录）
 
 **方式 A：Web 面板（推荐，各平台通用，免命令行）**
@@ -854,6 +885,8 @@ http://127.0.0.1:7863/panel/
 | `python3 scripts/probe_max_tokens.py` | 探测各模型**真实输出上限**（区分静默钳制与模型主动收尾），`--panel-out` 结果可直接进面板展示（见下节） |
 
 二进制不在 git 中：脚本首次使用自动 `go build` 对应 `cmd/*`（Docker 镜像内已预编译）。
+
+> **Windows 等价命令**：`.\login.exe trae --port=18080`（Trae 登录）、`.\signin_bin.exe`（批量签到）、`.\credit.exe -pretty`（积分日报）。上表 `.sh` 脚本仅 Linux / macOS 使用，功能与三个 exe 一致（同样覆盖 WorkBuddy 与 Trae）。
 
 ### 探测模型真实输出上限
 

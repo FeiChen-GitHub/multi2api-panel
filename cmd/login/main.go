@@ -20,17 +20,25 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	auth2 "github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // 上游常量：CN → copilot.tencent.com（Origin 为 codebuddy.cn）；global → www.workbuddy.ai
@@ -306,10 +314,15 @@ func buildLoginOutput(tok struct {
 func main() {
 	realm, rest, err := parseRealmArgs(os.Args[1:])
 	if err != nil {
-		fatal("%v (usage: login [--realm=cn|global] <url|poll|realm>)", err)
+		fatal("%v (usage: login [--realm=cn|global] <url|poll|realm|trae>)", err)
+	}
+	// login trae [--port=N]：Trae 网页登录（本地回调），不依赖 realm。
+	if len(rest) > 0 && rest[0] == "trae" {
+		runTrae(rest[1:])
+		return
 	}
 	if len(rest) < 1 {
-		fatal("usage: login [--realm=cn|global] <url|poll>")
+		fatal("usage: login [--realm=cn|global] <url|poll|trae>")
 	}
 	// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
 	jar, _ := cookiejar.New(nil)
@@ -331,6 +344,190 @@ func main() {
 		fmt.Println(realm)
 
 	default:
-		fatal("unknown subcommand %q (want url|poll|realm)", rest[0])
+		fatal("unknown subcommand %q (want url|poll|realm|trae)", rest[0])
 	}
+}
+
+// ---------------------------------------------------------------------------
+// login trae：Trae 网页登录（本地 HTTP 回调）
+//
+// 流程：生成 machineID/deviceID → 起 127.0.0.1:<port> 本地回调 → 打印登录 URL →
+// 浏览器登录后上游把 refreshToken/userInfo/userJwt 拼在 /authorize? 上回调 →
+// 解析拿 refreshToken，再用 TraeClient 换 access token / 补 uid → 落盘
+// auths/trae-<uid>.json。
+//
+// machineID/deviceID 必须与凭证同体保存：签到按设备去重，登录态和凭证不一致
+// 会被上游当成「该设备已签到」直接拦掉。
+// ---------------------------------------------------------------------------
+
+type traeVerdict struct {
+	info *panel.TraeCallbackInfo
+	err  error
+}
+
+// runTrae 执行 Trae 网页登录；args 为 trae 之后的参数（只支持 --port）。
+func runTrae(args []string) {
+	port := panel.TraeDefaultCallbackPort
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--port":
+			if i+1 >= len(args) {
+				fatal("--port requires a value")
+			}
+			port = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--port="):
+			port = strings.TrimPrefix(a, "--port=")
+		default:
+			fatal("unknown trae option %q (want --port=N)", a)
+		}
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		fatal("invalid --port %q", port)
+	}
+	port = strconv.Itoa(n)
+
+	// machineID：hex32；deviceID：16 位数字（与 signin 的签到口径一致）。
+	mb := make([]byte, 16)
+	if _, err := rand.Read(mb); err != nil {
+		fatal("machine id: %v", err)
+	}
+	machineID := hex.EncodeToString(mb)
+	deviceID, err := auth2.NewCheckinDeviceID()
+	if err != nil {
+		fatal("device id: %v", err)
+	}
+
+	callbackURL := "http://127.0.0.1:" + port + "/authorize"
+	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
+	if err != nil {
+		fatal("listen 127.0.0.1:%s failed (port in use?): %v", port, err)
+	}
+	ch := make(chan traeVerdict, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
+		abs := "http://" + r.Host + r.URL.RequestURI()
+		info, perr := panel.TraeParseCallback(abs)
+		select {
+		case ch <- traeVerdict{info: info, err: perr}:
+		default:
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, "<html><body><h2>登录失败</h2><p>%s</p></body></html>", html.EscapeString(perr.Error()))
+			return
+		}
+		fmt.Fprint(w, "<html><body><h2>登录成功，可以回到终端了</h2></body></html>")
+	})
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+
+	fmt.Fprintf(os.Stderr, "trae 登录：请用浏览器打开下面链接完成登录（回调 127.0.0.1:%s，10 分钟超时）\n", port)
+	fmt.Fprintln(os.Stdout, panel.TraeLoginURL(machineID, deviceID, callbackURL))
+
+	var v traeVerdict
+	select {
+	case v = <-ch:
+	case <-time.After(10 * time.Minute):
+		_ = srv.Close()
+		fatal("timed out waiting for trae login")
+	}
+	_ = srv.Shutdown(context.Background())
+	if v.err != nil {
+		fatal("parse callback: %v", v.err)
+	}
+	info := v.info
+
+	a := &auth2.Auth{
+		AccessToken:  info.AccessToken,
+		RefreshToken: info.RefreshToken,
+		UID:          info.UID,
+		Nickname:     info.Nickname,
+		EnterpriseID: info.EnterpriseID,
+		Domain:       "trae.cn",
+		ApiHost:      upstream.TraeOAuthHost,
+		MachineID:    machineID,
+		DeviceID:     deviceID,
+		ExpiresAt:    info.ExpiresAt,
+	}
+	auth2.SetProvider(a, auth2.ProviderTrae)
+
+	ctx := context.Background()
+	client := upstream.NewTraeClient()
+	// 有 refreshToken 就换一次 access token：回调里的 userJwt 只是兜底，
+	// 换出来的 access token 才是后面 OpenAPI 认的那个。
+	if strings.TrimSpace(a.RefreshToken) != "" {
+		if err := client.RefreshToken(ctx, a); err != nil {
+			fatal("refresh token: %v", err)
+		}
+	}
+	if uid, nick, ent, err := client.GetUserInfo(ctx, a); err == nil {
+		if uid != "" {
+			a.UID = uid
+		}
+		if nick != "" {
+			a.Nickname = nick
+		}
+		if ent != "" {
+			a.EnterpriseID = ent
+		}
+	}
+	if a.UID == "" {
+		fatal("trae login: empty uid")
+	}
+	if !validTraeUID(a.UID) {
+		fatal("trae login: invalid uid %q", a.UID)
+	}
+	if a.AccessTokenValue() == "" {
+		fatal("trae login: empty access token")
+	}
+	_, _, _ = a.EnsureKey()
+	_, _ = auth2.BackfillRealmFor(a, realmCN)
+	_, _ = a.EnsureCheckinDeviceID()
+
+	if err := os.MkdirAll("auths", 0o755); err != nil {
+		fatal("mkdir auths: %v", err)
+	}
+	a.FilePath = filepath.Join("auths", "trae-"+a.UID+".json")
+	if err := a.SaveAtomic(); err != nil {
+		fatal("save auth: %v", err)
+	}
+
+	expiresIn := a.ExpiresAt - time.Now().Unix()
+	if expiresIn < 0 {
+		expiresIn = 0
+	}
+	out := map[string]any{
+		"access_token":  a.AccessTokenValue(),
+		"refresh_token": a.RefreshToken,
+		"expires_in":    expiresIn,
+		"domain":        "trae.cn",
+		"realm":         realmCN,
+		"uid":           a.UID,
+		"enterprise_id": a.EnterpriseID,
+		"nickname":      a.Nickname,
+		"provider":      "trae",
+		"machine_id":    machineID,
+		"device_id":     deviceID,
+	}
+	raw, _ := json.Marshal(out)
+	fmt.Println(string(raw))
+}
+
+// validTraeUID 只允许字母/数字/下划线/连字符：uid 会拼进文件名，必须挡住路径字符。
+func validTraeUID(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_' || r == '-'
+		if !ok {
+			return false
+		}
+	}
+	return true
 }

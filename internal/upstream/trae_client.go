@@ -346,11 +346,27 @@ func (c *TraeClient) Checkin(ctx context.Context, a *auth.Auth) error {
 		return &Error{Kind: TraeClassify(resp.StatusCode, string(raw)), Status: resp.StatusCode, Msg: truncateText(string(raw), 200)}
 	}
 	var st struct {
-		CheckedIn bool `json:"checked_in"`
-		Enable    bool `json:"enable"`
+		CheckedIn bool   `json:"checked_in"`
+		Enable    bool   `json:"enable"`
+		Code      int    `json:"code"`
+		Message   string `json:"message"`
 	}
 	if err := json.Unmarshal(raw, &st); err != nil {
 		return fmt.Errorf("checkin status parse: %w", err)
+	}
+	// 上游对失效凭证也回 HTTP 200：此时 code=1001、enable=false，
+	// 只看 checked_in/enable 会把假 token 当成「签到未开放 → 幂等成功」。
+	// 因此 code != 0 一律判失败，1001 归为 session 失效。
+	if st.Code != 0 {
+		kind := TraeClassify(resp.StatusCode, string(raw))
+		if st.Code == 1001 {
+			kind = ErrSessionDead
+		}
+		msg := st.Message
+		if msg == "" {
+			msg = truncateText(string(raw), 200)
+		}
+		return &Error{Kind: kind, Status: resp.StatusCode, Msg: msg}
 	}
 	if st.CheckedIn || !st.Enable {
 		return nil // 已签到 / 签到未开放：幂等成功
@@ -374,7 +390,12 @@ func (c *TraeClient) Checkin(ctx context.Context, a *auth.Auth) error {
 		Message string `json:"message"`
 	}
 	if err := json.Unmarshal(claimRaw, &out); err == nil && out.Code != 0 {
-		return fmt.Errorf("checkin claim: %d %s", out.Code, out.Message)
+		kind := TraeClassify(claimResp.StatusCode, string(claimRaw))
+		if out.Code == 1001 {
+			kind = ErrSessionDead
+		}
+		return &Error{Kind: kind, Status: claimResp.StatusCode,
+			Msg: fmt.Sprintf("checkin claim: %d %s", out.Code, out.Message)}
 	}
 	return nil
 }
