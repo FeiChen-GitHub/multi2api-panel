@@ -88,6 +88,10 @@ type Config struct {
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
 
+	// ModelsHidden 模型黑名单原始条目（config models.hidden；Live 为 nil 的
+	// 裸用/测试路径经 loadLive() 归一化后使用）。
+	ModelsHidden []string
+
 	// Usage 逐请求用量记录器（可选；nil = 不记录）。
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
@@ -111,6 +115,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		APIKey:           h.cfg.APIKey,
 		SoftCooldown:     h.cfg.SoftCooldown,
 		RecordClientInfo: h.cfg.RecordClientInfo,
+		HiddenModels:     livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
 	}
 }
 
@@ -445,7 +450,12 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
+	// models.hidden 黑名单：快照外提，避免逐条目重复 Load。
+	hidden := h.loadLive().HiddenModels
 	for _, mi := range h.fetchDynamicModels() {
+		if _, ok := hidden["cn:"+mi.ID]; ok {
+			continue
+		}
 		entry := map[string]any{
 			"id":       "wb:" + mi.ID,
 			"object":   "model",
@@ -489,6 +499,9 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
+			if _, ok := hidden["global:"+id]; ok {
+				continue
+			}
 			entry := map[string]any{
 				"id":       "wb:global:" + id,
 				"object":   "model",
@@ -874,6 +887,18 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
 	}
 	defer st.done()
+
+	// models.hidden 黑名单：点名调用直接拒绝，不打上游、不占选号。
+	// 与 /v1/models 的列表过滤对称（只藏列表不够，知道名字仍可硬调）。
+	// 键为 realm+bare（隐藏配置按域归一化，见 livecfg.NormalizeHiddenModels），
+	// 与 provider 无关——两个 provider 的同一域同名模型一并隐藏。
+	if _, hide := h.loadLive().HiddenModels[realm+":"+bareModel]; hide {
+		writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable",
+			"model is hidden by gateway configuration, try another model", "")
+		st.status = http.StatusBadRequest
+		st.outcome = reqlog.OutcomeHTTPError
+		return
+	}
 
 	// 人格门锁：命中即短路返回激活页正文。位置的两头都有讲究——
 	// 在 st 之后：命中也要进请求日志与统计，否则面板上会凭空少一条流量。
