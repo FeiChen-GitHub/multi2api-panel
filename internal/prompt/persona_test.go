@@ -364,3 +364,39 @@ func TestEnvPersonasDirOverride(t *testing.T) {
 		t.Errorf("text=%q want %q", text, marker)
 	}
 }
+
+// TestLoadPersonaRelativeToExecutable 相对路径在 cwd 找不到时回落 exe 目录。
+//
+// 场景：服务以别的 cwd 启动（计划任务、systemd、快捷方式），配置里写
+// "personas\haiou.md" 仍应命中二进制旁边的文件，而不是直接报 not found。
+func TestLoadPersonaRelativeToExecutable(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	dir := filepath.Dir(exe)
+	name := "persona_exe_relative_test.md"
+	abs := filepath.Join(dir, name)
+	const body = "exe-relative persona\n"
+	if err := os.WriteFile(abs, []byte(body), 0o644); err != nil {
+		t.Skipf("cannot write next to test binary: %v", err)
+	}
+	t.Cleanup(func() { os.Remove(abs) })
+
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() { os.Chdir(old) })
+
+	text, source, err := LoadPersona(name)
+	if err != nil {
+		t.Fatalf("LoadPersona: %v", err)
+	}
+	if text != body || source != "path" {
+		t.Fatalf("text=%q source=%q, want body via path", text, source)
+	}
+}

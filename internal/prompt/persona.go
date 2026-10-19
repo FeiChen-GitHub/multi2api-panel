@@ -117,7 +117,7 @@ func LoadPersona(name string) (string, string, error) {
 		}
 		return builtinPersonas[trimmed], "embed", nil
 	}
-	raw, err := os.ReadFile(trimmed)
+	raw, err := os.ReadFile(resolvePersonaPath(trimmed))
 	if err != nil {
 		return "", "", fmt.Errorf("persona %s: %w", trimmed, err)
 	}
@@ -126,6 +126,30 @@ func LoadPersona(name string) (string, string, error) {
 		return "", "", fmt.Errorf("persona %s: file is empty", trimmed)
 	}
 	return text, "path", nil
+}
+
+// resolvePersonaPath 解析人格文件路径：相对路径先按进程工作目录找，
+// 找不到再按**可执行文件所在目录**找。
+//
+// 为什么保留 cwd 优先：老部署（从 build 目录起服务）用的是 cwd 相对路径，
+// 直接改成 exe 基准会让已经跑通的配置忽然读不到文件。两边都认，谁存在用谁；
+// 都不存在时原样返回相对路径，让调用方报出原始配置而不是伪造一个路径。
+func resolvePersonaPath(p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return p
+	}
+	alt := filepath.Join(filepath.Dir(exe), p)
+	if _, statErr := os.Stat(alt); statErr == nil {
+		return alt
+	}
+	return p
 }
 
 // loadBuiltinFromDisk 读内置人格的磁盘版。
