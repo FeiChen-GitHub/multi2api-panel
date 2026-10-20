@@ -192,7 +192,7 @@ type Config struct {
 		// 对既有部署是行为变更。缺省关闭保证老配置零影响；需要人格的用户
 		// 显式打开。人格文件本身随时可改，但要不要用它由这个开关决定。
 		PersonaEnabled bool `json:"persona_enabled"`
-		// PersonaMode 人格层注入方式（haio 分支），缺省空 = "replace"（覆盖）。
+		// PersonaMode 人格层注入方式（haio 分支），缺省空 = "append"（追加）。
 		//
 		//	"replace" = 人格**覆盖**：删掉客户端所有 system/developer，替换为人格文本
 		//	"append"  = 人格**追加**：保留客户端 system，人格插在其后
@@ -754,8 +754,8 @@ func (c *Config) normalizePersona() error {
 
 // normalizePersonaMode 归一 prompt.persona_mode，返回 true=覆盖 / false=追加。
 //
-//	空 / "replace" / "override" / "cover" → true（覆盖，缺省）
-//	"append" / "keep"                     → false（追加）
+//	空 / "append" / "keep"                → false（追加，缺省）
+//	"replace" / "override" / "cover"      → true（覆盖）
 //	其它                                  → 启动报错
 //
 // 收下多个同义写法而不是只认一个：用户在配置里写 cover/override 是很自然的
@@ -764,12 +764,12 @@ func (c *Config) normalizePersona() error {
 // 配了覆盖实际走了追加（或反之），而这种偏差在对话里极难察觉。
 func (c *Config) normalizePersonaMode() (bool, error) {
 	switch strings.ToLower(strings.TrimSpace(c.Prompt.PersonaMode)) {
-	case "", "replace", "override", "cover":
-		return true, nil
-	case "append", "keep":
+	case "", "append", "keep":
 		return false, nil
+	case "replace", "override", "cover":
+		return true, nil
 	default:
-		return false, fmt.Errorf("prompt.persona_mode: %q 不是合法值（replace = 覆盖 / append = 追加；缺省 replace）",
+		return false, fmt.Errorf("prompt.persona_mode: %q 不是合法值（replace = 覆盖 / append = 追加；缺省 append）",
 			c.Prompt.PersonaMode)
 	}
 }
@@ -814,3 +814,4 @@ func checkHourRange(field, switchKey string, hours []int) error {
 	}
 	return nil
 }
+

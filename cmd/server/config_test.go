@@ -913,16 +913,16 @@ func writePersonaCfg(t *testing.T, promptJSON string) (*Config, error) {
 	return Load(fp)
 }
 
-// TestPersonaModeDefaultsToReplace 缺省 = 覆盖（replace）。
-// 人格开启后就是要说了算，不需要用户显式指定；需要保留客户端指令的人
-// 才显式填 append。
-func TestPersonaModeDefaultsToReplace(t *testing.T) {
+// TestPersonaModeDefaultsToAppend 缺省 = 追加（append）。
+// 保留客户端 system（工具约定、项目规范）是更安全的默认；需要人格完全
+// 接管的人显式填 replace。
+func TestPersonaModeDefaultsToAppend(t *testing.T) {
 	c, err := writePersonaCfg(t, `{"mode":"custom","persona_enabled":true,"persona":"haiou"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !c.PersonaReplace {
-		t.Error("persona_mode 缺省应为 replace（覆盖），got append")
+	if c.PersonaReplace {
+		t.Error("persona_mode 缺省应为 append（追加），got replace")
 	}
 }
 
@@ -1074,3 +1074,4 @@ func TestServerReadTimeout(t *testing.T) {
 		t.Error("unparsable read_timeout should fail fast")
 	}
 }
+

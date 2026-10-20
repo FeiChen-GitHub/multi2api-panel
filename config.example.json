@@ -73,9 +73,9 @@
   "prompt": {
     "mode": "passthrough",
     "file": "",
-    "persona": "haiou",
+    "persona": "workflow",
     "persona_enabled": false,
-    "persona_mode": "replace"
+    "persona_mode": "append"
   },
   "upstash": {
     "url": "",

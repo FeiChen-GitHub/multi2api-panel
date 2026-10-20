@@ -1065,13 +1065,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="grid2">
               <label class="fld"><span class="lb">人格提示词</span>
                 <input name="prompt_persona" placeholder="haiou = 内置人格；或填文件路径">
-                <span class="hint">内置 haiuo；留空 = 关闭人格层</span></label>
+                <span class="hint">内置 haiou；留空 = 关闭人格层</span></label>
               <label class="fld"><span class="lb">人格注入方式</span>
                 <select name="prompt_persona_mode">
+                  <option value="append">append — 人格追加，保留客户端 system（缺省）</option>
                   <option value="replace">replace — 人格覆盖客户端 system</option>
-                  <option value="append">append — 人格追加，保留客户端 system</option>
                 </select>
-                <span class="hint">缺省 replace（覆盖）</span></label>
+                <span class="hint">缺省 append（追加）</span></label>
             </div>
             <div class="switch"><span class="lb">启用人格层</span>
               <input type="checkbox" name="prompt_persona_enabled">
