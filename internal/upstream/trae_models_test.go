@@ -71,7 +71,7 @@ func TestTraeFetchModelsParsesDynamicList(t *testing.T) {
 	}
 }
 
-// 动态拉取失败要回落静态表（trae2api 的 staticModels 口径），不能返回空。
+// 动态拉取失败要回落静态表（3.4.4 前端真实可见的 6 个模型），不能返回空。
 func TestTraeFetchModelsFallsBackToStatic(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
@@ -84,15 +84,20 @@ func TestTraeFetchModelsFallsBackToStatic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchModels should fall back to static list, got err: %v", err)
 	}
-	if len(infos) < 30 {
-		t.Fatalf("static fallback len = %d, want >= 30", len(infos))
+	if len(infos) < 6 {
+		t.Fatalf("static fallback len = %d, want >= 6", len(infos))
 	}
 	seen := map[string]bool{}
 	for _, mi := range infos {
 		seen[mi.ID] = true
 	}
+	// 静态表已替换为 3.4.4 真实可见模型，含 glm-5.2 / DeepSeek-V4-Flash-Official。
 	if !seen["glm-5.2"] || !seen["DeepSeek-V4-Flash-Official"] {
 		t.Fatalf("static list missing expected models: %v", seen)
+	}
+	// 旧的 custom_model_* / Doubao-Seed-2.1-Pro / kimi-k3 等应已从静态表移除。
+	if seen["custom_model_gemini"] || seen["Doubao-Seed-2.1-Pro"] || seen["kimi-k3"] {
+		t.Fatalf("static list should not contain legacy models: %v", seen)
 	}
 }
 
@@ -135,20 +140,26 @@ func TestTraeMergeModelsDedup(t *testing.T) {
 	}
 }
 
-// 非聊天服务配置（标题生成 / 摘要 / fast_apply / 搜索 agent 等）要被过滤。
+// 非聊天服务配置 + is_invisible_to_user=true + custom_model_*
+// 三类过滤：只留前端可见、可调用的真模型。
 func TestTraeParseModelListFiltersNonChat(t *testing.T) {
 	raw := []byte(`{"config_info_list":[` +
 		`{"config_name":"glm-5.2","display_config":{}},` +
 		`{"config_name":"title_generation","display_config":{}},` +
 		`{"config_name":"summary","display_config":{}},` +
 		`{"config_name":"fast_apply","display_config":{}},` +
-		`{"config_name":"kimi-k3","display_config":{}}]}`)
+		`{"config_name":"kimi-k3","is_invisible_to_user":true,"display_config":{}},` +
+		`{"config_name":"glm-4.7-auto","is_invisible_to_user":true,"display_config":{}},` +
+		`{"config_name":"custom_model_gemini","display_config":{}},` +
+		`{"config_name":"minimax-m3","display_config":{}}]}`)
 	out := traeParseModelList(raw)
 	ids := make([]string, 0, len(out))
 	for _, m := range out {
 		ids = append(ids, m.ID)
 	}
-	want := []string{"glm-5.2", "kimi-k3"}
+	// 只留 glm-5.2 + minimax-m3（kimi-k3/glm-4.7-auto invisible，
+	// title_generation/summary/fast_apply 服务，custom_model_gemini 模板）。
+	want := []string{"glm-5.2", "minimax-m3"}
 	if len(ids) != len(want) {
 		t.Fatalf("filtered len = %d (%v), want %d (%v)", len(ids), ids, len(want), want)
 	}

@@ -26,41 +26,18 @@ func TraeChannelForModel(id string) Channel {
 	return ChannelSOLO
 }
 
-// traeStaticModelIDs 动态拉取失败时的静态兜底（trae2api staticModels 的 32 条，
-// 顺序按原表；第一条即 Work 通道模型）。
+// traeStaticModelIDs 动态拉取失败时的静态兜底：Trae 3.4.4 前端真实
+// 可见的 6 个聊天模型（solo_agent 过滤后的可调用集）。旧表（32 条，含
+// Doubao-Seed-2.1-Pro / kimi-k3 / sagitta / aquila / custom_model_* 等）来自 0.1.52 时代的 trae2api，在 3.4.4
+// 下已不可见或是占位模板、未经授权验证不可调用，故替换。
 var traeStaticModelIDs = []string{
-	"DeepSeek-V4-Flash-Official",
-	"Doubao-Seed-2.1-Pro",
-	"seed-code-pro-0430",
-	"Doubao-Seed-2.1-Turbo",
-	"Doubao-Seed-2.0-Code",
-	"browser_use_subagent",
+	"Doubao-Seed-Code",
 	"glm-5.2",
-	"glm-5-turbo",
-	"glm-5",
+	"DeepSeek-V4-Flash-Official",
+	"DeepSeek-V4-Pro-Official",
 	"DeepSeek-V4-Pro",
-	"DeepSeek-V4-Flash",
-	"kimi-k3",
-	"kimi-k2.7-code",
-	"kimi-k2.6",
 	"minimax-m3",
 	"qwen-3.7-plus",
-	"sagitta",
-	"aquila",
-	"custom_model_gemini",
-	"custom_model_placeholder",
-	"custom_model_1M_text",
-	"custom_model_1M",
-	"custom_model_kimi",
-	"custom_model_claude",
-	"custom_model_gpt-5",
-	"custom_model_no-fc",
-	"custom_model_deepseek_chat",
-	"custom_model_deepseek_reasoner",
-	"custom_model_deepseek_v4",
-	"explore_sub_agent_v13",
-	"explore_sub_agent_v2",
-	"summary",
 }
 
 // traeStaticModelInfos 把静态 ID 列表转成 ModelInfo（context 沿用 trae2api 的 131072）。
@@ -75,6 +52,11 @@ func traeStaticModelInfos() []ModelInfo {
 // traeNonChatConfigs 不是聊天模型的服务配置（标题生成 / 输入优化 /
 // 摘要 / 快速 apply / 搜索 agent 等），拉取时过滤。这些 config_name 在
 // 3.4.4 solo_agent 响应中出现，但不是可对话模型。
+//
+// 注意：get_detail_param 返回的是后端全量配置注册表（solo_agent 44、chat_v3 42），
+// 而 Trae 3.4.4 前端实际可见的 solo_agent 只有 21 条（其中 14 条是 custom_model_*)。
+// 隐藏项都带 is_invisible_to_user=true（advisor / -auto / doubao-for-auto / glm-4.7 等内部
+// 路由变体）。过滤后剩下的才是用户能看到能选的真模型。
 var traeNonChatConfigs = map[string]bool{
 	"title_generation":           true,
 	"input_optimization":         true,
@@ -93,6 +75,10 @@ var traeNonChatConfigs = map[string]bool{
 type traeModelConfigEntry struct {
 	ConfigName          string `json:"config_name"`
 	IsDefault           bool   `json:"is_default"`
+	// IsInvisibleToUser 后端标记为隐藏（advisor / -auto / for-auto 等内部路由变体）。
+	// 3.4.4 前端会过滤这些，只显示 inv != true 的。注意：字段缺失为 nil
+	// （未设置隐藏），返回 json 里存在为 true / false；故用 *bool 。
+	IsInvisibleToUser  *bool  `json:"is_invisible_to_user"`
 	ContextWindowTokens struct {
 		Dev int64 `json:"dev"`
 		Max int64 `json:"max"`
@@ -122,6 +108,16 @@ func traeParseModelList(raw []byte) []ModelInfo {
 	for _, cfg := range out.ConfigInfoList {
 		id := strings.TrimSpace(cfg.ConfigName)
 		if id == "" || traeNonChatConfigs[id] {
+			continue
+		}
+		// 隐藏配置（is_invisible_to_user=true）过滤：这些是 advisor / -auto /
+		// for-auto 等内部路由变体，Trae 3.4.4 前端不向用户显示，网关也不应暴露。
+		if cfg.IsInvisibleToUser != nil && *cfg.IsInvisibleToUser {
+			continue
+		}
+		// custom_model_* 是用户自绱 API key 的模板槽位（前端可见但未配置时
+		// 调用会失败），对 OpenAI 兼容网关无意义，过滤掉。
+		if strings.HasPrefix(id, "custom_model_") {
 			continue
 		}
 		// 上下文窗口：优先 dev，缺失回落 max。此前整段被忽略，导致 /v1/models 的
