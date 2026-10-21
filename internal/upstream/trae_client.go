@@ -41,6 +41,13 @@ const (
 
 	traeIdeVersion     = "0.1.52"
 	traeIdeVersionCode = "20260811"
+	// 模型发现的 get_detail_param 用 3.4.4 头：3.4.4 的 solo_agent 返回 44 条
+	// 真实可用的 agent 模型（glm-5.x、DeepSeek-V4、minimax-m3、kimi-k2 等）。
+	// 注意对话端点 llm_utils_chat 必须仍用 0.1.52 头——实测 3.4.4 头打对话
+	// 会返回 SSE code:4001 "param is invalid"（app_id+app_version_code 查不到配置），
+	// 故模型发现与对话走两套版本头。
+	traeModelIdeVersion     = "3.4.4"
+	traeModelIdeVersionCode = "20260212"
 	traeOSVersion      = "macOS 15.7.4"
 	traeDeviceBrand    = "Apple"
 
@@ -87,15 +94,27 @@ func NewTraeClient() *TraeClient {
 
 var _ ChatClient = (*TraeClient)(nil)
 
-// traeSOLOHeaders 设置 llm_utils_chat / get_detail_param 所需头（实测必须）。
+// traeSOLOHeaders 设置 llm_utils_chat 对话端点所需头（实测必须）。
+// 对话必须用 0.1.52 头：3.4.4 头打 llm_utils_chat 会被上游以配置不存在为由拒。
 func traeSOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
+	traeSOLOHeadersWith(req, a, stream, traeIdeVersion, traeIdeVersionCode)
+}
+
+// traeModelHeaders 设置 get_detail_param 模型发现端点所需头，用 3.4.4
+// 版本（solo_agent 返回 44 条真实 agent 模型）。与对话头分离以避免影响对话。
+func traeModelHeaders(req *http.Request, a *auth.Auth) {
+	traeSOLOHeadersWith(req, a, false, traeModelIdeVersion, traeModelIdeVersionCode)
+}
+
+// traeSOLOHeadersWith 公共头组序，参数化版本/版本码：对话传 0.1.52，模型传 3.4.4。
+func traeSOLOHeadersWith(req *http.Request, a *auth.Auth, stream bool, ideVer, ideVerCode string) {
 	req.Header.Set("Content-Type", "application/json")
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	req.Header.Set("User-Agent", "Trae/"+traeIdeVersion)
+	req.Header.Set("User-Agent", "Trae/"+ideVer)
 	at := a.AccessTokenValue()
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+at)
 	req.Header.Set("X-Cloudide-Token", at)
@@ -105,9 +124,9 @@ func traeSOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
 	}
 	req.Header.Set("X-App-Id", TraeAppID)
 	req.Header.Set("X-App-Version", "default")
-	req.Header.Set("X-Ide-Version", traeIdeVersion)
-	req.Header.Set("X-Ide-Version-Code", traeIdeVersionCode)
-	req.Header.Set("X-App-Version-Code", traeIdeVersionCode)
+	req.Header.Set("X-Ide-Version", ideVer)
+	req.Header.Set("X-Ide-Version-Code", ideVerCode)
+	req.Header.Set("X-App-Version-Code", ideVerCode)
 	req.Header.Set("X-Ide-Version-Type", "stable")
 	req.Header.Set("X-Device-Type", "macos")
 	req.Header.Set("X-OS-Version", traeOSVersion)

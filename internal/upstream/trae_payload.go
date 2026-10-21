@@ -12,7 +12,15 @@ import (
 
 const (
 	// TraeFunction SOLO 请求固定 function 值（upstream 常量 Function）。
+	// 对话（llm_utils_chat）用 solo_work_lite。
 	TraeFunction = "solo_work_lite"
+	// TraeModelListFunction get_detail_param 模型发现用的 function。
+	// 3.4.4 头下 solo_agent 返回 44 条真实 agent 模型；同版本的
+	// solo_work_lite 只返回 15 条旧配置，无法覆盖当前可用模型集。
+	TraeModelListFunction = "solo_agent"
+	// TraeModelListFunctionAlt 合并补充来源：chat_v3 返回 42 条，
+	// 与 solo_agent 高度重叠但含个别 solo_agent 缺的条目（如 kimi-k2、qwen3-coder）。
+	TraeModelListFunctionAlt = "chat_v3"
 	// TraeDefaultModel SOLO 默认模型（trae2api DefaultConfigName，实测可用）。
 	TraeDefaultModel = "glm-5.2"
 )
