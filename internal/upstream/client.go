@@ -145,7 +145,7 @@ func isQueueFullBody(lower string) bool {
 //     上游 quota/quota_not_activated，register 未完成的试用未激活账号，同样账号级。
 //
 // 注意 **"request illegal" 不能作为通用 marker**：WorkBuddy 的 11128 通道校验失败
-// （`{"code":11128,"msg":"request illegal"}`，displayTips 明确说「可能不是官方客户端
+// （`{"code":"11-128","msg":"request illegal"}`，displayTips 明确说「可能不是官方客户端
 // 发送」）与 11140 账号限制（`{"code":11140,"msg":"request illegal"}`）文案完全相同。
 // 只看文案会把一次通道校验失败误判成账号封禁并硬禁用健康账号。11140 的判定统一走
 // IsAccountRestricted（code + 文案双条件），不放进本词表。
@@ -178,7 +178,7 @@ func isChannelRefused(body string) bool {
 	if !strings.Contains(strings.ToLower(body), accountRestrictedMsg) {
 		return false
 	}
-	return hasBusinessCode(body, "11128")
+	return hasBusinessCode(body, "11-128")
 }
 
 // contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。

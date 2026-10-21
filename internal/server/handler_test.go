@@ -504,7 +504,7 @@ func TestApplyErrorPolicyChannelRefusedDoesNotDisable(t *testing.T) {
 		wantDisabled bool
 		wantCooling  bool
 	}{
-		{"11128 channel refused", `{"code":11128,"msg":"request illegal","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, upstream.ErrChannelRefused, false, false},
+		{"11128 channel refused", `{"code":"11-128","msg":"request illegal","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, upstream.ErrChannelRefused, false, false},
 		{"11140 account restricted", `{"code":11140,"msg":"request illegal"}`, upstream.ErrAccountFault, true, false},
 		{"11140 rate-limiting variant", `{"code":11140,"msg":"The model provider is rate-limiting requests."}`, upstream.ErrSoftRate, false, true},
 	}
@@ -1560,7 +1560,7 @@ func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 				return &http.Response{
 					StatusCode: 400,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"code":11128,"msg":"blocked by security policy"}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"code":"11-128","msg":"blocked by security policy"}`)),
 				}, nil
 			}
 			return &http.Response{
@@ -1599,7 +1599,7 @@ func TestContentBlockedStickyDegraded(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if !firstCall {
 			firstCall = true
-			return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
+			return 400, `{"code":"11-128","msg":"blocked by security policy"}`, false
 		}
 		return 200, sseOK, true
 	})
@@ -1901,7 +1901,7 @@ func personaFixture(t *testing.T) string {
 // 400 content_blocked 防火墙文案（不轮转、不暴露账号/上游错误码）。
 func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
+		return 400, `{"code":"11-128","msg":"blocked by security policy"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "custom", PromptText: "SYS"})
@@ -1926,7 +1926,7 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	}
 	// 错误透传（error-passthrough，吸收上游 5755fe3）：message 装上游 body 原文
 	// （code/msg 原样），客户端必须看到真实错误才能排查；gateway_hint 并列补充。
-	if !strings.Contains(rec.Body.String(), "11128") {
+	if !strings.Contains(rec.Body.String(), "11-128") {
 		t.Errorf("message should carry upstream original body (passthrough): %s", rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "gateway_hint") {
@@ -1940,7 +1940,7 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 // TestContentBlockedDoesNotPenalizeAccount ErrContentBlocked 不罚账号（无冷却/熔断/NoteError）。
 func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
+		return 400, `{"code":"11-128","msg":"blocked by security policy"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	// 熔断阈值 1：若误罚 NoteError 一次即熔断；content_blocked 不应喂熔断。
