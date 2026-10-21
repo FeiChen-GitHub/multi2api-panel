@@ -73,7 +73,7 @@
   "prompt": {
     "mode": "passthrough",
     "file": "",
-    "persona": "workflow",
+    "persona": "internal/prompt/personas/coffee.md",
     "persona_enabled": false,
     "persona_mode": "append"
   },

@@ -213,6 +213,11 @@ type Config struct {
 	// PersonaReplace 人格层是否覆盖客户端 system（true=replace，false=append）。
 	// 由 normalizePersona 从 PersonaMode 归一而来，供 handler 直接判断。
 	PersonaReplace bool `json:"-"`
+	// PersonaLatch 人格门锁（activation latch），nil = 该人格没有门锁。
+	//
+	// 来源是与人格 md 同目录同名的 .json（coffee.md → coffee.json），不存在则 nil。
+	// 门锁在请求级短路，不经上游，因此这里存的是已解析的对象而非文本。
+	PersonaLatch *prompt.Latch `json:"-"`
 
 	Upstash struct {
 		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
@@ -744,11 +749,19 @@ func (c *Config) normalizePersona() error {
 		return err
 	}
 	c.PersonaText = text
+	// 门锁：人格 md 旁边有同名 json 就装上，没有就不装。
+	// 内置名（"haiou"）没有文件路径可依 → 必然无门锁，不做无谓的磁盘查找。
+	latch, err := prompt.LoadPersonaLatch(c.Prompt.Persona)
+	if err != nil {
+		return err
+	}
+	c.PersonaLatch = latch
 	// 数据来源与注入方式都在启动日志里露一次面：磁盘版与 embed 快照分叉时
 	// （改了 md 却看到 embed）source 是唯一排查线索；mode 则是确认
-	// "我到底覆盖了还是追加了"的直接证据。
-	log.Printf("[config] persona %q loaded from %s (%d bytes, mode=%s)",
-		c.Prompt.Persona, source, len(text), personaModeName(replace))
+	// "我到底覆盖了还是追加了"的直接证据。门锁一并露面，避免"配了 json 没生效"
+	// 变成只能靠猜。
+	log.Printf("[config] persona %q loaded from %s (%d bytes, mode=%s, latch=%s)",
+		c.Prompt.Persona, source, len(text), personaModeName(replace), latchDesc(latch))
 	return nil
 }
 
@@ -780,6 +793,14 @@ func personaModeName(replace bool) string {
 		return "replace"
 	}
 	return "append"
+}
+
+// latchDesc 门锁状态的日志表述。
+func latchDesc(l *prompt.Latch) string {
+	if l == nil {
+		return "off"
+	}
+	return fmt.Sprintf("on(%d word(s))", len(l.Words))
 }
 
 // validateScheduleHours 校验排程小时落在 0-23。

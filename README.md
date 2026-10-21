@@ -430,7 +430,7 @@ curl -sN http://localhost:7863/v1/responses \
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
 | `prompt.persona_enabled` | `false` | 人格层总开关（haio 分支）；缺省关闭保证既有部署零影响 |
-| `prompt.persona` | 空 | 人格名（内置 `haiou`）或人格文件路径（如 `internal/prompt/personas/workflow.md`）；`persona_enabled=true` 时必填，否则启动报错 |
+| `prompt.persona` | 空 | 人格名（内置 `haiou`）或人格文件路径（如 `internal/prompt/personas/coffee.md`）；`persona_enabled=true` 时必填，否则启动报错 |
 | `prompt.persona_mode` | `append` | 人格注入方式：`append` = 保留客户端 system，人格插在其后；`replace` = 人格覆盖客户端 system/developer |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
 | `pool.max_in_flight_global` | `2` | global 域单账号在途上限（国际版 WAF 风控更紧，压低并发） |
@@ -505,7 +505,7 @@ Trae 上游无成长任务体系，面板请求 Trae 账号的 tasks 接口返�
 | `passthrough` | 人格层仍生效——人格覆写不依赖 mode，开人格不必改 mode |
 
 - `prompt.persona_enabled` **缺省 `false`**：既有部署升级后行为逐字不变
-- `prompt.persona` 填内置名 `haiou`，或填任意文件路径（外挂自定义人格，无需改仓库/重编译），如内置目录下的 `internal/prompt/personas/workflow.md`
+- `prompt.persona` 填内置名 `haiou`，或填任意文件路径（外挂自定义人格，无需改仓库/重编译），如内置目录下的 `internal/prompt/personas/coffee.md`
 - `persona_enabled=true` 但 `persona` 为空 → **启动报错**（fail fast，不会静默关掉人格）
 - 人格文件不可读 / 内容为空 → **启动报错**，不回落"无人格"
 - 降级期人格让位给 Degraded 中性提示词（带指纹原文重试只会确定性再撞 400，与 append 同口径）
@@ -525,6 +525,22 @@ Trae 上游无成长任务体系，面板请求 Trae 账号的 tasks 接口返�
 - Docker：镜像已 `COPY internal/prompt/personas /app/personas` 并预设 `WB2A_PERSONAS_DIR=/app/personas`；想直接在宿主机编辑，把 `./internal/prompt/personas:/app/personas` 挂进去即可
 
 人格注入方式（`prompt.persona_mode`）与全部 prompt 字段的逐项说明见 [docs/config-guide.md](docs/config-guide.md)——`config.json` 不支持注释，那份文档即注释。
+
+#### 人格门锁（`persona latch`）
+
+人格 md 同目录放一个同名 `.json`（`coffee.md` → `coffee.json`），即启用门锁：
+
+- 最后一条用户消息**整句**（去首尾空白）等于激活词时，网关**直接返回 `reply` 全文**，不打上游、不占账号、不进模型
+- 判定在代码层完成（`internal/prompt/persona_latch.go`），是字节级确定返回，不依赖模型模仿
+- 无同名 json → 门锁不装载，人格其余部分照常工作（不报错）
+- json 损坏 / `reply` 或 `words` 为空 → **启动报错**，不静默失效
+- 装载结果进启动日志：`latch=on(N word(s))` / `latch=off`
+
+```json
+{"latch":{"words":["冷咖啡","cold coffee"],"match":"whole_trimmed","reply":"激活页正文，逐字返回"}}
+```
+
+`match` 目前仅支持 `whole_trimmed`（可省略）。示例见 `internal/prompt/personas/coffee.json`。
 
 ### 内容拦截误报与降级重试
 
@@ -1063,6 +1079,8 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 人格层优先级（PersonaText 非空即接管） | `internal/server/handler.go` 提示词改写分支 |
 | 内置人格文本 | `internal/prompt/personas/haiou.md` |
 | 人格加载（内置名 + 文件路径） | `internal/prompt/persona.go` |
+| 人格门锁加载与判定 | `internal/prompt/persona_latch.go` |
+| 门锁请求级短路 | `internal/server/handler.go` `servePersonaLatch` |
 | 人格 fail fast 校验 | `cmd/server/config.go` `normalizePersona` |
 | 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go:30`（Trigger）、`:46`（nextMidnightCST） |
 | 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:127`、`internal/upstream/client.go:147` |

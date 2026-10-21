@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -882,7 +883,6 @@ func TestPersonaWorksInPassthroughMode(t *testing.T) {
 	}
 }
 
-
 // TestRestartRequiredFieldsIncludePrompt haio 分支：prompt.* 改动必须列入重启清单。
 // saveConfig 的热应用段没有重设 handler 的 PromptMode/PromptText/PersonaText
 // （它们在 NewHandler 装配期从 cfg 拷入），改完不重启不生效。漏列会让面板
@@ -929,12 +929,12 @@ func TestPersonaModeDefaultsToAppend(t *testing.T) {
 // TestPersonaModeExplicitValues persona_mode 显式取值。
 func TestPersonaModeExplicitValues(t *testing.T) {
 	cases := []struct {
-		mode   string
+		mode    string
 		replace bool
 	}{
 		{`"replace"`, true},
-		{`"override"`, true},  // 同义词
-		{`"cover"`, true},     // 同义词
+		{`"override"`, true}, // 同义词
+		{`"cover"`, true},    // 同义词
 		{`"append"`, false},
 		{`"keep"`, false},     // 同义词
 		{`"REPLACE"`, true},   // 大小写不敏感
@@ -1075,3 +1075,78 @@ func TestServerReadTimeout(t *testing.T) {
 	}
 }
 
+// ===== 人格门锁（persona latch）配置层测试 =====
+
+// writePersonaPairCfg 在临时目录写 md + 可选 json，返回配置加载结果。
+func writePersonaPairCfg(t *testing.T, md, jsonBody string) (*Config, error) {
+	t.Helper()
+	dir := t.TempDir()
+	mdPath := filepath.Join(dir, "coffee.md")
+	if err := os.WriteFile(mdPath, []byte(md), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if jsonBody != "" {
+		if err := os.WriteFile(filepath.Join(dir, "coffee.json"), []byte(jsonBody), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"custom","persona_enabled":true,"persona":`+
+		strconv.Quote(mdPath)+`,"persona_mode":"replace"}}`), 0o600)
+	return Load(fp)
+}
+
+// TestPersonaLatchLoaded 同名 json 存在 → 门锁装上。
+func TestPersonaLatchLoaded(t *testing.T) {
+	c, err := writePersonaPairCfg(t, "# p\n",
+		`{"latch":{"words":["冷咖啡"],"match":"whole_trimmed","reply":"R"}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PersonaLatch == nil {
+		t.Fatal("同名 json 存在时应装上门锁")
+	}
+	if !c.PersonaLatch.MatchWholeTrimmed("冷咖啡") {
+		t.Error("门锁应能匹配激活词")
+	}
+}
+
+// TestPersonaLatchAbsent 无同名 json → 人格照常加载，门锁为 nil（不报错）。
+func TestPersonaLatchAbsent(t *testing.T) {
+	c, err := writePersonaPairCfg(t, "# p\n", "")
+	if err != nil {
+		t.Fatalf("无 json 不应报错: %v", err)
+	}
+	if c.PersonaLatch != nil {
+		t.Error("无 json 时门锁应为 nil")
+	}
+	if c.PersonaText == "" {
+		t.Error("人格本体仍应加载")
+	}
+}
+
+// TestPersonaLatchBrokenFailsStartup 门锁损坏 → 启动报错，不静默失效。
+func TestPersonaLatchBrokenFailsStartup(t *testing.T) {
+	if _, err := writePersonaPairCfg(t, "# p\n", `{`); err == nil {
+		t.Fatal("门锁 json 损坏应启动报错")
+	}
+}
+
+// TestPersonaLatchDisabledWhenPersonaOff 人格关闭 → 不加载门锁（nil）。
+func TestPersonaLatchDisabledWhenPersonaOff(t *testing.T) {
+	dir := t.TempDir()
+	mdPath := filepath.Join(dir, "coffee.md")
+	os.WriteFile(mdPath, []byte("# p\n"), 0o600)
+	os.WriteFile(filepath.Join(dir, "coffee.json"),
+		[]byte(`{"latch":{"words":["冷咖啡"],"reply":"R"}}`), 0o600)
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"custom","persona_enabled":false,"persona":`+
+		strconv.Quote(mdPath)+`}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PersonaLatch != nil {
+		t.Error("人格关闭时门锁不应装载")
+	}
+}

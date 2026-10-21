@@ -345,6 +345,7 @@ func main() {
 		PromptText:       cfg.PromptText,
 		PersonaText:      cfg.PersonaText,
 		PersonaReplace:   cfg.PersonaReplace,
+		PersonaLatch:     cfg.PersonaLatch,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -75,6 +76,11 @@ type Config struct {
 	PersonaText string
 	// PersonaReplace 见 PersonaText 说明；人格层关闭时无意义。
 	PersonaReplace bool
+	// PersonaLatch 人格门锁，nil = 无门锁。
+	//
+	// 命中时直接短路返回激活页正文，不打上游、不消耗额度。判定在请求体解析后
+	// 立刻做（早于选号），所以命中请求连账号都不占。
+	PersonaLatch *prompt.Latch
 
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
@@ -818,6 +824,16 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
 	}
 	defer st.done()
+
+	// 人格门锁：命中即短路返回激活页正文。位置的两头都有讲究——
+	// 在 st 之后：命中也要进请求日志与统计，否则面板上会凭空少一条流量。
+	// 在选号之前：激活词不需要上游，命中请求连账号都不占，也不必走 Release。
+	if h.cfg.PersonaLatch != nil {
+		if hit, ok := personaLatchInput(body); ok && h.cfg.PersonaLatch.MatchWholeTrimmed(hit) {
+			h.servePersonaLatch(w, proto, peek.Stream, peek.Model, st)
+			return
+		}
+	}
 
 	tried := map[auth.AccountKey]bool{}
 	var lastErr error
@@ -1854,4 +1870,192 @@ func (h *Handler) hintOf(kind upstream.ErrKind, body, bareModel string, hasImage
 		msg = uerr.Msg
 	}
 	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
+}
+
+// personaLatchInput 取门锁判定用的用户输入。
+//
+// 只认「最后一条 user 消息」的纯文本，口径与 session.TurnKey 一致：
+// 首条 user 在整个会话内不变，会把不同轮并进同一判定；取最后一条才对齐"这一轮
+// 用户说了什么"。多模态 parts 只拼 text，纯图片请求不参与判定。
+//
+// 无 user 消息 / 该消息无文本 → ok=false（调用方跳过判定，不伪造输入）。
+func personaLatchInput(body []byte) (string, bool) {
+	if len(body) == 0 {
+		return "", false
+	}
+	var obj struct {
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return "", false
+	}
+	for i := len(obj.Messages) - 1; i >= 0; i-- {
+		if obj.Messages[i].Role != "user" {
+			continue
+		}
+		return latchContentText(obj.Messages[i].Content), true
+	}
+	return "", false
+}
+
+// latchContentText 取 content 文本：字符串直返，数组形态拼接各 part 的 text。
+// 与 session 包的 contentText 同逻辑，但那是未导出函数，为一行逻辑去改
+// session 的导出面不值得，这里本地实现一份。
+func latchContentText(raw json.RawMessage) string {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return ""
+	}
+	if s[0] == '"' {
+		var str string
+		if err := json.Unmarshal(raw, &str); err != nil {
+			return ""
+		}
+		return str
+	}
+	if s[0] != '[' {
+		return ""
+	}
+	var parts []struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		b.WriteString(p.Text)
+	}
+	return b.String()
+}
+
+// servePersonaLatch 写出门锁激活页：逐字返回 json 里的 reply，不打上游。
+//
+// 流式与非流式都要能接——客户端按自己的 stream 标志收，格式不对直接解析失败。
+// usage 刻意不伪造：门锁不消耗上游 token，写 0 会被成本账本读成"这一跳零成本"，
+// 缺失则保持"未上报"语义，下游对缺 usage 已有成熟处理。
+func (h *Handler) servePersonaLatch(w http.ResponseWriter, proto protocol, stream bool, model string, st *chatStat) {
+	text := h.cfg.PersonaLatch.Reply
+	obj := latchCompletion(model, text)
+	if !stream {
+		if proto == protoResponses {
+			obj = chatCompletionToResponse(obj)
+		}
+		writeJSON(w, http.StatusOK, obj)
+		st.status = http.StatusOK
+		st.outcome = reqlog.OutcomeSuccess
+		clearChatStatError(st)
+		return
+	}
+	// 流式手写一个最小 SSE，不复用 upstream.StreamHint——那是为转发上游字节流
+	// 设计的（hint 判定 / 标记修复 / 统计读取器），门锁这里没有上游可读。
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	if proto == protoResponses {
+		writeLatchResponsesSSE(w, obj)
+	} else {
+		writeSSEFrame(w, obj)
+		writeSSEFrame(w, map[string]any{
+			"id": obj["id"], "object": "chat.completion.chunk",
+			"created": obj["created"], "model": model,
+			"choices": []any{map[string]any{
+				"index": 0, "delta": map[string]any{}, "finish_reason": "stop",
+			}},
+		})
+		io.WriteString(w, "data: [DONE]\n\n")
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	st.status = http.StatusOK
+	st.outcome = reqlog.OutcomeSuccess
+	clearChatStatError(st)
+}
+
+// latchCompletion 门锁用的单候选 completion 对象。没有上游响应可取，
+// id/created 现造；choices 只有一个 finish_reason=stop。
+func latchCompletion(model, text string) map[string]any {
+	return map[string]any{
+		"id":      "chatcmpl-latch-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"message":       map[string]any{"role": "assistant", "content": text},
+			"finish_reason": "stop",
+		}},
+	}
+}
+
+// writeLatchResponsesSSE 按 Responses 协议写出门锁内容。
+//
+// 事件名与顺序对齐 internal/upstream/responses_stream.go 的真实输出——少发
+// 任何一段都会让严格客户端卡在等待，所以这里完整走完 created → completed。
+func writeLatchResponsesSSE(w http.ResponseWriter, obj map[string]any) {
+	msg := obj["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	text, _ := msg["content"].(string)
+
+	respID := "resp_" + strings.TrimPrefix(obj["id"].(string), "chatcmpl-")
+	base := func(status string) map[string]any {
+		return map[string]any{"id": respID, "object": "response", "status": status}
+	}
+	seq := int64(0)
+	emit := func(event string, data map[string]any) {
+		seq++
+		data["sequence_number"] = seq
+		payload, _ := json.Marshal(data)
+		io.WriteString(w, "event: "+event+"\n")
+		io.WriteString(w, "data: "+string(payload)+"\n\n")
+	}
+
+	emit("response.created", map[string]any{"response": base("in_progress")})
+	emit("response.in_progress", map[string]any{"response": base("in_progress")})
+	emit("response.output_item.added", map[string]any{
+		"output_index": 0,
+		"item": map[string]any{
+			"id": "msg_latch", "type": "message", "status": "in_progress",
+			"role": "assistant", "content": []any{},
+		},
+	})
+	emit("response.content_part.added", map[string]any{
+		"item_id": "msg_latch", "output_index": 0, "content_index": 0,
+		"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+	})
+	emit("response.output_text.delta", map[string]any{
+		"item_id": "msg_latch", "output_index": 0, "content_index": 0, "delta": text,
+	})
+	emit("response.output_text.done", map[string]any{
+		"item_id": "msg_latch", "output_index": 0, "content_index": 0, "text": text,
+	})
+	part := map[string]any{"type": "output_text", "text": text, "annotations": []any{}}
+	emit("response.content_part.done", map[string]any{
+		"item_id": "msg_latch", "output_index": 0, "content_index": 0, "part": part,
+	})
+	done := map[string]any{
+		"id": "msg_latch", "type": "message", "status": "completed",
+		"role": "assistant", "content": []any{part},
+	}
+	emit("response.output_item.done", map[string]any{"output_index": 0, "item": done})
+	completed := base("completed")
+	completed["output"] = []any{done}
+	completed["created_at"] = obj["created"]
+	emit("response.completed", map[string]any{"response": completed})
+}
+
+// writeSSEFrame 写一个 data 帧并 flush（门锁内容短，写完即推）。
+func writeSSEFrame(w http.ResponseWriter, obj map[string]any) {
+	payload, err := json.Marshal(obj)
+	if err != nil {
+		return
+	}
+	io.WriteString(w, "data: "+string(payload)+"\n\n")
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
