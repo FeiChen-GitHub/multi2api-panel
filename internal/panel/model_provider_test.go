@@ -77,8 +77,10 @@ func TestPanelModelsTraeOnlyPoolSkipsWorkBuddyEndpoint(t *testing.T) {
 		t.Fatalf("WorkBuddy models endpoint hit %d time(s); Trae token must not be sent there", n)
 	}
 	// ② Trae 端点确实被查了（否则上面是"什么都没查"的假通过）。
-	if n := atomic.LoadInt32(&traeHits); n != 1 {
-		t.Fatalf("Trae models endpoint hits = %d, want 1", n)
+	// 3.4.4 模型发现会请求两个 function（solo_agent + chat_v3），
+	// 故 hits → 2；这里只守“必须有调用”，具体次数交给上游决定。
+	if n := atomic.LoadInt32(&traeHits); n < 1 {
+		t.Fatalf("Trae models endpoint hits = %d, want >= 1", n)
 	}
 
 	var out struct {
