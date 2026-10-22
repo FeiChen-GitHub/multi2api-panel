@@ -1173,7 +1173,11 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 		if isTrae {
 			// Trae 成功路径（SOLO 原生流）：格式归一化与错误处置都在 serveTraeSuccess 内，
 			// 不落入下方 WorkBuddy 专属的 StreamHint / markup repair / 统计路径。
-			h.serveTraeSuccess(w, r, acct, rc, bareModel, peek.Stream, st, stickySessKey, chatChannel, proto)
+			// 用量统计在这里补记：serveTraeSuccess 返回是否计请求 + token 增量。
+			res := h.serveTraeSuccess(w, r, acct, rc, bareModel, peek.Stream, st, stickySessKey, chatChannel, proto)
+			if res.record {
+				recordAttempt(acct.UID, res.delta, 0, false, attemptStarted, 0)
+			}
 			return
 		}
 		if peek.Stream {

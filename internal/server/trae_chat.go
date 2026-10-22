@@ -75,6 +75,13 @@ func (h *Handler) applyTraeWorkStreamError(acct *auth.Auth, model string, se *up
 		logfmt.Label(acct.UID, acct.Nickname), model, se.Kind(), se)
 }
 
+// traeServeResult 描述一次 Trae 响应是否应计入请求统计（Requests+1），
+// 以及明确的 token 用量增量（无 usage 时 delta 为空 → 只记 Requests，UsageCount 不加）。
+type traeServeResult struct {
+	record bool
+	delta  pool.TokenUsageDelta
+}
+
 // serveTraeSuccess 处理 Trae 的一次 200 响应：
 //   - 流式：原生流 → OpenAI SSE；流内 event:error 经回调冷却账号；
 //   - 非流式：聚合为 chat.completion 后一次写出。
@@ -83,7 +90,7 @@ func (h *Handler) applyTraeWorkStreamError(acct *auth.Auth, model string, se *up
 // ch 决定用哪套解析器：Work 的事件是 payload 包裹的 plan_item/output/done 且
 // output 是累积全文，SOLO 是扁平的 response/reasoning_content —— 两套形状不能
 // 互相套用（套错的一侧会输出空内容）。
-func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct *auth.Auth, rc io.ReadCloser, model string, stream bool, st *chatStat, sessKey string, ch upstream.Channel, proto protocol) {
+func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct *auth.Auth, rc io.ReadCloser, model string, stream bool, st *chatStat, sessKey string, ch upstream.Channel, proto protocol) traeServeResult {
 	defer rc.Close()
 
 	work := ch == upstream.ChannelWork
@@ -98,38 +105,42 @@ func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct 
 		st.status = http.StatusOK
 		var streamErr *upstream.TraeStreamError
 		var err error
+		// 捕获流内 usage 帧：token_usage / work usage 出现即记一次明确用量。
+		var lastUsage map[string]any
+		onUsage := func(u map[string]any) { lastUsage = u }
 		// Responses：包一层事件翻译器（转发 Flusher），两个 Trae 写入点本身不改。
 		out := w
 		if proto == protoResponses {
 			out = upstream.NewResponsesWriter(w, nil)
 		}
 		if work {
-			err = upstream.TraeStreamWorkToOpenAI(out, rc, model, func(se *upstream.TraeStreamError) {
+			err = upstream.TraeStreamWorkToOpenAIWithUsage(out, rc, model, func(se *upstream.TraeStreamError) {
 				streamErr = se
 				onWorkErr(se)
-			})
+			}, onUsage)
 		} else {
-			err = upstream.TraeStreamToOpenAI(out, rc, model, func(se *upstream.TraeStreamError) {
+			err = upstream.TraeStreamToOpenAIWithUsage(out, rc, model, func(se *upstream.TraeStreamError) {
 				streamErr = se
 				onErr(se)
-			})
+			}, onUsage)
 		}
 		if err != nil {
 			// 客户端写失败（断连）：上游帧无恙，账号照常记成功（与 WorkBuddy 同口径）。
 			st.outcome = reqlog.OutcomeInterrupted
 			h.cfg.Pool.NoteSuccess(acct.UID)
-			return
+			return traeServeResult{record: true, delta: usageDeltaFromResponse(map[string]any{"usage": lastUsage})}
 		}
 		if streamErr != nil {
+			// 流内业务错误：不算成功请求，不计 Requests。
 			st.status = http.StatusServiceUnavailable
 			st.outcome = reqlog.OutcomeStreamError
-			return
+			return traeServeResult{record: false}
 		}
 		h.markTraeSuccess(acct, model, st, sessKey)
 		if work {
 			h.probeTraeWorkCredits(acct)
 		}
-		return
+		return traeServeResult{record: true, delta: usageDeltaFromResponse(map[string]any{"usage": lastUsage})}
 	}
 
 	var resp map[string]any
@@ -146,12 +157,12 @@ func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct 
 			st.status = http.StatusServiceUnavailable
 			st.outcome = reqlog.OutcomeStreamError
 			chatErr(w, proto, http.StatusServiceUnavailable, "trae_upstream_error", se.Error(), "")
-			return
+			return traeServeResult{record: false}
 		}
 		st.status = http.StatusBadGateway
 		st.outcome = reqlog.OutcomeStreamError
 		chatErr(w, proto, http.StatusBadGateway, "upstream_parse", err.Error(), "")
-		return
+		return traeServeResult{record: false}
 	}
 	h.markTraeSuccess(acct, model, st, sessKey)
 	if work {
@@ -161,6 +172,7 @@ func (h *Handler) serveTraeSuccess(w http.ResponseWriter, r *http.Request, acct 
 		resp = chatCompletionToResponse(resp)
 	}
 	writeJSON(w, http.StatusOK, resp)
+	return traeServeResult{record: true, delta: usageDeltaFromResponse(resp)}
 }
 
 // probeTraeWorkCredits 异步刷新账号的 work_credits（DESIGN §6.6 ProbeCredits）。

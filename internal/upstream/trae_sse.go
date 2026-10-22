@@ -286,6 +286,12 @@ func traeSortInts(a []int) {
 // 保证至少一个 [DONE]。onErr 在遇到 event:error 时回调（供上层冷却账号），
 // 错误信息同时注入 SSE 事件流。调用方负责已写好 status 200 与响应头。
 func TraeStreamToOpenAI(w http.ResponseWriter, r io.Reader, model string, onErr func(*TraeStreamError)) error {
+	return TraeStreamToOpenAIWithUsage(w, r, model, onErr, nil)
+}
+
+// TraeStreamToOpenAIWithUsage 在 TraeStreamToOpenAI 的基础上增加 onUsage 回调：
+// 收到 token_usage 事件时把 usage 原样上报给上层（供统计），不影响客户端输出。
+func TraeStreamToOpenAIWithUsage(w http.ResponseWriter, r io.Reader, model string, onErr func(*TraeStreamError), onUsage func(map[string]any)) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -372,6 +378,9 @@ func TraeStreamToOpenAI(w http.ResponseWriter, r io.Reader, model string, onErr 
 				}
 			case "token_usage":
 				pendingUsage = ev.Usage
+				if onUsage != nil {
+					onUsage(ev.Usage)
+				}
 			case "done":
 				if err := writeChunk(map[string]any{}, ev.FinishReason); err != nil {
 					return err
