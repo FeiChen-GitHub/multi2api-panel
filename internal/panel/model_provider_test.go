@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -32,10 +33,7 @@ func TestPanelModelsTraeOnlyPoolSkipsWorkBuddyEndpoint(t *testing.T) {
 	var traeHits int32
 	traeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&traeHits, 1)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"config_info_list":[` +
-			`{"config_name":"glm-5.2","display_config":{"display_name":"GLM-5.2"}},` +
-			`{"config_name":"DeepSeek-V4-Flash-Official","display_config":{"display_name":"DeepSeek V4"}}]}`))
+		http.Error(w, "unexpected upstream request", http.StatusInternalServerError)
 	}))
 	defer traeSrv.Close()
 
@@ -58,6 +56,7 @@ func TestPanelModelsTraeOnlyPoolSkipsWorkBuddyEndpoint(t *testing.T) {
 
 	up := &upstream.Client{HTTP: wbSrv.Client(), ChatBaseCN: wbSrv.URL}
 	tc := &upstream.TraeClient{HTTP: traeSrv.Client(), AgentHost: traeSrv.URL}
+	tc.ModelCachePath = filepath.Join(t.TempDir(), "missing.vscdb")
 	p := New(Config{
 		Version:    "test",
 		AuthDir:    t.TempDir(),
@@ -77,10 +76,9 @@ func TestPanelModelsTraeOnlyPoolSkipsWorkBuddyEndpoint(t *testing.T) {
 		t.Fatalf("WorkBuddy models endpoint hit %d time(s); Trae token must not be sent there", n)
 	}
 	// ② Trae 端点确实被查了（否则上面是"什么都没查"的假通过）。
-	// 3.4.4 模型发现会请求两个 function（solo_agent + chat_v3），
-	// 故 hits → 2；这里只守“必须有调用”，具体次数交给上游决定。
-	if n := atomic.LoadInt32(&traeHits); n < 1 {
-		t.Fatalf("Trae models endpoint hits = %d, want >= 1", n)
+	// 3.4.4 UI 目录是本机静态权威表，不应再请求 get_detail_param。
+	if n := atomic.LoadInt32(&traeHits); n != 0 {
+		t.Fatalf("Trae models endpoint hits = %d, want 0", n)
 	}
 
 	var out struct {
@@ -89,34 +87,51 @@ func TestPanelModelsTraeOnlyPoolSkipsWorkBuddyEndpoint(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
 		t.Fatalf("decode: %v (%s)", err, rr.Body.String())
 	}
-	if len(out.Models) != 2 {
-		t.Fatalf("models = %d, want 2: %s", len(out.Models), rr.Body.String())
+	if len(out.Models) != 22 {
+		t.Fatalf("models = %d, want 21 static + Auto: %s", len(out.Models), rr.Body.String())
 	}
 	byID := map[string]map[string]any{}
 	for _, m := range out.Models {
 		byID[m["id"].(string)] = m
 	}
-	entry, ok := byID["trae:glm-5.2"]
+	entry, ok := byID["trae:glm-5.3"]
 	if !ok {
-		t.Fatalf("missing trae:glm-5.2 entry: %s", rr.Body.String())
+		t.Fatalf("missing trae:glm-5.3 entry: %s", rr.Body.String())
 	}
 	// ③ id 前缀与 /v1/models 一致（wb:/wb:global:/trae:），旧面板的 "cn:" 不是合法网关模型名。
 	if entry["provider"] != string(auth.ProviderTrae) || entry["realm"] != "cn" {
 		t.Fatalf("entry provider/realm = %v/%v, want trae/cn", entry["provider"], entry["realm"])
 	}
-	// ④ 不套 WorkBuddy 的静态档位表：glm-5.2 在两边同名，套上去等于编档位数据。
-	if _, bad := entry["supported_efforts"]; bad {
-		t.Fatalf("Trae entry must not carry WorkBuddy effort table: %v", entry["supported_efforts"])
+	// ④ 透出 UI 缓存里的真实能力与计费字段，但绝不套 WorkBuddy 同名静态表。
+	if entry["credits"] != "x0.78" || entry["context_length"] != float64(200000) || entry["max_output_tokens"] != float64(64000) {
+		t.Fatalf("glm-5.3 base/credits = %v", entry)
 	}
-	if _, bad := entry["credits"]; bad {
-		t.Fatalf("Trae entry must not carry a rate: %v", entry["credits"])
+	efforts, _ := entry["supported_efforts"].([]any)
+	if len(efforts) != 3 || efforts[0] != "light" || efforts[2] != "extra_high" || entry["default_effort"] != "extra_high" {
+		t.Fatalf("glm-5.3 efforts = %v", entry)
+	}
+	if entry["supports_reasoning"] != true || entry["supports_images"] != false {
+		t.Fatalf("glm-5.3 capability fields = %v", entry)
+	}
+	if _, bad := entry["is_default"]; bad {
+		t.Fatalf("glm-5.3 must not be default: %v", entry)
 	}
 	// ⑤ 通道判定（Work / SOLO）照旧透出，供前端识别。
 	if byID["trae:DeepSeek-V4-Flash-Official"]["channel"] != string(upstream.ChannelWork) {
 		t.Fatalf("Flash-Official channel = %v, want work", byID["trae:DeepSeek-V4-Flash-Official"]["channel"])
 	}
 	if entry["channel"] != string(upstream.ChannelSOLO) {
-		t.Fatalf("glm-5.2 channel = %v, want solo", entry["channel"])
+		t.Fatalf("glm-5.3 channel = %v, want solo", entry["channel"])
+	}
+	if byID["trae:Doubao-Seed-Code"]["is_default"] != true {
+		t.Fatalf("Doubao-Seed-Code must be default: %v", byID["trae:Doubao-Seed-Code"])
+	}
+	qwen := byID["trae:qwen-3.7-plus"]
+	if qwen["supports_reasoning"] != false {
+		t.Fatalf("qwen-3.7-plus supports_reasoning = %v, want false", qwen["supports_reasoning"])
+	}
+	if _, bad := qwen["supported_efforts"]; bad {
+		t.Fatalf("qwen-3.7-plus must omit empty efforts: %v", qwen)
 	}
 }
 
@@ -133,8 +148,7 @@ func TestPanelModelsMixedPoolSplitsByProvider(t *testing.T) {
 	}))
 	defer wbSrv.Close()
 	traeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"config_info_list":[{"config_name":"trae-only","display_config":{"display_name":"Trae Only"}}]}`))
+		http.Error(w, "unexpected upstream request", http.StatusInternalServerError)
 	}))
 	defer traeSrv.Close()
 
@@ -165,6 +179,7 @@ func TestPanelModelsMixedPoolSplitsByProvider(t *testing.T) {
 
 	up := &upstream.Client{HTTP: wbSrv.Client(), ChatBaseCN: wbSrv.URL}
 	tc := &upstream.TraeClient{HTTP: traeSrv.Client(), AgentHost: traeSrv.URL}
+	tc.ModelCachePath = filepath.Join(t.TempDir(), "missing.vscdb")
 	p := New(Config{
 		Version:    "test",
 		AuthDir:    t.TempDir(),
@@ -179,7 +194,7 @@ func TestPanelModelsMixedPoolSplitsByProvider(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
-	for _, want := range []string{`"wb:wb-only"`, `"trae:trae-only"`} {
+	for _, want := range []string{`"wb:wb-only"`, `"trae:glm-5.3"`, `"trae:Auto"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("missing %s in %s", want, body)
 		}

@@ -65,19 +65,15 @@ func TestTraePrepareBodyDefaultsModel(t *testing.T) {
 	}
 }
 
-// D7：`auto` 是别名不是模型名，必须映射到默认模型（glm-5.2）。
-// 直接当 config_name 上发会被上游拒，整个请求失败。
-func TestTraePrepareBodyMapsAutoAlias(t *testing.T) {
-	for _, in := range []string{`{"model":"auto","messages":[]}`, `{"model":"AUTO","messages":[]}`} {
-		out := TraePrepareBody([]byte(in))
-		var got map[string]any
-		if err := json.Unmarshal(out, &got); err != nil {
-			t.Fatalf("unmarshal: %v (%s)", err, in)
-		}
-		if got["model"] != TraeDefaultModel || got["config_name"] != TraeDefaultModel {
-			t.Fatalf("%s → model/config_name = %v/%v, want %q（auto 必须映射为默认模型）",
-				in, got["model"], got["config_name"], TraeDefaultModel)
-		}
+// Auto 是 Trae UI 提供的真实模式，必须原样透传给上游，不能再改写为默认模型。
+func TestTraePrepareBodyPreservesAutoMode(t *testing.T) {
+	out := TraePrepareBody([]byte(`{"model":"Auto","messages":[]}`))
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["model"] != "Auto" || got["config_name"] != "Auto" {
+		t.Fatalf("model/config_name = %v/%v, want Auto", got["model"], got["config_name"])
 	}
 }
 
