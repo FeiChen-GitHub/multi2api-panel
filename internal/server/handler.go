@@ -495,7 +495,7 @@ func (h *Handler) modelList() []map[string]any {
 		acct := h.cfg.Pool.AuthByKey(keys[0])
 		if acct != nil {
 			if ml, ok := h.clientFor(auth.ProviderTrae).(upstream.ModelLister); ok {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				infos, err := ml.FetchModels(ctx, acct)
 				cancel()
 				if err != nil {
@@ -517,6 +517,24 @@ func (h *Handler) modelList() []map[string]any {
 					}
 					if mi.Name != "" {
 						entry["name"] = mi.Name
+					}
+					if mi.Credits != "" {
+						entry["credits"] = mi.Credits
+					}
+					if mi.IsDefault {
+						entry["is_default"] = true
+					}
+					if mi.ID != "Auto" {
+						entry["supports_reasoning"] = mi.SupportsReasoning
+					}
+					if mi.SupportsImages {
+						entry["supports_images"] = true
+					}
+					if len(mi.Efforts) > 0 {
+						entry["reasoning_supported_efforts"] = mi.Efforts
+						if mi.DefaultEffort != "" {
+							entry["reasoning_default_effort"] = mi.DefaultEffort
+						}
 					}
 					out = append(out, entry)
 				}

@@ -48,8 +48,8 @@ const (
 	// 故模型发现与对话走两套版本头。
 	traeModelIdeVersion     = "3.4.4"
 	traeModelIdeVersionCode = "20260212"
-	traeOSVersion      = "macOS 15.7.4"
-	traeDeviceBrand    = "Apple"
+	traeOSVersion           = "macOS 15.7.4"
+	traeDeviceBrand         = "Apple"
 
 	TraeEpChat          = "/api/agent/v3/llm_utils_chat"
 	TraeEpModels        = "/api/ide/v1/get_detail_param"
@@ -72,6 +72,9 @@ type TraeClient struct {
 	UgHost    string
 	OAuthHost string
 	ClientID  string
+
+	// ModelCachePath Trae 桌面端 state.vscdb 路径；空 = 不读取本地缓存。
+	ModelCachePath string
 }
 
 // NewTraeClient 生产默认值（连接池复用，同 trae2api.New）。
@@ -83,12 +86,13 @@ func NewTraeClient() *TraeClient {
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
 	return &TraeClient{
-		HTTP:       &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		StreamHTTP: &http.Client{Transport: tr},
-		AgentHost:  TraeAgentHost,
-		UgHost:     TraeUgHost,
-		OAuthHost:  TraeOAuthHost,
-		ClientID:   TraeClientID,
+		HTTP:           &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		StreamHTTP:     &http.Client{Transport: tr},
+		AgentHost:      TraeAgentHost,
+		UgHost:         TraeUgHost,
+		OAuthHost:      TraeOAuthHost,
+		ClientID:       TraeClientID,
+		ModelCachePath: DefaultTraeModelCachePath(),
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -23,6 +24,7 @@ func traeTestClient(t *testing.T, calls *int) *upstream.TraeClient {
 	t.Helper()
 	tc := upstream.NewTraeClient()
 	tc.AgentHost = "https://trae.fake"
+	tc.ModelCachePath = filepath.Join(t.TempDir(), "missing.vscdb")
 	tc.UgHost = "https://trae.fake"
 	tc.OAuthHost = "https://trae.fake"
 	fake := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -153,17 +155,9 @@ func TestModelsIncludesTraeEntries(t *testing.T) {
 	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
 	tc := upstream.NewTraeClient()
 	tc.AgentHost = "https://trae.fake"
+	tc.ModelCachePath = filepath.Join(t.TempDir(), "missing.vscdb")
 	tc.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path != upstream.TraeEpModels {
-			return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader("nope")), Header: http.Header{}}, nil
-		}
-		return &http.Response{
-			StatusCode: 200,
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body: io.NopCloser(strings.NewReader(`{"config_info_list":[` +
-				`{"config_name":"glm-5.2","display_config":{"display_name":"GLM 5.2"}},` +
-				`{"config_name":"DeepSeek-V4-Flash-Official","display_config":{"display_name":"Flash"}}]}`)),
-		}, nil
+		return &http.Response{StatusCode: 500, Body: io.NopCloser(strings.NewReader("unexpected upstream request")), Header: http.Header{}}, nil
 	})}
 	tc.StreamHTTP = tc.HTTP
 
@@ -191,12 +185,25 @@ func TestModelsIncludesTraeEntries(t *testing.T) {
 			byID[id] = m
 		}
 	}
-	solo, ok := byID["trae:glm-5.2"]
-	if !ok {
-		t.Fatalf("trae:glm-5.2 missing; ids=%v", keysOf(byID))
+	if len(resp.Data) != 22 {
+		t.Fatalf("Trae models = %d, want 21 + Auto; ids=%v", len(resp.Data), keysOf(byID))
 	}
-	if solo["owned_by"] != "trae" || solo["channel"] != "solo" {
-		t.Fatalf("trae:glm-5.2 = %v", solo)
+	solo, ok := byID["trae:glm-5.3"]
+	if !ok {
+		t.Fatalf("trae:glm-5.3 missing; ids=%v", keysOf(byID))
+	}
+	if solo["owned_by"] != "trae" || solo["channel"] != "solo" || solo["credits"] != "x0.78" {
+		t.Fatalf("trae:glm-5.3 = %v", solo)
+	}
+	if solo["context_length"] != float64(200000) || solo["max_output_tokens"] != float64(64000) {
+		t.Fatalf("trae:glm-5.3 limits = %v", solo)
+	}
+	efforts, _ := solo["reasoning_supported_efforts"].([]any)
+	if len(efforts) != 3 || efforts[0] != "light" || efforts[2] != "extra_high" || solo["reasoning_default_effort"] != "extra_high" {
+		t.Fatalf("trae:glm-5.3 efforts = %v", solo)
+	}
+	if solo["supports_reasoning"] != true || solo["supports_images"] != nil {
+		t.Fatalf("trae:glm-5.3 capabilities = %v", solo)
 	}
 	work, ok := byID["trae:DeepSeek-V4-Flash-Official"]
 	if !ok {
@@ -204,6 +211,13 @@ func TestModelsIncludesTraeEntries(t *testing.T) {
 	}
 	if work["channel"] != "work" {
 		t.Fatalf("work model channel = %v, want work", work["channel"])
+	}
+	qwen := byID["trae:qwen-3.7-plus"]
+	if qwen["supports_reasoning"] != false || qwen["credits"] != "x0.25" || qwen["supports_images"] != true {
+		t.Fatalf("trae:qwen-3.7-plus = %v", qwen)
+	}
+	if _, bad := qwen["reasoning_supported_efforts"]; bad {
+		t.Fatalf("qwen-3.7-plus must omit empty efforts: %v", qwen)
 	}
 }
 

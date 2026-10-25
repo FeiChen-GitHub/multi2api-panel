@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -409,6 +410,70 @@ process.stdout.write(JSON.stringify({
 		`"rateFree":0,"rateMissing":null}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("model filter=%s\nwant %s", out, want)
+	}
+}
+
+// mdRowHtml：Trae 已知“不支持思考”时不能再显示“上游未披露”；有真实档位时
+// 正常渲染档位、默认档和倍率。未知字段仍保留“上游未披露”语义。
+func TestAppJSTraeReasoningRendering(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; trae reasoning rendering test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const escStart = src.indexOf('function esc(');
+const escEnd = src.indexOf('function ago(');
+const rowStart = src.indexOf('function mdRowHtml');
+const rowEnd = src.indexOf('function renderModels');
+if ([escStart, escEnd, rowStart, rowEnd].some(v => v < 0)) throw new Error('row helpers not found');
+const rateStart = src.indexOf('function rateCell');
+const rateEnd = src.indexOf('async function loadModels');
+if (rateStart < 0 || rateEnd < 0) throw new Error('rate cell helper not found');
+const ctx = { String, Array, Math, Number, outCell: () => '<td></td>' };
+vm.createContext(ctx);
+vm.runInContext(src.slice(escStart, escEnd) + src.slice(rateStart, rateEnd) + src.slice(rowStart, rowEnd) +
+  '\nthis.mdRowHtml=mdRowHtml;', ctx);
+const base = { id: 'trae:qwen-3.7-plus', name: 'Qwen3.7-Plus', provider: 'trae', realm: 'cn',
+  supports_reasoning: false, credits: 'x0.25', context_length: 200000, max_output_tokens: 64000 };
+const off = ctx.mdRowHtml(base, null);
+const thinking = ctx.mdRowHtml(Object.assign({}, base, {
+  id: 'trae:glm-5.3', name: 'GLM-5.3', supports_reasoning: true,
+  supported_efforts: ['light', 'high', 'extra_high'], default_effort: 'extra_high', credits: 'x0.78'
+}), null);
+const unknown = ctx.mdRowHtml(Object.assign({}, base, { id: 'trae:unknown', supports_reasoning: undefined }), null);
+process.stdout.write(JSON.stringify({ off, thinking, unknown }));`
+	f, err := os.CreateTemp(t.TempDir(), "trae-row-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("trae reasoning node test failed: %v\n%s", err, out)
+	}
+	var got struct {
+		Off      string `json:"off"`
+		Thinking string `json:"thinking"`
+		Unknown  string `json:"unknown"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("decode node output: %v (%s)", err, out)
+	}
+	if !strings.Contains(got.Off, "不支持思考") || strings.Contains(got.Off, "上游未披露") {
+		t.Fatalf("known non-reasoning model rendered wrong: %s", got.Off)
+	}
+	for _, want := range []string{"light", "extra_high", "x0.78"} {
+		if !strings.Contains(got.Thinking, want) {
+			t.Fatalf("thinking model missing %q: %s", want, got.Thinking)
+		}
+	}
+	if !strings.Contains(got.Unknown, "上游未披露") {
+		t.Fatalf("unknown reasoning capability must stay undisclosed: %s", got.Unknown)
 	}
 }
 

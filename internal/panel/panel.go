@@ -394,7 +394,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	if keys := p.cfg.Pool.AvailableKeysForProviderModelRealm(auth.ProviderTrae, "", "cn"); len(keys) > 0 {
 		if acct := p.cfg.Pool.AuthByKey(keys[0]); acct != nil {
 			if ml, ok := p.clientFor(auth.ProviderTrae).(upstream.ModelLister); ok {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				infos, err := ml.FetchModels(ctx, acct)
 				cancel()
 				if err != nil {
@@ -476,11 +476,9 @@ func panelModelEntry(idPrefix, realm string, mi upstream.ModelInfo, remoteEffort
 
 // panelTraeModelEntry 构造单个 Trae 模型条目。
 //
-// 刻意不复用 panelModelEntry：那个函数内部走 EffortListing → staticEffortCap →
-// 按模型名查 CN 兜底表，而 glm-5.2 / kimi-k3 / DeepSeek-V4-Flash 等在两个上游
-// 同名，套上去等于把 WorkBuddy 的档位张冠李戴到 Trae 模型上（编数据）。
-// Trae 的 get_detail_param 只回 ID / 展示名 / 上下文，因此倍率、能力旗标、档位
-// 一律留空——前端据此显示"上游未披露"，而不是冒充"不支持思考"。
+// 不复用 panelModelEntry，避免把 WorkBuddy 的同名模型档位套到 Trae 上。
+// Trae 的本地 solo_agent 缓存会给出倍率、能力旗标和档位，直接透出。
+// Auto 只暴露 ID/名称，能力字段保持未知。
 func panelTraeModelEntry(mi upstream.ModelInfo) map[string]any {
 	entry := map[string]any{
 		"id":       "trae:" + mi.ID,
@@ -495,15 +493,25 @@ func panelTraeModelEntry(mi upstream.ModelInfo) map[string]any {
 	if mi.MaxTokens > 0 {
 		entry["max_output_tokens"] = mi.MaxTokens
 	}
+	if mi.Credits != "" {
+		entry["credits"] = mi.Credits
+	}
+	if mi.IsDefault {
+		entry["is_default"] = true
+	}
+	if mi.ID != "Auto" {
+		entry["supports_reasoning"] = mi.SupportsReasoning
+		entry["supports_images"] = mi.SupportsImages
+	}
+	if len(mi.Efforts) > 0 {
+		entry["supported_efforts"] = mi.Efforts
+		if mi.DefaultEffort != "" {
+			entry["default_effort"] = mi.DefaultEffort
+		}
+	}
 	return entry
 }
 
-// modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out
-// 写入的契约文件），供前端在「模型与档位」的实测列做风险标注。
-//
-// 设计边界：纯只读透传——文件缺失/未配置返回空集（面板退化为无标注，与历史行为
-// 一致），网关自身不解析字段语义、不据此做任何路由或出站决策；上游改了限制后
-// 重跑一次工具、下次查询即刷新，无需重启网关。
 func (p *Panel) modelProbes(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{"probes": map[string]json.RawMessage{}, "exists": false}
 	if p.cfg.ProbeFile == "" {

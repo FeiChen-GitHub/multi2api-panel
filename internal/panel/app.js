@@ -734,8 +734,9 @@ function mdRowHtml(m, pr) {
   if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
   const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
     : '<span style="color:var(--ink-3);font-size:12.5px">' +
-      // Trae 上游（get_detail_param）不披露档位与倍率：显示"未披露"而不是冒充"不支持思考"。
-      (m.provider === 'trae' ? '上游未披露'
+      // Trae 本地缓存有明确能力时按真实值展示；字段缺失时仍显示“未披露”。
+      (m.provider === 'trae' && m.supports_reasoning === undefined ? '上游未披露'
+        : m.supports_reasoning === false ? '不支持思考'
         : (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考')) + '</span>';
   // 能力徽标：来源 / 默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
   const caps = [];
