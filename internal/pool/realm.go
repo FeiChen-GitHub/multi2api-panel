@@ -203,3 +203,41 @@ func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 	sort.Strings(uids)
 	return uids
 }
+
+// ServableForProviderModelRealmChannel 返回「provider + realm + 通道」这个组合此刻
+// **真正能服务该模型**的账号数（跨域回退 issue #135 的判据）。
+//
+// 与 pick 的候选口径一致（healthyForChannel 的 6004/11102 模型级冷却豁免、在途租约、
+// 积分保底都计入），但**不含 pick 的全冷却兜底**——回退要的正是「这个组合此刻有没有
+// 健康号」，兜底把冷却号捞回来的乐观语义会掩盖这一点。
+//
+// 只读：持 RLock 遍历，不改任何状态。provider / realm 为空串时退化为该维不过滤
+// （与既有 realm 语义一致）。
+func (p *Pool) ServableForProviderModelRealmChannel(provider auth.Provider, model, realm string, ch Channel) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	n := 0
+	for _, e := range p.byKey {
+		if e == nil || e.a == nil {
+			continue
+		}
+		if provider != "" && e.a.Provider() != provider {
+			continue
+		}
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if !e.healthyForChannel(now, ch, model) {
+			continue
+		}
+		if p.inFlightFull(e) {
+			continue
+		}
+		if p.floorBlockedForRealmModel(e, model, realm, now) {
+			continue
+		}
+		n++
+	}
+	return n
+}

@@ -825,7 +825,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 	// 路由协议解析（DESIGN §3.1）：model 名可带 "[provider:][realm:]" 前缀。
 	// 剥出 provider + realm + bareModel；bareModel 用于选号/粘性/出站 body 重写
 	// （前缀是网关侧路由协议，上游只认裸名）。过渡期裸名 → (workbuddy, cn, 原串)。
-	provider, realm, bareModel, rmErr := resolveModel(peek.Model)
+	provider, realm, bareModel, realmExplicit, rmErr := resolveModelDetail(peek.Model)
 	if rmErr != nil {
 		// provider 必填（DESIGN §3.1）：缺前缀/未知 provider 一律 400，
 		// 不再有「未知前缀整体当裸名」的兜底。
@@ -877,6 +877,13 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
 	}
+	// 跨域回退（issue #135）：只有「写了 provider、没写 realm」的请求才允许回退，
+	// 且必须显式开启 pool.cross_domain_fallback。语义 = 「同 provider 内不绑死单域」：
+	// 首选域（缺省 cn）选不到可用号（账号级冷却/熔断/在途占满，或该域账号对这个模型
+	// 11102 后进入模型级负缓存）时，改用同 provider 的另一域再选一次。
+	// 显式 wb:cn: / wb:global: 是用户的明确意图，永不回退；也绝不跨 provider 借号
+	// （模型名、计费与上游协议都不同，默默替用户换 provider 是错的）。
+	crossRealm := !realmExplicit && h.cfg.Pool.CrossDomainFallback()
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), rawBody, peek.Stream)
@@ -1067,7 +1074,9 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 		var acct *auth.Auth
 		if stickyKey != "" {
 			acct = h.cfg.Pool.PickByKeyForModel(stickyKey, bareModel)
-			if acct == nil || (realm != "" && acct.Realm() != realm) {
+			// 跨域回退开启且请求未显式写 realm 时，粘性号可以落在同 provider 的任一域
+			// （回退成功后绑的是另一域的账号，下一轮不该被 realm 校验立刻解绑）。
+			if acct == nil || (realm != "" && acct.Realm() != realm && !crossRealm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
 				// 本次回落普通轮换。
 				unbindSticky()
@@ -1085,7 +1094,21 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
 			// 带通道维度：Trae 的 Work 请求不被 SOLO 触发的账号级冷却挡住（DESIGN §6.6）。
-			acct = h.cfg.Pool.PickExcludingForProviderRealmChannel(tried, bareModel, realm, provider, toPoolChannel(chatChannel))
+			pickRealm := realm
+			if crossRealm &&
+				h.cfg.Pool.ServableForProviderModelRealmChannel(provider, bareModel, realm, toPoolChannel(chatChannel)) == 0 &&
+				h.cfg.Pool.ServableForProviderModelRealmChannel(provider, bareModel, otherRealm(realm), toPoolChannel(chatChannel)) > 0 {
+				// 首选域此刻没有真正可服务的号（11102 模型级负缓存 / 账号级冷却 /
+				// 在途占满），而同 provider 的另一域有 → 直接换域选号（issue #135）。
+				// 先看健康度再选，避免拿全冷却兜底捞回来的旧域账号白撞一次上游。
+				pickRealm = otherRealm(realm)
+			}
+			acct = h.cfg.Pool.PickExcludingForProviderRealmChannel(tried, bareModel, pickRealm, provider, toPoolChannel(chatChannel))
+			if acct == nil && crossRealm {
+				// 该域选不到（并发抢名额/轮换耗尽/另一域刚冷却完）→ 同 provider 的另一域
+				// 再试一次，保持尽力而为语义；tried 已记录失败号，轮转仍由 MaxRotate 封顶。
+				acct = h.cfg.Pool.PickExcludingForProviderRealmChannel(tried, bareModel, otherRealm(pickRealm), provider, toPoolChannel(chatChannel))
+			}
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -1100,6 +1123,11 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 		st.uid = acct.UID
 		// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
 		st.nick = acct.Nickname
+		if crossRealm && h.cfg.Upstream != nil && acct.Realm() != realm {
+			// 跨域回退命中：按实际服务域取积分倍率，用量/账本记的是真实域口径，
+			// 而不是请求前缀声明的域。
+			modelRate = h.cfg.Upstream.ModelRate(acct.Realm(), bareModel)
+		}
 		tried[acct.Key()] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
