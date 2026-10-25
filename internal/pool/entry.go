@@ -600,6 +600,9 @@ type stateModelCost struct {
 // stateFile 持久化格式。
 type stateFile struct {
 	Accounts map[string]stateAccount `json:"accounts"`
+	// Scheduling 顺序耗尽/轮询游标（键 provider\x1frealm\x1fmodel）。omitempty：
+	// 全部走加权随机时不落这段，老 state.json 读入时缺字段即空（零回归）。
+	Scheduling map[string]scheduleCursor `json:"scheduling,omitempty"`
 }
 
 // flushInterval 后台落盘周期。

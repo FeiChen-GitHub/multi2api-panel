@@ -942,7 +942,13 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 	if h.cfg.Session != nil && sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		if key, ok := h.cfg.Session.ResolveForModel(stickySessKey, peek.Model); ok {
+		// 有序策略（轮询/顺序耗尽）下改用 LookupForModel：只复用已有绑定，不给新会话
+		// 做哈希分配——否则一致性哈希会绕过池的调度游标，策略的确定性失效。
+		resolve := h.cfg.Session.ResolveForModel
+		if h.cfg.Pool != nil && h.cfg.Pool.StrategyForRealm(realm) != pool.WeightedRandom {
+			resolve = h.cfg.Session.LookupForModel
+		}
+		if key, ok := resolve(stickySessKey, peek.Model); ok {
 			stickyKey = auth.AccountKey(key)
 		}
 	}

@@ -86,6 +86,14 @@ type Pool struct {
 	// 为 LRU 兜底/防惊群提供与 time.Now() 精度无关的严格全序（Windows ~0.5ms 精度下
 	// lastUsed 墙钟会全等）。仅 pick 写锁路径读写，无需 atomic。
 	pickSeq uint64
+	// strategies 按地区独立的调度策略（cn=domestic / global=international）。
+	// 空串等价 weighted_random（现状零回归），由 SetScheduling 注入并热更新。
+	strategies RegionStrategies
+	// accountOrder 按地区的 UID 优先顺序（轮询与顺序耗尽用）。
+	accountOrder RegionAccountOrder
+	// scheduling 顺序耗尽/轮询的游标，键 = provider\x1frealm\x1fmodel（见 schedulingKey）。
+	// 持久化进 state.json 的 scheduling 段，重启后按既有快照机制恢复。
+	scheduling map[string]scheduleCursor
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh chan struct{}
@@ -112,6 +120,7 @@ func New(stateFp string) *Pool {
 		// config 显式 "0" 关停（SetCostExploreInterval(0)）。
 		costExploreInterval: defaultCostExploreInterval,
 		exploreLast:         map[string]time.Time{},
+		scheduling:          map[string]scheduleCursor{},
 	}
 	if stateFp != "" {
 		p.load()

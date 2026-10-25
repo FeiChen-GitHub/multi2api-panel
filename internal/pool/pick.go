@@ -91,11 +91,18 @@ func (p *Pool) pick(tried map[auth.AccountKey]bool, reqModel, realm string, prov
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
+		// 有序策略（轮询/顺序耗尽）例外：它们的卖点是确定性，兜底把冷却号捞回来
+		// 会破坏这一点，也会掩盖「这个域真的没号了」这个事实——直接返回 nil 等待恢复。
+		if p.strategyForRealmLocked(realm) != WeightedRandom {
+			return nil
+		}
 		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel, provider, ch)
 	}
 	// provider 级策略（DESIGN §9.5）：Trae 用「余额最高优先」（trae2api PickExcluding 口径），
 	// WorkBuddy 保留现有加权随机 + 防惊群 + cost tier。
-	if provider == auth.ProviderTrae {
+	// 但显式配置的有序策略（轮询/顺序耗尽）优先：那是运维的明确意图，而「余额最高」
+	// 只是 Trae 的缺省启发式。strategy=weighted_random 时本分支保持原样（零回归）。
+	if provider == auth.ProviderTrae && p.strategyForRealmLocked(realm) == WeightedRandom {
 		return p.pickTraeHighestCreditsLocked(cands, ch)
 	}
 	// top5 短名单按权重降序截断（而非 credits 单纯降序）：否则闲置补偿根本进不了
@@ -174,6 +181,23 @@ func (p *Pool) pick(tried map[auth.AccountKey]bool, reqModel, realm string, prov
 		if ti == bestTier {
 			ws = append(ws, weighted{e: e, w: p.routingWeightOf(e, maxCredits, now), tier: ti, cost1k: ci})
 		}
+	}
+	// 按地区独立的有序策略（轮询 / 顺序耗尽）：在成本层过滤后的候选集上顺序选择。
+	// 加权随机（默认）继续走下方 top5 + 加权抽签，零回归。
+	if strategy := p.strategyForRealmLocked(realm); strategy != WeightedRandom {
+		ordered := make([]*entry, 0, len(ws))
+		for _, w := range ws {
+			ordered = append(ordered, w.e)
+		}
+		e := p.pickOrderedLocked(ordered, tried, reqModel, realm, provider, strategy, explored, now)
+		e.lastUsed = now
+		p.pickSeq++
+		e.usedSeq = p.pickSeq
+		if explored {
+			log.Printf("[pool] cost explore model=%s realm=%q provider=%q acct=%s window=%s",
+				reqModel, realm, provider, logfmt.Label(e.a.UID, e.a.Nickname), p.costExploreInterval)
+		}
+		return e.a
 	}
 	// 等权重洗牌：仅当存在权重相等且候选数超过 top5 时，才对 ws 做 Fisher-Yates
 	// 洗牌（且**不消耗 p.randInt64N 注入源**，避免改变 pickWeighted 的确定性语义，

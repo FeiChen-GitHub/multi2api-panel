@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
 
@@ -251,6 +252,10 @@ type Config struct {
 	} `json:"upstash"`
 
 	Pool struct {
+		// Strategy 按地区独立的账号池调度策略（cn=domestic / global=international）。
+		// 缺省两域都 weighted_random（现状零回归）。可选 round_robin / sequential_exhaust。
+		Strategy     pool.RegionStrategies   `json:"strategy"`
+		AccountOrder pool.RegionAccountOrder `json:"account_order,omitempty"`
 		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
 		MaxInFlightGlobal  int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 风控紧域压低并发），0 = 回落默认 2
 		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
@@ -391,6 +396,7 @@ func Default() *Config {
 	// 配置层反向依赖 UI 层）。
 	c.Trae.CallbackPort = defaultTraeCallbackPort
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
+	c.Pool.Strategy = pool.RegionStrategies{Domestic: pool.WeightedRandom, International: pool.WeightedRandom}
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
 	// P1-1）；0/负数 normalize 回落默认（与 max_in_flight 的 0=不限语义不同，分档键
@@ -574,6 +580,11 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
+	// 调度策略归一化：空串 → weighted_random；非法值 fail fast（拼错的策略名静默
+	// 回落到默认会让用户以为轮询生效了，实际仍在加权随机）。
+	if c.Pool.Strategy, err = c.Pool.Strategy.Normalize(); err != nil {
+		return fmt.Errorf("pool.strategy: %w", err)
+	}
 	// providers 的键必须是已实现的 provider（DESIGN §8）：拼错时旧行为是静默忽略——
 	// 那一整块配置（enabled / api_host / work_enabled）全部失效，而用户看不出，
 	// 只会在"为什么 Trae 还是启用的 / 为什么 host 没生效"里绕圈。fail fast 更好。

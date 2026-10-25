@@ -127,6 +127,7 @@ func (p *Pool) load() {
 		return
 	}
 	p.applyAccountsLocked(sf.Accounts)
+	p.restoreSchedulingLocked(sf.Scheduling)
 }
 
 // applyAccountsLocked 用持久化账号状态覆盖/插入索引（placeholder 凭证，Add 时换全）。
@@ -258,6 +259,7 @@ func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
 	p.byKey = map[auth.AccountKey]*entry{}
 	p.applyAccountsLocked(s.Accounts)
+	p.restoreSchedulingLocked(s.Scheduling)
 }
 func (p *Pool) saveLocked() {
 	if p.stateFp == "" {
@@ -312,7 +314,7 @@ func (p *Pool) notePersistFail(err error) {
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
 func (p *Pool) stateOverviewLocked() stateFile {
 	now := time.Now()
-	sf := stateFile{Accounts: map[string]stateAccount{}}
+	sf := stateFile{Accounts: map[string]stateAccount{}, Scheduling: p.scheduling}
 	// 写侧按 AccountKey 作键（跨 provider 同 uid 不再互相覆盖），uid 存记录内。
 	for key, e := range p.byKey {
 		uid := ""

@@ -105,6 +105,10 @@ func main() {
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
 	p.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback) // 同 provider 内跨域回退（issue #135，默认关闭）
+	if err := p.SetScheduling(cfg.Pool.Strategy, cfg.Pool.AccountOrder); err != nil {
+		// normalize() 已校验过，这里失败属于内部不一致（不静默回落默认策略）。
+		log.Fatalf("pool.scheduling: %v", err)
+	}
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -604,6 +608,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
 	p.SetCrossDomainFallback(newCfg.Pool.CrossDomainFallback) // 跨域回退热生效
+	if err := p.SetScheduling(newCfg.Pool.Strategy, newCfg.Pool.AccountOrder); err != nil {
+		log.Printf("WARN: pool.scheduling 热应用失败（保留原策略）: %v", err)
+	}
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,

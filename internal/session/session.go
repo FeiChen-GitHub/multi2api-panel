@@ -220,6 +220,27 @@ func (r *Router) Resolve(key string) (string, bool) {
 	return r.ResolveForModel(key, "")
 }
 
+// LookupForModel 只复用已有有效绑定，不通过哈希为新会话分配账号。
+//
+// 有序账号池策略（轮询 / 顺序耗尽）用它保留粘性：这些策略的卖点是「选号由池的
+// 游标决定」，若新会话仍走 ResolveForModel 的一致性哈希，等于绕过了池的策略——
+// 哈希会把请求摊到任意号上，轮询/顺序耗尽的确定性就失效了。因此有序策略下：
+//   - 已有绑定 → 照常复用（滚动 lastActive）；
+//   - 未绑定 → 返回 false，交给 Pool 选号并在成功后 Bind。
+func (r *Router) LookupForModel(key, model string) (string, bool) {
+	now := time.Now()
+	available := r.availableSet(model)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, found := r.entries[key]
+	if !found || expired(e, now, r.cfg.TTL) || !available[e.key] {
+		return "", false
+	}
+	r.entries[key] = entry{key: e.key, lastActive: now}
+	r.cfg.Store.SetBind(key, string(e.key), r.cfg.TTL)
+	return string(e.key), true
+}
+
 // ResolveForModel 返回会话 key 在该模型上应绑定的账号主键字符串（AccountKey 的
 // 字符串形态）。调用方拿到主键后用 Pool.PickByKeyForModel / AuthByKey 还原账号。
 // 命中且账号在该模型可用 → 滚动 lastActive 并直接返回；否则（绑定号已冷却/占满/
