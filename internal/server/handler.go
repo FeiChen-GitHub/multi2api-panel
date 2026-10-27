@@ -910,6 +910,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 	// 人格门锁：命中即短路返回激活页正文。位置的两头都有讲究——
 	// 在 st 之后：命中也要进请求日志与统计，否则面板上会凭空少一条流量。
 	// 在选号之前：激活词不需要上游，命中请求连账号都不占，也不必走 Release。
+	h.latchDebugLog(body) // 调试专用：仅 WB2A_LATCH_DEBUG=1 输出，排查"content 是冷咖啡却不触发"
 	if h.cfg.PersonaLatch != nil {
 		if hit, ok := personaLatchInput(body); ok && h.cfg.PersonaLatch.MatchWholeTrimmed(hit) {
 			h.servePersonaLatch(w, proto, peek.Stream, peek.Model, st)
@@ -2047,6 +2048,50 @@ func personaLatchInput(body []byte) (string, bool) {
 	return "", false
 }
 
+// latchDebugLog 门锁判定调试快照：仅 WB2A_LATCH_DEBUG=1 时输出（生产零开销）。
+//
+// 用途：排查"我发的 content 明明就是 冷咖啡，却不短路返回激活页"。实战中
+// 见到的根因有两类，日志把两类都摊开：
+//  1. 客户端/中间层把原文包了一层，最后一条 user 消息根本不是裸激活词——
+//     例如 agent 框架把激活词塞进 "Generate the session title ..." 的 JSON，
+//     或在其后追加 <system-reminder> 技能目录；门锁只认「整条等于激活词」，
+//     于是判不等、请求落到上游、返回一个普通回答，看上去像"激活词没生效"。
+//  2. 输入混入 TrimSpace 去不掉的非打印字符（零宽空格 U+200B、BOM U+FEFF、
+//     行/段分隔符 U+2028/U+2029）——MatchWholeTrimmed 只去 Unicode 空白，
+//     残留一个零宽字符就会整句判不等。
+//
+// 这里把提取到的原文逐 rune 打 %U，让不可见字符与包装痕迹都现形。
+func (h *Handler) latchDebugLog(body []byte) {
+	if os.Getenv("WB2A_LATCH_DEBUG") != "1" {
+		return
+	}
+	if h.cfg.PersonaLatch == nil {
+		log.Print("[latch-debug] PersonaLatch == nil（门锁未加载：检查 prompt.persona_enabled / prompt.persona / 同名 .json）")
+		return
+	}
+	log.Printf("[latch-debug] PersonaLatch words=%v", h.cfg.PersonaLatch.Words)
+	hit, ok := personaLatchInput(body)
+	if !ok {
+		log.Print("[latch-debug] 未提取到 user 文本（无 user 消息，或 content 非文本/纯图片）")
+		return
+	}
+	log.Printf("[latch-debug] raw(len=%d): %s", len(hit), runeHex(hit))
+	trimmed := strings.TrimSpace(hit)
+	log.Printf("[latch-debug] trimmed(len=%d): %s  match=%v", len(trimmed), runeHex(trimmed), h.cfg.PersonaLatch.MatchWholeTrimmed(hit))
+}
+
+// runeHex 把字符串逐 rune 转成 U+XXXX 序列，便于肉眼识别零宽/不可见字符。
+func runeHex(s string) string {
+	if s == "" {
+		return "(empty)"
+	}
+	var b strings.Builder
+	for _, r := range s {
+		fmt.Fprintf(&b, "U+%04X ", r)
+	}
+	return strings.TrimSpace(b.String())
+}
+
 // latchContentText 取 content 文本：字符串直返，数组形态拼接各 part 的 text。
 // 与 session 包的 contentText 同逻辑，但那是未导出函数，为一行逻辑去改
 // session 的导出面不值得，这里本地实现一份。
@@ -2105,7 +2150,25 @@ func (h *Handler) servePersonaLatch(w http.ResponseWriter, proto protocol, strea
 	if proto == protoResponses {
 		writeLatchResponsesSSE(w, obj)
 	} else {
-		writeSSEFrame(w, obj)
+		// 标准 chat 流式形态：正文必须走 delta.content（分块），不能第一帧就塞
+		// 完整 message.content——严格流式客户端只累加 delta.content，第一帧如果
+		// 是 message 形态（content 在 message.content 里），聚合结果为空，报
+		// "completed response with no content"。对齐 upstream 实发：先一帧空
+		// delta（带 role），再一帧带内容的 delta，最后 finish_reason=stop + [DONE]。
+		writeSSEFrame(w, map[string]any{
+			"id": obj["id"], "object": "chat.completion.chunk",
+			"created": obj["created"], "model": model,
+			"choices": []any{map[string]any{
+				"index": 0, "delta": map[string]any{"role": "assistant", "content": ""},
+			}},
+		})
+		writeSSEFrame(w, map[string]any{
+			"id": obj["id"], "object": "chat.completion.chunk",
+			"created": obj["created"], "model": model,
+			"choices": []any{map[string]any{
+				"index": 0, "delta": map[string]any{"content": text},
+			}},
+		})
 		writeSSEFrame(w, map[string]any{
 			"id": obj["id"], "object": "chat.completion.chunk",
 			"created": obj["created"], "model": model,
@@ -2154,6 +2217,10 @@ func writeLatchResponsesSSE(w http.ResponseWriter, obj map[string]any) {
 	seq := int64(0)
 	emit := func(event string, data map[string]any) {
 		seq++
+		// type 必须写进 data：真实上游 ResponsesWriter.emit 同样带 "type": typ，
+		// 严格客户端（Codex 等）按 data.type 分发事件而不是 event: 行——缺它则
+		// 连 response.completed 都认不出，报 "stream closed before response.completed"。
+		data["type"] = event
 		data["sequence_number"] = seq
 		payload, _ := json.Marshal(data)
 		io.WriteString(w, "event: "+event+"\n")
