@@ -229,6 +229,14 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .acc.md .mark { display: none; }
 /* 操作列用 width:1px + nowrap 的经典技巧：列宽恰为内容宽，其余列按内容自适应 */
 .acc .c-acts { width: 1px; white-space: nowrap; }
+.acc .c-acts { width: 1px; white-space: nowrap; }
+/* 粘性会话表：会话键/账号窄列，长值省略号 */
+.acc.sticky .sess-key { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 11px; color: var(--ink-2); }
+.acc.sticky .who { max-width: 150px; }
+.acc.sticky .who .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acc.sticky .who .id { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px; }
+.acc.sticky th:nth-child(5), .acc.sticky td:nth-child(5) { width: 170px; max-width: 170px; }
+.acc.sticky td:nth-child(5) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 档位标签列：允许换行在标签之间（不拆字），并给足最小宽度 */
 .acc .efs { min-width: 150px; }
 .acc .efs .tag { margin: 1px 0; }
@@ -634,7 +642,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#config" data-view="config">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
         配置</a></li>
-      <li><a href="#logs" data-view="logs">
+      <li><a href="#sticky" data-view="sticky">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4 2h8v3.5L9.2 8l2.8 2.5V14H4v-3.5L6.8 8 4 5.5z"/><path d="M8 8v.01"/></svg>
+        粘性会话</a></li>      <li><a href="#logs" data-view="logs">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h7"/></svg>
         运行日志</a></li>
     </ul>
@@ -1154,6 +1164,36 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </form>
     </section>
 
+    <!-- 粘性会话 -->
+    <section class="view" id="view-sticky" hidden>
+      <div class="box">
+        <header>
+          <h3>粘性会话 <span class="hint">同一会话（conversation_id / prompt_cache_key / 内容派生键）绑定同一账号；解绑后该会话下次请求重新选号（Trae 走余额最高优先）</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="stickyNote">—</span>
+          <button class="xs" id="btnStickyReload">刷新</button>
+        </header>
+        <div class="fbar" id="stickyFilter">
+          <select id="stickyAcct" aria-label="按账号筛选">
+            <option value="">全部账号</option>
+          </select>
+          <label class="sel-note">已选 <b id="stickySel">0</b> 条</label>
+          <span class="grow"></span>
+          <button class="xs" id="btnStickyUnbind" disabled>解绑选中</button>
+          <button class="xs ghost danger" id="btnStickyUnbindAll" title="解绑当前筛选范围内的全部会话（不筛选时 = 全部会话）；不影响账号本身">解绑全部</button>
+        </div>
+        <div class="tbl-wrap">
+          <table class="acc sticky">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th>
+              <th style="width:34px"><input type="checkbox" id="stickyAll" aria-label="全选"></th>
+              <th>最后问题</th><th>会话标题</th><th>会话键</th><th>账号</th><th>模型</th><th>结果</th><th class="num">Token</th><th>来源 IP</th><th>User-Agent</th><th>最近活跃</th>
+            </tr></thead>
+            <tbody id="stickyBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
     <!-- 日志 -->
     <section class="view" id="view-logs" hidden>
       <div class="box">
@@ -1396,3 +1436,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <script src="mobile.js"></script>
 </body>
 </html>
+
+
+
+
+

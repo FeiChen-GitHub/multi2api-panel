@@ -350,7 +350,7 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志', sticky: '粘性会话' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -361,6 +361,7 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
+  if (v === 'sticky') loadSticky();
   // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
   // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
   // 完整逐包明细由卡片上的「检查」按钮显式触发（loadPackages/loadExpiry）。
@@ -884,6 +885,105 @@ $('logChips').addEventListener('click', ev => {
   document.querySelectorAll('#logChips .chip').forEach(c => c.classList.toggle('on', c === b));
   loadLogs();
 });
+/* ── 粘性会话 ─────────────────────────────────────────────────────── */
+/* 状态：stickyRows 全量绑定；stickyAcctFilter 当前账号筛选；stickySel 选中集合 */
+let stickyRows = [];
+let stickyAcctFilter = '';
+let stickySel = new Set();
+async function loadSticky(quiet) {
+  try {
+    const d = await api('sticky');
+    stickyRows = d.entries || [];
+    // 筛选下拉：按账号（UID + 昵称）聚合，保留当前选中项
+    const sel = $('stickyAcct');
+    const cur = sel.value;
+    const groups = {};
+    stickyRows.forEach(r => { const k = r.uid || r.account_key || ''; if (k) groups[k] = (r.nickname || r.uid || r.account_key); });
+    const opts = Object.keys(groups).sort().map(k => '<option value="' + esc(k) + '">' + esc(groups[k] || k) + '</option>').join('');
+    sel.innerHTML = '<option value="">全部账号</option>' + opts;
+    if (cur) sel.value = cur;
+    renderSticky();
+  } catch (e) {
+    if (!quiet) toast('读取粘性会话失败：' + e.message, 'err');
+    $('stickyBody').innerHTML = '<tr><td colspan="12"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+  }
+}
+function stickyFiltered() {
+  if (!stickyAcctFilter) return stickyRows;
+  return stickyRows.filter(r => (r.uid || r.account_key) === stickyAcctFilter);
+}
+function renderSticky() {
+  const rows = stickyFiltered();
+  $('stickyNote').textContent = rows.length + ' / ' + stickyRows.length + ' 条绑定';
+  // 全选按当前筛选
+  $('stickySel').textContent = stickySel.size;
+  const tb = $('stickyBody');
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="12"><div class="empty">' + (stickyRows.length ? '当前筛选无匹配' : '暂无粘性会话') + '</div></td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map(r => {
+    const key = r.session_key;
+    // 账号标识：Trae 加小标签（同账号池 realm-tag），域另列
+    const acct = (r.nickname ? esc(r.nickname) + ' <span style="color:var(--ink-3)">' : '') + esc(r.uid || r.account_key) + (r.nickname ? '</span>' : '');
+    const providerTag = r.provider === 'trae' ? ' <span class="realm-tag">Trae</span>' : '';
+    const realmTag = r.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '';
+    const outcome = r.outcome ? (r.outcome === 'success' ? '<span style="color:var(--ok)">成功</span>' : '<span style="color:var(--bad)">' + esc(r.outcome) + '</span>') : '—';
+    const title = r.title ? '<div class="note" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(r.title) + '">' + esc(r.title) + '</div>' : '—';
+    const lastQ = r.last_question ? '<div class="note" style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(r.last_question) + '">' + esc(r.last_question) + '</div>' : '—';
+    return '<tr>' +
+      '<td class="mark" aria-hidden="true"><i></i></td>' +
+      '<td><input type="checkbox" data-sk="' + esc(key) + '"' + (stickySel.has(key) ? ' checked' : '') + '></td>' +
+      '<td>' + lastQ + '</td>' +
+      '<td>' + title + '</td>' +
+      '<td class="sess-key" title="' + esc(key) + '">' + esc(key) + '</td>' +
+      '<td class="who"><div class="nm">' + acct + providerTag + realmTag + '</div><div class="id">' + esc(r.account_key) + '</div></td>' +
+      '<td>' + (r.model ? esc(r.model) : '—') + '</td>' +
+      '<td>' + outcome + '</td>' +
+      '<td class="num">' + (r.total_tokens ? formatTokenCount(r.total_tokens) : '—') + '</td>' +
+      '<td class="num" style="color:var(--ink-3)">' + (r.client_ip ? esc(r.client_ip) : '—') + '</td>' +
+      '<td class="num" style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(r.user_agent || '') + '">' + (r.user_agent ? esc(r.user_agent) : '—') + '</td>' +
+      '<td class="num" style="color:var(--ink-3)">' + ago(r.last_active) + '</td>' +
+      '</tr>';
+  }).join('');
+}
+$('stickyAll').addEventListener('change', ev => {
+  const rows = stickyFiltered();
+  if (ev.target.checked) rows.forEach(r => stickySel.add(r.session_key));
+  else rows.forEach(r => stickySel.delete(r.session_key));
+  renderSticky();
+});
+$('stickyBody').addEventListener('change', ev => {
+  const cb = ev.target.closest('input[data-sk]');
+  if (!cb) return;
+  if (cb.checked) stickySel.add(cb.dataset.sk); else stickySel.delete(cb.dataset.sk);
+  $('stickySel').textContent = stickySel.size;
+});
+$('stickyAcct').addEventListener('change', ev => { stickyAcctFilter = ev.target.value; renderSticky(); });
+$('btnStickyReload').onclick = () => loadSticky();
+async function stickyUnbindKeys(keys, label) {
+  if (!keys.length) return;
+  const r = await api('sticky/unbind', { method: 'POST', body: JSON.stringify({ keys }) });
+  toast(label + '，解绑 ' + r.unbound + ' 条', 'ok');
+  stickySel.clear();
+  loadSticky();
+}
+$('btnStickyUnbind').onclick = async () => {
+  const keys = Array.from(stickySel);
+  if (!keys.length) { toast('先勾选要解绑的会话', 'warn'); return; }
+  try { await stickyUnbindKeys(keys, '已解绑选中会话'); }
+  catch (e) { toast('解绑失败：' + e.message, 'err'); }
+};
+$('btnStickyUnbindAll').onclick = async () => {
+  const rows = stickyFiltered();
+  if (!rows.length) return;
+  if (!confirm('将解绑当前筛选范围内的 ' + rows.length + ' 条粘性会话' + (stickyAcctFilter ? '（已按账号筛选）' : '（未筛选 = 全部会话）') + '。解绑后这些会话下次请求会重新选号，不影响账号本身。确认？')) return;
+  const keys = rows.map(r => r.session_key);
+  try { await stickyUnbindKeys(keys, '已解绑 ' + rows.length + ' 条会话'); }
+  catch (e) { toast('解绑失败：' + e.message, 'err'); }
+};
+/* 按钮状态：有选中才可点 */
+setInterval(() => { const b = $('btnStickyUnbind'); if (b) b.disabled = stickySel.size === 0; }, 500);
 async function loadLogs() {
   const box = $('logBox');
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
@@ -1079,7 +1179,7 @@ function renderRequestTable() {
       '<td class="num">' + reqCreditCell(e) + '</td>' +
       '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '</tr>';
-  }).join('') || '<tr><td colspan="11" class="empty">' +
+  }).join('') || '<tr><td colspan="12" class="empty">' +
       (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
 
   const filtered = list.length !== reqEntries.length;
@@ -3548,3 +3648,9 @@ if ($('btnExpFold')) {
   };
 }
 applyExpFold();
+
+
+
+
+
+

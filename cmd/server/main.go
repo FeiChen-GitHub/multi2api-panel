@@ -329,6 +329,10 @@ func main() {
 	up.SetCreditObserver(creditHist.Observe)
 	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
 
+	// 会话最后一条 user 消息缓存（进程内、不落盘）：面板「粘性会话」展示最近一问。
+	// 有界（2000 条）+ TTL（24h），随进程生命周期。
+	userMsgCache := session.NewUserMessageCache(2000, 24*time.Hour)
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -340,6 +344,42 @@ func main() {
 		APIKey:      cfg.APIKey,
 		RedisMode:   redisMode,
 		StickyCount: sessCount,
+		// 粘性会话管理（面板「粘性会话」视图）：枚举 + 批量解绑。
+		// 只在粘性路由启用时注入（sessRouter != nil），否则面板 501 且前端隐藏入口。
+		StickySessions: func() []panel.StickySession {
+			if sessRouter == nil {
+				return nil
+			}
+			rows := sessRouter.Bindings()
+			out := make([]panel.StickySession, 0, len(rows))
+			for _, b := range rows {
+				ss := panel.StickySession{
+					SessionKey: b.SessionKey,
+					AccountKey: string(b.AccountKey),
+					LastActive: b.LastActive,
+				}
+				if st, ok := p.StatusByKey(b.AccountKey); ok {
+					ss.UID = st.UID
+					ss.Nickname = st.Nickname
+					ss.Provider = string(st.Provider)
+					ss.Realm = st.Realm
+				}
+				// 最后一条 user 消息：进程内缓存（可能无 → 保持空，前端 "-" 兜底）。
+				if userMsgCache != nil {
+					if q, ok := userMsgCache.Get(b.SessionKey); ok {
+						ss.LastQuestion = q
+					}
+				}
+				out = append(out, ss)
+			}
+			return out
+		},
+		UnbindStickySessions: func(keys []string) (int, error) {
+			if sessRouter == nil {
+				return 0, fmt.Errorf("粘性路由未启用")
+			}
+			return sessRouter.UnbindMany(keys), nil
+		},
 		Version:     appVersion,
 		Live:        live,
 		// Trae 网页登录的 OAuth host 覆盖（面板落盘凭证前换 token / 查账号信息用）。
@@ -373,6 +413,7 @@ func main() {
 		TraeWorkDisabled: traeWorkDisabled,
 		APIKey:           cfg.APIKey,
 		Session:          sessRouter,
+		UserMessages:      userMsgCache,
 		StickyCount:      sessCount,
 		RedisMode:        redisMode,
 		SoftCooldown:     cfg.SoftRateDur,
@@ -693,3 +734,4 @@ func mergedJSON(m map[string]any) []byte {
 	}
 	return b
 }
+

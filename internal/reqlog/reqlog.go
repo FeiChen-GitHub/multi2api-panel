@@ -89,6 +89,13 @@ type Event struct {
 	ErrorMessage string `json:"error_message,omitempty"`
 	ClientIP     string `json:"client_ip,omitempty"`
 	UserAgent    string `json:"user_agent,omitempty"`
+	// SessionKey 粘性会话键（provider|sessKey，与 session.Bindings 的键对齐）：
+	// 面板「粘性会话」按它聚合同一会话的标题/结果/模型/来源/token。
+	// 空 = 无会话键请求（不参与聚合），旧归档读取时恒空。
+	SessionKey string `json:"session_key,omitempty"`
+	// Title 会话标题：首条 user 消息文本截断（提取见 session.ConversationTitle）。
+	// 供面板一眼区分"这是哪段对话"。
+	Title string `json:"title,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），
@@ -653,3 +660,4 @@ func (w *archiveWriter) errString() string {
 	defer w.lastErrMu.Unlock()
 	return w.lastErr
 }
+

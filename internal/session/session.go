@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -345,6 +346,38 @@ func (r *Router) Unbind(key string) bool {
 	return found
 }
 
+// Binding 一条会话绑定（面板只读展示；SessionKey 含 provider 前缀）。
+type Binding struct {
+	SessionKey string          // 会话键（provider|sessKey，含 provider 前缀）
+	AccountKey auth.AccountKey // 绑定的账号主键
+	LastActive time.Time       // 最近活跃（滚动续期时刻）
+}
+
+// Bindings 返回全部有效会话绑定的快照（会话键 → 账号主键）。
+// 供面板「粘性会话」视图枚举；返回值按 SessionKey 排序，输出稳定。
+func (r *Router) Bindings() []Binding {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]Binding, 0, len(r.entries))
+	for key, e := range r.entries {
+		out = append(out, Binding{SessionKey: key, AccountKey: e.key, LastActive: e.lastActive})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SessionKey < out[j].SessionKey })
+	return out
+}
+
+// UnbindMany 解绑多个会话键，返回实际解绑条数。只删内存与 Redis 镜像，
+// 不改动账号池。供面板「批量解绑」；单会话解绑直接走 Unbind。
+func (r *Router) UnbindMany(keys []string) int {
+	n := 0
+	for _, k := range keys {
+		if r.Unbind(k) {
+			n++
+		}
+	}
+	return n
+}
+
 // Count 返回当前绑定数（供 /status 观测）。
 func (r *Router) Count() int {
 	r.mu.RLock()
@@ -618,3 +651,261 @@ func strOrEmpty(v any) string {
 	s, _ := v.(string)
 	return s
 }
+
+
+
+
+
+
+// ConversationTitle 从请求体提取会话标题：取首条 user 消息的文本（与
+// deriveKey 同口径：纯文本拼接，非文本 part 占位），截断到 maxTitleLen。
+// 供请求归档写入 Title 字段（面板「粘性会话」据此区分是哪段对话）。
+// 无 user 消息/无文本/坏 JSON 返回 ""（不伪造）。
+func ConversationTitle(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return ""
+	}
+	// chat 形状：messages 数组。
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		// responses 形状兜底：input 数组（message 项带 role，其他项跳过）。
+		msgs, ok = obj["input"].([]any)
+		if !ok {
+			return ""
+		}
+	}
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strOrEmpty(msg["role"]) != "user" {
+			continue
+		}
+		text := messageText(msg["content"])
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		// 剥离注入上下文（environment_context / INSTRUCTIONS / AGENTS 头）；纯注入则看下一条。
+		if text = stripInjectedContext(text); text == "" {
+			continue
+		}
+		// 单行化 + 截断：多行正文/超长首条只留可辨识的开头。
+		text = strings.Join(strings.Fields(text), " ")
+		if len(text) > maxTitleLen {
+			return text[:maxTitleLen]
+		}
+		return text
+	}
+	return ""
+}
+
+// maxTitleLen 会话标题截断长度（字节；与 maxChatErrorSummaryLen 同量级）。
+const maxTitleLen = 120
+// stripInjectedContext 剥离客户端注入的工程上下文，返回剩余的"真实文本"：
+// Codex 系客户端把 <environment_context>、AGENTS.md 指令（<INSTRUCTIONS>）
+// 作为首条 user 消息塞进请求（可能与真实问题同段）。标题/最近一问提取
+// 必须先剥离这类噪音，否则「会话标题」显示的是环境上下文而非对话内容。
+//
+// 剥离规则：
+//   - <environment_context>...</environment_context> XML 块整体删掉；
+//   - <INSTRUCTIONS>...</INSTRUCTIONS> 块整体删掉（AGENTS.md 注入形态）；
+//   - 剩余文本去空白返回；剥离后为空返回 ""（纯注入消息）。
+func stripInjectedContext(text string) string {
+	t := strings.TrimSpace(text)
+	for {
+		// 1) <environment_context> 前缀块：Codex 实际不闭合，剥到 <INSTRUCTIONS>
+		//    或整段结束（若其后还有真实问题则保留）。
+		if strings.HasPrefix(t, "<environment_context>") {
+			rest := t[len("<environment_context>"):]
+			// 有闭合 </environment_context> → 剥到闭合之后（保留其后真实问题）。
+			// 无闭合（Codex 实际形态）→ 剥到下一注入边界或整段结束。
+			cut := len(rest)
+			if e := strings.Index(rest, "</environment_context>"); e >= 0 {
+				cut = e + len("</environment_context>")
+			} else {
+				for _, marker := range []string{"<INSTRUCTIONS>", "# AGENTS.md instructions for"} {
+					if i := strings.Index(rest, marker); i >= 0 && i < cut {
+						cut = i
+					}
+				}
+			}
+			t = strings.TrimSpace(rest[cut:])
+			if t == "" {
+				return ""
+			}
+			continue
+		}
+		// 2) <INSTRUCTIONS> 前缀块：剥到闭合 </INSTRUCTIONS>；无闭合剥到
+		//    下一个注入边界或结束。
+		if strings.HasPrefix(t, "<INSTRUCTIONS>") {
+			if e := strings.Index(t, "</INSTRUCTIONS>"); e >= 0 {
+				t = strings.TrimSpace(t[e+len("</INSTRUCTIONS>"):])
+			} else {
+				t = ""
+			}
+			if t == "" {
+				return ""
+			}
+			continue
+		}
+		// 3) AGENTS.md 指令头：整条都是工程上下文（Codex 把它放 <INSTRUCTIONS>
+		//    之前）。剥到 <INSTRUCTIONS> 或结束。
+		if strings.HasPrefix(t, "# AGENTS.md instructions for") {
+			rest := t[len("# AGENTS.md instructions for"):]
+			if i := strings.Index(rest, "<INSTRUCTIONS>"); i >= 0 {
+				rest = rest[i:]
+				t = strings.TrimSpace(rest)
+			} else {
+				t = ""
+			}
+			if t == "" {
+				return ""
+			}
+			continue
+		}
+		break
+	}
+	return t
+}
+// LastUserMessage 从请求体提取**最后一条 user 消息**的文本（chat 形状 messages；
+// 与 ConversationTitle 相对：标题取首条、这里取最后一条——展示"最近一问"）。
+// 单行化并截断到 maxLastMsgLen；无 user 消息/坏 JSON 返回 ""。
+func LastUserMessage(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return ""
+	}
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		msgs, ok = obj["input"].([]any)
+		if !ok {
+			return ""
+		}
+	}
+	var last string
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strOrEmpty(msg["role"]) != "user" {
+			continue
+		}
+		text := messageText(msg["content"])
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		// 剥离注入上下文（environment_context / INSTRUCTIONS / AGENTS 头）；纯注入则看下一条。
+		if text = stripInjectedContext(text); text == "" {
+			continue
+		}
+		last = text
+	}
+	if last == "" {
+		return ""
+	}
+	last = strings.Join(strings.Fields(last), " ")
+	if len(last) > maxLastMsgLen {
+		return last[:maxLastMsgLen]
+	}
+	return last
+}
+
+// maxLastMsgLen 最后一条 user 消息缓存长度上限（字节）：只缓存可辨识的
+// 开头，避免长上下文/贴代码把进程内存撑大。
+const maxLastMsgLen = 200
+
+// UserMessageCache 进程内缓存每个粘性会话的"最后一条 user 消息"（有界 + TTL）。
+// 只进内存、不落盘（符合内容不存档的约束）；供面板「粘性会话」展示最近一问。
+// key 与粘性绑定对齐（provider|sessKey）。
+type UserMessageCache struct {
+	mu  sync.Mutex
+	m   map[string]cacheEntry
+	max int
+	ttl time.Duration
+}
+
+type cacheEntry struct {
+	text string
+	at   time.Time
+}
+
+// NewUserMessageCache 构建有界缓存；max<=0 回落 2000，ttl<=0 回落 24h。
+func NewUserMessageCache(max int, ttl time.Duration) *UserMessageCache {
+	if max <= 0 {
+		max = 2000
+	}
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	return &UserMessageCache{m: make(map[string]cacheEntry, max), max: max, ttl: ttl}
+}
+
+// Set 写入/刷新某会话的最后一条 user 消息；key 空忽略。
+func (c *UserMessageCache) Set(key, text string) {
+	if key == "" || text == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	if len(c.m) >= c.max {
+		// 满：先清过期，仍满则整体重建（保留最新 max/2 条）——简单有界，
+		// 不维护 LRU 链表：面板只读最近活跃会话，冷条目淘汰可接受。
+		c.pruneLocked(now)
+		if len(c.m) >= c.max {
+			keep := make(map[string]cacheEntry, c.max/2)
+			for k, e := range c.m {
+				keep[k] = e
+				if len(keep) >= c.max/2 {
+					break
+				}
+			}
+			c.m = keep
+		}
+	}
+	c.m[key] = cacheEntry{text: text, at: now}
+}
+
+// Get 返回某会话缓存的最后一条 user 消息；过期条目惰性删除。
+func (c *UserMessageCache) Get(key string) (string, bool) {
+	if key == "" {
+		return "", false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.m[key]
+	if !ok {
+		return "", false
+	}
+	if time.Since(e.at) > c.ttl {
+		delete(c.m, key)
+		return "", false
+	}
+	return e.text, true
+}
+
+// pruneLocked 清理过期条目；调用方需已持 c.mu。
+func (c *UserMessageCache) pruneLocked(now time.Time) {
+	for k, e := range c.m {
+		if now.Sub(e.at) > c.ttl {
+			delete(c.m, k)
+		}
+	}
+}
+
+
+
+
+
+

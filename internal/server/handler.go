@@ -43,6 +43,9 @@ type Config struct {
 	MaxRotate        int    // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
+	// UserMessages 进程内缓存"每个粘性会话最后一条 user 消息"（不落盘、有界）；
+	// nil = 关闭（粘性 tab 的「最后问题」列显示 —）。
+	UserMessages *session.UserMessageCache
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
 	StickyCount func() int
 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
@@ -886,7 +889,7 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 	crossRealm := !realmExplicit && h.cfg.Pool.CrossDomainFallback()
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	st := newChatStat(time.Now(), rawBody, peek.Stream)
+	st := newChatStat(time.Now(), body, peek.Stream)
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
@@ -938,6 +941,18 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 	stickySessKey := sessKey
 	if sessKey != "" {
 		stickySessKey = string(provider) + "|" + sessKey
+
+	// 会话维度入统计/归档：粘性键（provider|sessKey）与标题（首条 user 文本）
+	// 供面板「粘性会话」聚合展示；无会话键请求保持空（不参与聚合）。
+	st.sessionKey = stickySessKey
+	// 缓存"最后一条 user 消息"（进程内、不落盘）：面板粘性 tab 展示最近一问。
+	// body 是 chat 形状（responses 已转换），在人格改写前取——改写会动消息内容。
+	if h.cfg.UserMessages != nil && stickySessKey != "" {
+		if msg := session.LastUserMessage(body); msg != "" {
+			h.cfg.UserMessages.Set(stickySessKey, msg)
+		}
+	}
+
 	}
 	var stickyKey auth.AccountKey
 	if h.cfg.Session != nil && sessKey != "" {

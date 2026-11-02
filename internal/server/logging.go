@@ -19,6 +19,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -75,6 +76,10 @@ type chatStat struct {
 	// 关闭，或非 chat 路径），展示层一律以 "-" 兜底。
 	clientIP  string
 	userAgent string
+	// sessionKey 粘性会话键（provider|sessKey，与 session.Bindings 对齐）；
+	// title 会话标题（首条 user 文本截断）。面板「粘性会话」据此聚合。
+	sessionKey string
+	title      string
 	logged    bool
 }
 
@@ -84,7 +89,7 @@ func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 	if stream {
 		mode = "stream"
 	}
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1, title: session.ConversationTitle(body)}
 }
 
 // maxChatErrorSummaryLen 请求归档里保留的失败摘要上限。错误原文可能带整页
@@ -539,6 +544,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.CacheMissTokens = s.cacheMiss
 		e.ErrorCode = s.errorCode
 		e.ErrorMessage = s.errorMsg
+		e.SessionKey = s.sessionKey
+		e.Title = s.title
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
@@ -722,3 +729,7 @@ func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64)
 	c.last[model] = now
 	log.Printf("WARN: [server] cache miss: model=%s 本次大前缀未命中（prompt=%d miss=%d，此前观测到过命中）；上游前缀缓存重算，费用会显著升高", model, prompt, miss)
 }
+
+
+
+

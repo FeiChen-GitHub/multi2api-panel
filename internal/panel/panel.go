@@ -59,6 +59,13 @@ type Config struct {
 
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
+	// StickySessions 返回粘性会话绑定明细（面板「粘性会话」视图枚举）；
+	// nil = 粘性路由未启用/未注入，列表接口返回 501。
+	StickySessions func() []StickySession
+	// UnbindStickySessions 批量解绑指定会话键，返回实际解绑条数；
+	// nil = 粘性路由未启用/未注入，解绑接口返回 501。
+	UnbindStickySessions func(keys []string) (int, error)
+
 
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
@@ -222,6 +229,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/compensation", p.withAuth(p.compensation))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/compensation", p.withAuth(p.accountCompensationClaim))
 	p.mux.HandleFunc("POST /panel/api/compensation_all", p.withAuth(p.compensationAll))
+	p.mux.HandleFunc("GET /panel/api/sticky", p.withAuth(p.stickyList))
+	p.mux.HandleFunc("POST /panel/api/sticky/unbind", p.withAuth(p.stickyUnbind))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -1185,3 +1194,6 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
 }
+
+
+
