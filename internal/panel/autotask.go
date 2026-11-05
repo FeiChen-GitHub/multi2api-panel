@@ -710,6 +710,16 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	isMP := isMPTaskCode(act.TaskCode)
+	// 上游锁定（Sequential 链每日零点解锁一环 / 未开放）：accept 不落账、行为事件
+	// 也不计分，跑动作只会白耗真实对话配额，还留下「已上报但进度 0/x」的误导。
+	// 与 growthPending 同口径直接跳过，到点解锁后自然回到待办。
+	if before.Locked {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "skipped": true,
+			"message": "上游未解锁（Sequential 链每日零点解锁一环），到点后再试",
+		})
+		return
+	}
 	if before.Claimed {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skipped": true, "message": "该任务已领取过奖励"})
 		return
@@ -1316,6 +1326,15 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 		if before == nil {
 			item["status"] = "skipped"
 			item["message"] = "该账号无此任务"
+			out = append(out, item)
+			continue
+		}
+		// 上游锁定：accept 不落账、行为事件不计分（Sequential 链每日零点解锁一环）。
+		// 直接跳过而不是跑一遍再报「accept 未登记生效」——后者每轮都要多打几个
+		// 上游请求，正是限流雪崩的残留来源。到点解锁后自动回到待办。
+		if before.Locked {
+			item["status"] = "skipped"
+			item["message"] = "上游未解锁（Sequential 链每日零点解锁一环），到点后自动进入待办"
 			out = append(out, item)
 			continue
 		}
