@@ -24,11 +24,13 @@ package panel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math/rand/v2"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -173,6 +175,40 @@ var autoActions = []autoAction{
 		TaskCode: "Sequential_Tasks_7",
 		Desc:     "体验灵感功能（预留，疑 PC 口径 +500c+5e）：accept → 灵感事件组（PC+mp 双形态）→ 领奖（判据待解锁验证）",
 		run:      runSequentialPlaybook,
+	},
+	// 2026-11 新增「体验指定专家」系列：判据与 expert_5 同源（真实召唤链 +
+	// 真实 chat 的 requestId + expert_actual_use），但目标专家由任务自身指定，
+	// 不能像 expert_5 那样随便取市场榜首。2026-11-05 实测逐条点亮并到账。
+	{
+		TaskCode: "WorkBuddy_Valorant",
+		Desc:     "体验「无畏契约拼豆专家」：按标题搜市场 → 召唤链 → 真实对话 → expert_actual_use（已验证点亮 +100c+5e）",
+		run:      expertSpecified("WorkBuddy_Valorant"),
+	},
+	{
+		TaskCode: "expert_use_maidehao",
+		Desc:     "体验「中国电商运营专家」：召唤链 + 真实对话（已验证点亮 +50c+5e）",
+		run:      expertSpecified("expert_use_maidehao"),
+	},
+	{
+		TaskCode: "expert_use_douyinyin",
+		Desc:     "体验「抖音策略师」：召唤链 + 真实对话（已验证点亮 +50c+5e）",
+		run:      expertSpecified("expert_use_douyinyin"),
+	},
+	{
+		TaskCode: "expert_use_shangjia_xuanchuan",
+		Desc:     "体验「商家宣传页与海报设计师」：召唤链 + 真实对话（已验证点亮 +50c+5e）",
+		run:      expertSpecified("expert_use_shangjia_xuanchuan"),
+	},
+	{
+		TaskCode: "expert_use_bowangwang",
+		Desc:     "体验「直播电商教练」：召唤链 + 真实对话（已验证点亮 +50c+5e）",
+		run:      expertSpecified("expert_use_bowangwang"),
+	},
+	{
+		TaskCode: "wb_wechat_oa_subscribe_task",
+		Desc:     "关注公众号满 24 小时：判据为真实微信关注回执 + 计时，纯 API 无法代完成",
+		Attempt:  true,
+		run:      runWechatOA,
 	},
 }
 
@@ -1127,78 +1163,161 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 // 全量自动完成
 // ---------------------------------------------------------------------------
 
+// taskSnapshot 一次拉取的任务快照（默认口径 + 小程序口径合并）。
+//
+// 为什么需要：任务动作的"前置状态判断"过去每项都调用一次 ListTasks，
+// 「一键完成」25 项就会打出上百次列表请求（每项还可能叠加 4 次达标轮询），
+// 2026-11-05 实测跑到第 20 项就撞上游 429 soft_rate，用户看到一片"查询失败"。
+// 快照把前置判断降到零请求，只在真正执行过动作后才回读一次进度。
+type taskSnapshot struct {
+	byCode  map[string]upstream.Task
+	fetched time.Time
+}
+
+// loadTaskSnapshot 拉取默认与小程序两个口径的任务列表并按 task_code 合并
+// （默认口径优先；mp 列表失败静默——没有 mp 任务的部署零影响）。
+func (p *Panel) loadTaskSnapshot(a *auth.Auth) (*taskSnapshot, error) {
+	tasks, err := p.cfg.Upstream.ListTasks(a)
+	if err != nil {
+		return nil, err
+	}
+	s := &taskSnapshot{byCode: make(map[string]upstream.Task, len(tasks)), fetched: time.Now()}
+	for _, t := range tasks {
+		s.byCode[t.TaskCode] = t
+	}
+	if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
+		for _, t := range mpTasks {
+			if _, ok := s.byCode[t.TaskCode]; !ok {
+				s.byCode[t.TaskCode] = t
+			}
+		}
+	}
+	return s, nil
+}
+
+// get 取快照里的任务；不存在返回 nil（该账号无此任务）。
+func (s *taskSnapshot) get(code string) *upstream.Task {
+	if s == nil {
+		return nil
+	}
+	if t, ok := s.byCode[code]; ok {
+		cp := t
+		return &cp
+	}
+	return nil
+}
+
+// put 用回读结果更新快照（避免同一任务在后续判断里读到旧状态）。
+func (s *taskSnapshot) put(t *upstream.Task) {
+	if s == nil || t == nil {
+		return
+	}
+	s.byCode[t.TaskCode] = *t
+}
+
+// unaccepted 列出尚未接受、未领取、未锁定的任务码。mp 为 true 时只返回
+// 小程序口径专属码（提交时必须与默认口径分开，混提交会让 mp 任务报 not found）。
+func (s *taskSnapshot) unaccepted(mp bool) []string {
+	if s == nil {
+		return nil
+	}
+	var codes []string
+	for code, t := range s.byCode {
+		if mp != isMPTaskCode(code) {
+			continue
+		}
+		if t.Claimed || t.Locked || t.AcceptStatus == "accepted" || t.AcceptStatus == "completed" {
+			continue
+		}
+		codes = append(codes, code)
+	}
+	sort.Strings(codes) // 稳定顺序，便于日志对照
+	return codes
+}
+
+// isSoftRateErr 报告错误是否为上游软限流（429 / soft_rate 语义）。
+// 「一键完成」据此提前收手，而不是把余下每一项都打成失败。
+func isSoftRateErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *upstream.Error
+	if errors.As(err, &ue) {
+		return ue.Kind == upstream.ErrSoftRate
+	}
+	return strings.Contains(err.Error(), "soft_rate")
+}
+
 // runAutoAll 对单账号依次执行所有可自动化任务，返回逐项结果。
 // 供「一键完成全部可自动任务」使用；单项失败不影响后续项。
 //
-// 流程：先把所有未接受的任务批量 accept（规范状态机；上游脚本建议"先 accept"），
-// 再逐项执行行为链路。accept 不是进度产生的必要条件，但让后续状态流转规范。
+// 流程：起始拉一次任务快照 → 批量 accept 未接受的任务 → 逐项执行行为链路 →
+// 仅对执行过的任务回读一次进度并自动领奖。
+//
+// 上游请求预算：前置判断全部读快照（零请求），因此 25 项全量只在开头产生
+// 2 次列表请求；每项执行后 1 次回读。一旦撞 429，本轮立即停止后续上游调用，
+// 已完成的项如实回报、未执行的项标注"因限流提前结束"，用户稍后重试即可
+// （动作幂等，已完成的任务会自动跳过）。
 func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 	var out []map[string]any
 
+	snap, err := p.loadTaskSnapshot(a)
+	if err != nil {
+		return append(out, map[string]any{
+			"task_code": "(任务列表)", "status": "error",
+			"message": "查询任务列表失败: " + err.Error(),
+		})
+	}
+
 	// 阶段 0：批量接受尚未接受的任务（失败不阻塞——行为事件才是进度唯一判据）。
-	if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
-		var codes []string
-		for _, t := range tasks {
-			if !t.Claimed && !t.Locked && t.AcceptStatus != "accepted" && t.AcceptStatus != "completed" {
-				codes = append(codes, t.TaskCode)
-			}
+	// 默认与 mp 口径必须分开提交（端标记不同，混提交会让 mp 任务报 not found）。
+	acceptPhase := func(codes []string, mp bool) {
+		if len(codes) == 0 {
+			return
 		}
-		if len(codes) > 0 {
-			if err := p.cfg.Upstream.AcceptTasks(a, codes); err != nil {
-				out = append(out, map[string]any{
-					"task_code": "(批量接受)", "status": "error",
-					"message": "接受任务失败（不阻塞后续）: " + err.Error(),
-				})
-			} else {
-				out = append(out, map[string]any{
-					"task_code": "(批量接受)", "status": "done",
-					"message": fmt.Sprintf("已接受 %d 个任务", len(codes)),
-				})
-				time.Sleep(reportGap)
-			}
+		var aerr error
+		if mp {
+			aerr = p.cfg.Upstream.AcceptTasksMP(a, codes)
+		} else {
+			aerr = p.cfg.Upstream.AcceptTasks(a, codes)
 		}
+		label := "(批量接受)"
+		if mp {
+			label = "(批量接受-mp)"
+		}
+		if aerr != nil {
+			out = append(out, map[string]any{
+				"task_code": label, "status": "error",
+				"message": "接受任务失败（不阻塞后续）: " + aerr.Error(),
+			})
+			return
+		}
+		out = append(out, map[string]any{
+			"task_code": label, "status": "done",
+			"message": fmt.Sprintf("已接受 %d 个任务", len(codes)),
+		})
+		time.Sleep(reportGap)
 	}
+	acceptPhase(snap.unaccepted(false), false)
+	acceptPhase(snap.unaccepted(true), true)
 
-	// 阶段 0b：小程序口径任务单独接受（默认列表不含 mp 码；失败不阻塞）。
-	if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil {
-		var mpCodes []string
-		for _, t := range mpTasks {
-			if !t.Claimed && !t.Locked && t.AcceptStatus != "accepted" && t.AcceptStatus != "completed" {
-				mpCodes = append(mpCodes, t.TaskCode)
-			}
-		}
-		if len(mpCodes) > 0 {
-			if err := p.cfg.Upstream.AcceptTasksMP(a, mpCodes); err != nil {
-				out = append(out, map[string]any{
-					"task_code": "(批量接受-mp)", "status": "error",
-					"message": "接受小程序任务失败（不阻塞后续）: " + err.Error(),
-				})
-			} else {
-				out = append(out, map[string]any{
-					"task_code": "(批量接受-mp)", "status": "done",
-					"message": fmt.Sprintf("已接受 %d 个小程序任务", len(mpCodes)),
-				})
-				time.Sleep(reportGap)
-			}
-		}
-	}
-
+	limited := false // 一旦撞限流就停止一切后续上游调用
 	for _, act := range autoActions {
 		item := map[string]any{"task_code": act.TaskCode, "desc": act.Desc}
-		before, err := p.taskByCode(a, act.TaskCode)
-		if err != nil {
-			item["status"] = "error"
-			item["message"] = "查询失败: " + err.Error()
+		if limited {
+			item["status"] = "skipped"
+			item["message"] = "上游限流，本轮提前结束；稍后重试会从未完成项继续（已完成的自动跳过）"
 			out = append(out, item)
 			continue
 		}
+		before := snap.get(act.TaskCode)
 		if before == nil {
 			item["status"] = "skipped"
 			item["message"] = "该账号无此任务"
 			out = append(out, item)
 			continue
 		}
-		if before.Claimed || before.Current >= before.Target && before.Target > 0 {
+		if before.Claimed || (before.Target > 0 && before.Current >= before.Target) {
 			item["status"] = "skipped"
 			msg := "已完成（" + taskProgressText(before) + "）"
 			// 达标未领：先补领再跳过（issue #174）。经真实对话等链路点亮的
@@ -1213,6 +1332,9 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 				case cerr != nil:
 					item["claim_error"] = cerr.Error()
 					msg += "；补领失败（可在列表手动重试）"
+					if isSoftRateErr(cerr) {
+						limited = true
+					}
 				case credit > 0 || energy > 0:
 					item["claimed"] = true
 					item["credit"] = credit
@@ -1226,27 +1348,48 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 			out = append(out, item)
 			continue
 		}
+
 		msg, err := act.run(p, a)
 		if err != nil {
 			item["status"] = "error"
 			item["message"] = err.Error()
+			if isSoftRateErr(err) {
+				limited = true
+			}
 			out = append(out, item)
 			continue
 		}
-		var after *upstream.Task
-		if isMPTaskCode(act.TaskCode) {
-			after, _ = p.taskByCodeMP(a, act.TaskCode)
-		} else {
-			after, _ = p.taskByCodeWaiting(a, act.TaskCode)
-		}
 		item["status"] = "done"
 		item["message"] = msg
-		item["progress_after"] = taskProgressText(after)
+
+		// 回读进度：只对执行过动作的任务读一次（上游计分是异步的，最多再补一轮）。
+		after, rerr := p.refreshTask(a, snap, act.TaskCode)
+		if rerr != nil {
+			if isSoftRateErr(rerr) {
+				limited = true
+				item["message"] = msg + "；进度回读被上游限流（稍后重试可自动补领）"
+			}
+			out = append(out, item)
+			time.Sleep(reportGap)
+			continue
+		}
+		if after != nil && !after.Claimable && !after.Claimed && !after.Locked {
+			item["progress_after"] = taskProgressText(after)
+			time.Sleep(claimPollGap) // 再来一轮，等异步计分落定
+			if after2, rerr2 := p.refreshTask(a, snap, act.TaskCode); rerr2 == nil {
+				after = after2
+			} else if isSoftRateErr(rerr2) {
+				limited = true
+			}
+		}
+		if after != nil {
+			item["progress_after"] = taskProgressText(after)
+		}
 		// 进度达标即自动领奖（mp 任务走 chat 域 mp 口径，其余 Web 端接口）。
 		// 领奖失败不掩盖主流程结果：status 仍为 done，附加 claim_error 供前端提示。
-	if after != nil && after.Claimable {
-		item["claimable"] = true
-		credit, energy, cerr := claimTaskReward(p, a, act.TaskCode)
+		if after != nil && after.Claimable {
+			item["claimable"] = true
+			credit, energy, cerr := claimTaskReward(p, a, act.TaskCode)
 			if cerr == nil {
 				item["claimed"] = true
 				item["credit"] = credit
@@ -1259,12 +1402,34 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 			} else {
 				item["claim_error"] = cerr.Error()
 				item["message"] = msg + "；达标但领奖失败（可在列表手动重试）"
+				if isSoftRateErr(cerr) {
+					limited = true
+				}
 			}
 		}
 		out = append(out, item)
 		time.Sleep(reportGap) // 项间节流
 	}
 	return out
+}
+
+// refreshTask 回读单个任务并写回快照。mp 口径码走 mp 列表，其余走默认列表；
+// 只发一次请求（不做内部轮询——轮询节奏由调用方控制，便于统一限流处理）。
+func (p *Panel) refreshTask(a *auth.Auth, snap *taskSnapshot, code string) (*upstream.Task, error) {
+	var (
+		t   *upstream.Task
+		err error
+	)
+	if isMPTaskCode(code) {
+		t, err = p.taskByCodeMP(a, code)
+	} else {
+		t, err = p.taskByCode(a, code)
+	}
+	if err != nil {
+		return nil, err
+	}
+	snap.put(t)
+	return t, nil
 }
 
 // accountTaskAutoAll 一键完成该账号全部可自动任务。

@@ -586,3 +586,70 @@ func desktopExpertActualUse(e MarketExpert, conversationID, requestID string) De
 		"requestModelId": "fast-model", "requestModelName": "fast-model",
 	}
 }
+
+// MarketExpertListKeyword 按关键词搜索专家市场，返回命中的专家列表。
+// 用于「体验 XX 专家」类成长任务：任务的 jump_url 里带了目标 ex_ id，
+// 但市场列表接口只按 keyword 过滤（传 expert_ids/ids/expert_id 均被忽略，
+// 实测 2026-11-05 恒返回 reco_rank 榜首），故按任务标题里的专家名搜索，
+// 再用 ExpertID 精确匹配。keyword 为空时退化为普通推荐列表。
+func (c *Client) MarketExpertListKeyword(a *auth.Auth, keyword string) ([]MarketExpert, error) {
+	body := map[string]any{"page": 1, "page_size": 20, "sort_by": "reco_rank", "sort_order": "desc"}
+	if keyword != "" {
+		body["keyword"] = keyword
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, c.chatBase(a)+"/portal/operation-platform/market/expert/list", bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("X-Domain", c.chatBase(a))
+	req.Header.Set("X-Product", "SaaS")
+	if a.UID != "" {
+		req.Header.Set("X-User-Id", a.UID)
+	}
+	var out struct {
+		Experts []MarketExpert `json:"experts"`
+	}
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("expert list parse: %w", err)
+	}
+	return out.Experts, nil
+}
+
+// MarketExpertByID 在专家市场里按 expert_id 精确定位一个专家。
+// 先用 keyword（=任务标题里的专家名）搜索，命中 ExpertID 即返回；搜索不到时
+// 回落到推荐列表首页扫描。找到则返回该条目（version/type 等以服务端为准），
+// 找不到返回 nil——调用方应据此跳过动作，避免用编造 id 上报（服务端不计数）。
+func (c *Client) MarketExpertByID(a *auth.Auth, expertID, keyword string) (*MarketExpert, error) {
+	if keyword != "" {
+		if list, err := c.MarketExpertListKeyword(a, keyword); err == nil {
+			for i := range list {
+				if list[i].ExpertID == expertID {
+					return &list[i], nil
+				}
+			}
+		} else {
+			return nil, err
+		}
+	}
+	list, err := c.MarketExpertList(a, "agent")
+	if err != nil {
+		return nil, err
+	}
+	for i := range list {
+		if list[i].ExpertID == expertID {
+			return &list[i], nil
+		}
+	}
+	return nil, nil
+}

@@ -1812,7 +1812,13 @@ const AUTO_TASKS = {
   'Sequential_Tasks_4': '小程序定时任务（预留，每日零点解锁一环）：accept → 定时任务创建事件 → 领奖（判据待解锁验证）',
   'Sequential_Tasks_5': '小程序使用 GLM5.2（预留）：accept → 带模型字段的 mini 对话上报 → 领奖（判据待解锁验证）',
   'Sequential_Tasks_6': '小程序十次对话（预留）：accept → mini 对话上报 ×target（自动补差额）→ 领奖',
-  'Sequential_Tasks_7': '体验灵感功能（预留，疑 PC 口径）：accept → 灵感事件组（PC+mp 双形态）→ 领奖（判据待解锁验证）'
+  'Sequential_Tasks_7': '体验灵感功能（预留，疑 PC 口径）：accept → 灵感事件组（PC+mp 双形态）→ 领奖（判据待解锁验证）',
+  'WorkBuddy_Valorant': '体验「无畏契约拼豆专家」：市场搜 id → 召唤链 → 真实对话 → expert_actual_use（已验证点亮）',
+  'expert_use_maidehao': '体验「中国电商运营专家」：召唤链 + 真实对话（已验证点亮）',
+  'expert_use_douyinyin': '体验「抖音策略师」：召唤链 + 真实对话（已验证点亮）',
+  'expert_use_shangjia_xuanchuan': '体验「商家宣传页与海报设计师」：召唤链 + 真实对话（已验证点亮）',
+  'expert_use_bowangwang': '体验「直播电商教练」：召唤链 + 真实对话（已验证点亮）',
+  'wb_wechat_oa_subscribe_task': '关注公众号满 24 小时：判据为真实微信关注回执 + 计时，纯 API 无法代完成'
 };
 
 // key 是账号主键（面板路由参数），nick 仅用于标题展示。
