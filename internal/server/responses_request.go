@@ -1,7 +1,9 @@
 package server
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -90,10 +92,13 @@ func responsesInputToMessages(input any) ([]map[string]any, error) {
 	case string:
 		return []map[string]any{{"role": "user", "content": v}}, nil
 	case []any:
+		// scopeStart 本回合起点：只有位于最后一条 user 消息**之后**的工具结果图片
+		// 才算「这一轮的图」（见 currentTurnStart）。
+		scopeStart := currentTurnStart(v)
 		var msgs []map[string]any
 		// pendingImages 工具结果里的图片（见函数头注释），循环结束后统一挂到末条 user。
 		var pendingImages []map[string]any
-		for _, raw := range v {
+		for i, raw := range v {
 			item, ok := raw.(map[string]any)
 			if !ok {
 				return nil, &responsesError{400, "invalid_request", "input items must be objects"}
@@ -137,7 +142,11 @@ func responsesInputToMessages(input any) ([]map[string]any, error) {
 					"tool_call_id": str(item["call_id"]),
 					"content":      responsesToolOutputText(out),
 				})
-				pendingImages = append(pendingImages, responsesToolOutputImages(out)...)
+				// 只收本回合的图：历史轮次的图若也上提，客户端每轮回放完整历史时会被
+				// 反复挂到最新的 user 消息上，模型看到的是「用户每轮都在发同一张图」。
+				if i >= scopeStart {
+					pendingImages = append(pendingImages, responsesToolOutputImages(out)...)
+				}
 			default:
 				// 静默丢弃会表现为「模型失忆」，比报错难查。
 				return nil, &responsesError{422, "unsupported_input_item",
@@ -151,6 +160,38 @@ func responsesInputToMessages(input any) ([]map[string]any, error) {
 	default:
 		return nil, &responsesError{400, "invalid_request", "input must be a string or an array"}
 	}
+}
+
+// currentTurnStart 返回「本回合」起点：最后一条 user 消息项之后的下标。
+//
+// 为什么需要它：网关无状态（previous_response_id 已被 responsesRequestToChat 拒绝），
+// 客户端必须每轮回放完整 input。上游只编码末条消息里的图，所以工具结果里的图必须
+// 搬到末条 user 消息上——但「搬哪些」必须限定在本回合。否则历史里那张截图会在之后
+// 每一轮被重新上提：模型看到的是「用户每轮都在发同一张图」，语义与成本双错。
+//
+// 判定口径与 responsesMessageItem 严格一致：
+//   - type 为空或 "message" 才算消息项（其余是 function_call / function_call_output 等）；
+//   - role 缺失按 user 处理（EasyInputMessage 的 role 可省略，见 responsesMessageItem）。
+//
+// 找不到 user 消息项 → 返回 0，退化为「整个 input 视为本回合」。纯工具续跑（用户在
+// 上一轮发言后，agent 连续多次 tool call 的请求里没有新的 user 项）必须保持这个行为，
+// 否则图永远上提不了、模型答「看不到图」。
+func currentTurnStart(items []any) int {
+	for i := len(items) - 1; i >= 0; i-- {
+		item, ok := items[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		typ, _ := item["type"].(string)
+		if typ != "" && typ != "message" {
+			continue
+		}
+		role, _ := item["role"].(string)
+		if role == "" || role == "user" {
+			return i + 1
+		}
+	}
+	return 0
 }
 
 // attachImagesToLastUser 把图片 part 挂到最后一条 user 消息上（上游只编码末条消息的图）。
@@ -167,6 +208,11 @@ func attachImagesToLastUser(msgs []map[string]any, images []map[string]any) []ma
 	if n := len(msgs); n > 0 {
 		last := msgs[n-1]
 		if role, _ := last["role"].(string); role == "user" {
+			// 末条 user 已带同一张图（用户自己传过，或翻译层两处都写了）→ 不重复挂。
+			images = filterNewImages(last["content"], images)
+			if len(images) == 0 {
+				return msgs
+			}
 			switch c := last["content"].(type) {
 			case []map[string]any:
 				last["content"] = append(c, images...)
@@ -471,21 +517,75 @@ func imageDataURL(s string) (string, bool) {
 	return t, true
 }
 
+// imagePartKey 图片 part 的去重键：URL 的 sha256 前 16 hex（空 URL → ""）。
+//
+// 为什么用摘要而不是原串做 map 键：data URL 单张可达数 MB，多图请求下 map 会持有
+// 每张图的一份完整副本；摘要固定 16 字节。同一 URL 摘要恒定，语义与「按 URL 去重」
+// 完全等价（不校验负载——与 imageDataURL 同口径，坏图交上游报错）。
+func imagePartKey(part map[string]any) string {
+	url := ""
+	if m, ok := part["image_url"].(map[string]any); ok {
+		url, _ = m["url"].(string)
+	}
+	if url == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(url))
+	return hex.EncodeToString(sum[:16])
+}
+
 // dedupeImages 按 URL 去重（同一张截图可能在历史里出现多次）。
 // 每张图上游按 ~1-2k token 计，重复挂载纯属浪费；去重后顺序保持首次出现。
 func dedupeImages(in []map[string]any) []map[string]any {
 	seen := make(map[string]bool, len(in))
 	out := make([]map[string]any, 0, len(in))
 	for _, p := range in {
-		url := ""
-		if m, ok := p["image_url"].(map[string]any); ok {
-			url, _ = m["url"].(string)
+		if k := imagePartKey(p); k != "" {
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
 		}
-		if url != "" && seen[url] {
+		out = append(out, p)
+	}
+	return out
+}
+
+// filterNewImages 过滤掉目标 content 里已存在的图片（按 imagePartKey）。
+//
+// 覆盖「翻译层把同一张图同时写进 tool 结果与 user 消息」的形态：不查重会在同一条
+// 消息里塞两份，上游按两张图计费、模型也会以为是两张不同的图。
+func filterNewImages(existing any, images []map[string]any) []map[string]any {
+	if len(images) == 0 {
+		return images
+	}
+	have := map[string]bool{}
+	mark := func(p any) {
+		pm, ok := p.(map[string]any)
+		if !ok {
+			return
+		}
+		if k := imagePartKey(pm); k != "" {
+			have[k] = true
+		}
+	}
+	switch c := existing.(type) {
+	case []any:
+		for _, p := range c {
+			mark(p)
+		}
+	case []map[string]any:
+		for _, p := range c {
+			mark(p)
+		}
+	}
+	if len(have) == 0 {
+		return images
+	}
+	out := make([]map[string]any, 0, len(images))
+	for _, p := range images {
+		if k := imagePartKey(p); k != "" && have[k] {
 			continue
-		}
-		if url != "" {
-			seen[url] = true
 		}
 		out = append(out, p)
 	}

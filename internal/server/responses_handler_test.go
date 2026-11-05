@@ -2,7 +2,9 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -121,6 +123,68 @@ func TestResponsesEndpointRejectsPreviousResponseID(t *testing.T) {
 	e, _ := body["error"].(map[string]any)
 	if e["code"] != "unsupported_parameter" {
 		t.Fatalf("error.code = %v, want unsupported_parameter", e["code"])
+	}
+}
+
+// TestResponsesEndpointDoesNotResendHistoryImage 端到端回归（2026-11-05 实案）：
+// 第二轮请求回放第一轮截图后，**出站给上游的 body** 不得再带那张图。
+//
+// 分层意义：上面的 responsesRequestToChat 单测只验证转换函数；这条覆盖
+// responsesCompletions → chatCore → prompt.Rewrite → prepareBody 整条管线，
+// 确认后续阶段不会把图又捡回来。
+func TestResponsesEndpointDoesNotResendHistoryImage(t *testing.T) {
+	const dataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+
+	var sentBodies [][]byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			sentBodies = append(sentBodies, raw)
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	wb := &auth.Auth{UID: "wb1", AccessToken: "wb-at", ExpiresAt: 9999999999}
+	h := NewHandler(Config{Pool: testPoolWith(wb), Upstream: up})
+
+	// 第 1 轮：用户发话 → agent 截图。
+	first := `{"model":"wb:cn:auto","stream":true,"input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"帮我看看这个界面"}]},
+		{"type":"function_call","call_id":"c1","name":"screenshot","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":[{"type":"input_image","image_url":"` + dataURL + `"}]}]}`
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(first)))
+	if rr.Code != 200 {
+		t.Fatalf("round1 code=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	// 第 2 轮：客户端回放完整历史 + 新提问。图属于上一轮 → 不得上提。
+	second := `{"model":"wb:cn:auto","stream":true,"input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"帮我看看这个界面"}]},
+		{"type":"function_call","call_id":"c1","name":"screenshot","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":[{"type":"input_image","image_url":"` + dataURL + `"}]},
+		{"type":"message","role":"assistant","content":[{"type":"output_text","text":"这是你的桌面"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}]}`
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(second)))
+	if rr.Code != 200 {
+		t.Fatalf("round2 code=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	if len(sentBodies) != 2 {
+		t.Fatalf("upstream calls = %d, want 2", len(sentBodies))
+	}
+	// 第 1 轮必须带图（本回合的截图，模型得看得见）。
+	if !bytes.Contains(sentBodies[0], []byte(dataURL)) {
+		t.Fatalf("round1 出站 body 丢了本回合截图（模型会答「看不到图」）: %s", sentBodies[0])
+	}
+	// 第 2 轮必须不带图（历史截图不得被重复上提）。
+	if bytes.Contains(sentBodies[1], []byte(dataURL)) {
+		t.Fatalf("round2 出站 body 仍带着上一轮的截图（每轮重复计费 + 语义错位）: %s", sentBodies[1])
 	}
 }
 

@@ -220,19 +220,47 @@ func TestResponsesRequestToChatOnlyHostedTools(t *testing.T) {
 	}
 }
 
-// function_call_output 携带图片 part 时：文本留 tool、图片挂到最后一条 user 消息。
+// currentTurnStart 的边界：type 省略/空、role 省略、非 message 类型都要按
+// responsesMessageItem 的口径判定，否则回合边界算错 → 图被错误上提或漏提。
+func TestCurrentTurnStart(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  int
+	}{
+		{"无 user 项 → 0（全 input 视为本回合）", `[]`, 0},
+		{"只有工具项 → 0", `[{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}]`, 0},
+		{"单轮：user 在首", `[{"type":"message","role":"user","content":"hi"},{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}]`, 1},
+		{"跨轮：取最后一条 user 之后", `[{"type":"message","role":"user","content":"a"},{"type":"message","role":"user","content":"b"},{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}]`, 2},
+		{"type 省略按消息处理", `[{"role":"user","content":"hi"},{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}]`, 1},
+		{"role 省略按 user 处理", `[{"type":"message","content":"hi"},{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}]`, 1},
+		{"assistant 消息不算回合起点", `[{"type":"message","role":"user","content":"a"},{"type":"message","role":"assistant","content":"b"}]`, 1},
+	} {
+		var items []any
+		if err := json.Unmarshal([]byte(tc.input), &items); err != nil {
+			t.Fatalf("%s: unmarshal: %v", tc.name, err)
+		}
+		if got := currentTurnStart(items); got != tc.want {
+			t.Errorf("%s: currentTurnStart = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// function_call_output 携带图片 part 时：文本留 tool、图片挂到本回合的末条 user 消息。
 //
 // 2026-10-18 实案（11115 prompt is too long: 2059849 > 1048576）：
 // Codex 的 view_image 把 2.4MB base64 作为 input_image 回传，旧实现 json.Marshal
 // 成字符串 → 上游按文本分词 ≈ 2.05M token，一张截图顶爆 1M 上下文。
 // 且实测上游只编码「最后一条消息」里的图，tool/历史消息里的图静默丢弃。
+//
+// 本用例是**单轮**形态：用户先发话，随后 agent 截图。图位于最后一条 user 消息之后
+// → 属于本回合，必须上提。（跨轮形态见 TestResponsesRequestToChatDoesNotHoistHistoryToolImage。）
 func TestResponsesRequestToChatFunctionCallOutputImagePart(t *testing.T) {
 	const dataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 	raw := []byte(`{"model":"wb:glm-5.3-flash","input":[
 		{"type":"message","role":"user","content":[{"type":"input_text","text":"看图"}]},
 		{"type":"function_call","call_id":"call_img","name":"view_image","arguments":"{}"},
-		{"type":"function_call_output","call_id":"call_img","output":[{"type":"input_image","image_url":"` + dataURL + `"}]},
-		{"type":"message","role":"user","content":[{"type":"input_text","text":"这是什么"}]}]}`)
+		{"type":"function_call_output","call_id":"call_img","output":[{"type":"input_image","image_url":"` + dataURL + `"}]}]}`)
 	out, err := responsesRequestToChat(raw)
 	if err != nil {
 		t.Fatalf("err = %v", err)
@@ -247,7 +275,7 @@ func TestResponsesRequestToChatFunctionCallOutputImagePart(t *testing.T) {
 	}
 	msgs := got["messages"].([]any)
 	if len(msgs) != 4 {
-		t.Fatalf("messages len = %d, want 4（不额外插消息）: %s", len(msgs), out)
+		t.Fatalf("messages len = %d, want 4（user/assistant+tool + 合成的图片 user）: %s", len(msgs), out)
 	}
 	if msgs[2].(map[string]any)["role"] != "tool" {
 		t.Fatalf("msgs[2].role = %v, want tool", msgs[2].(map[string]any)["role"])
@@ -319,6 +347,145 @@ func TestResponsesRequestToChatFunctionCallOutputImageString(t *testing.T) {
 	}
 }
 
+// TestResponsesRequestToChatDoesNotHoistHistoryToolImage 跨轮回归：**历史轮次**的工具截图
+// 不得被搬进本轮的 user 消息。
+//
+// Bug 形态（2026-11-05 Claude Desktop 实案）：第 1 轮截图后，客户端每轮回放完整 input，
+// 旧实现把历史上所有 function_call_output 的图无条件上提到末条 user 消息 →
+// 模型看到的是「用户每轮都在发同一张图」，语义错位且每轮重复计 image token。
+//
+// 修复口径：只有「最后一条 user 消息之后」的工具图片才算本回合（currentTurnStart）。
+func TestResponsesRequestToChatDoesNotHoistHistoryToolImage(t *testing.T) {
+	const dataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	raw := []byte(`{"model":"wb:glm-5.3-flash","input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"帮我看看这个界面"}]},
+		{"type":"function_call","call_id":"call_shot","name":"screenshot","arguments":"{}"},
+		{"type":"function_call_output","call_id":"call_shot","output":[{"type":"input_image","image_url":"` + dataURL + `"}]},
+		{"type":"message","role":"assistant","content":[{"type":"output_text","text":"这是你的桌面"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}]}`)
+	out, err := responsesRequestToChat(raw)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if bytes.Contains(out, []byte("data:image/")) {
+		t.Fatalf("历史轮次的截图不得出现在本轮请求里（否则每轮都会重复上提）: %s", out)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs := got["messages"].([]any)
+	last := msgs[len(msgs)-1].(map[string]any)
+	if last["role"] != "user" {
+		t.Fatalf("末条 role = %v, want user", last["role"])
+	}
+	if c, ok := last["content"].(string); !ok || c != "继续" {
+		t.Fatalf("末条 content = %#v, want 原样的字符串 %q（不得被改写成 parts）", last["content"], "继续")
+	}
+	if len(msgs) != 5 {
+		t.Fatalf("messages len = %d, want 5（不应额外合成 user 消息）: %s", len(msgs), out)
+	}
+}
+
+// TestResponsesRequestToChatHoistsOnlyLatestTurnImage 多轮里只有最后一条 user 之后的图
+// 被上提：上一轮截图丢弃，本轮截图保留。
+func TestResponsesRequestToChatHoistsOnlyLatestTurnImage(t *testing.T) {
+	const oldImg = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	const newImg = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+	raw := []byte(`{"model":"wb:glm-5.3-flash","input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"第一轮"}]},
+		{"type":"function_call","call_id":"c1","name":"screenshot","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":[{"type":"input_image","image_url":"` + oldImg + `"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"第二轮，再截一次"}]},
+		{"type":"function_call","call_id":"c2","name":"screenshot","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c2","output":[{"type":"input_image","image_url":"` + newImg + `"}]}]}`)
+	out, err := responsesRequestToChat(raw)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if bytes.Contains(out, []byte(oldImg)) {
+		t.Fatalf("上一轮的截图不应被上提: %s", out)
+	}
+	if !bytes.Contains(out, []byte(newImg)) {
+		t.Fatalf("本轮的截图必须被上提（否则模型看不到图）: %s", out)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs := got["messages"].([]any)
+	last := msgs[len(msgs)-1].(map[string]any)
+	parts, ok := last["content"].([]any)
+	if !ok {
+		t.Fatalf("末条 content = %#v, want parts 数组", last["content"])
+	}
+	n := 0
+	for _, p := range parts {
+		if pm, _ := p.(map[string]any); pm["type"] == "image_url" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("末条 user 图片数 = %d, want 1（只挂本轮那张）: %s", n, out)
+	}
+}
+
+// TestResponsesRequestToChatHoistsImageWithoutUserMessage 纯工具续跑（input 里没有
+// 新的 user 项）必须保持原有上提行为——否则图永远上提不了、模型答「看不到图」。
+func TestResponsesRequestToChatHoistsImageWithoutUserMessage(t *testing.T) {
+	const dataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	raw := []byte(`{"model":"wb:glm-5.3-flash","input":[
+		{"type":"function_call","call_id":"c1","name":"screenshot","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":[{"type":"input_image","image_url":"` + dataURL + `"}]}]}`)
+	out, err := responsesRequestToChat(raw)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs := got["messages"].([]any)
+	last := msgs[len(msgs)-1].(map[string]any)
+	if last["role"] != "user" {
+		t.Fatalf("末条 role = %v, want user（无 user 项时合成一条）", last["role"])
+	}
+	if !bytes.Contains(out, []byte(dataURL)) {
+		t.Fatalf("无 user 消息项时图仍须上提: %s", out)
+	}
+}
+
+// TestResponsesRequestToChatSkipsImageAlreadyInUserMessage 末条 user 已带同一张图时
+// 不重复挂载（翻译层可能把图同时写进 tool 结果与 user 消息）。
+func TestResponsesRequestToChatSkipsImageAlreadyInUserMessage(t *testing.T) {
+	const dataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	raw := []byte(`{"model":"wb:glm-5.3-flash","input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"看图"}]},
+		{"type":"function_call","call_id":"c1","name":"screenshot","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":[{"type":"input_image","image_url":"` + dataURL + `"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"看到了"},{"type":"input_image","image_url":"` + dataURL + `"}]}]}`)
+	out, err := responsesRequestToChat(raw)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs := got["messages"].([]any)
+	last := msgs[len(msgs)-1].(map[string]any)
+	parts, _ := last["content"].([]any)
+	n := 0
+	for _, p := range parts {
+		if pm, _ := p.(map[string]any); pm["type"] == "image_url" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("末条 user 图片数 = %d, want 1（已有同图不得重复挂）: %s", n, out)
+	}
+}
+
 // 纯文本 function_call_output（字符串 / {"text":...} / 多段文本数组）仍走字符串，
 // 保持既有 chat 路径与 DSML 修复的字符串口径（回归守卫）。
 func TestResponsesRequestToChatFunctionCallOutputTextUnchanged(t *testing.T) {
@@ -351,11 +518,11 @@ func TestResponsesRequestToChatFunctionCallOutputTextUnchanged(t *testing.T) {
 func TestResponsesRequestToChatDedupesImages(t *testing.T) {
 	const dataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 	raw := []byte(`{"model":"wb:glm-5.3-flash","input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"截图看看"}]},
 		{"type":"function_call","call_id":"c1","name":"view_image","arguments":"{}"},
 		{"type":"function_call_output","call_id":"c1","output":[{"type":"input_image","image_url":"` + dataURL + `"}]},
 		{"type":"function_call","call_id":"c2","name":"view_image","arguments":"{}"},
-		{"type":"function_call_output","call_id":"c2","output":[{"type":"input_image","image_url":"` + dataURL + `"}]},
-		{"type":"message","role":"user","content":[{"type":"input_text","text":"两张图一样吗"}]}]}`)
+		{"type":"function_call_output","call_id":"c2","output":[{"type":"input_image","image_url":"` + dataURL + `"}]}]}`)
 	out, err := responsesRequestToChat(raw)
 	if err != nil {
 		t.Fatalf("err = %v", err)
