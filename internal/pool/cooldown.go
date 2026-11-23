@@ -440,7 +440,9 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 //   - resetAt 非零（上游带权威重置时间，无论 6004 还是 11140 rate-limiting）→
 //     账号级直到该墙钟（截断到 softRateMax，绝不指数堆加）；**不**在
 //     modelCooldowns 记模型（账号级语义，不产生切模型豁免——普通账号级限流不该
-//     因切模型绕过）。
+//     因切模型绕过）。若账号已处于仍生效的 CoolSoft，本入口**只延长、不缩短**
+//     unlock：并发/兜底探测里后到的短 resetAt（或解析失败的短兜底值）不得把先
+//     写入的真实长冷却覆盖掉——这正是「倒计时结束又弹回 60 分钟」的成因。
 //   - resetAt 零值且**不在冷却中**（首次/恢复后的新限流）→ 有界退避：按 softStreak
 //     指数退避并封顶 softRateMax。softStreak 只在真正进入一次新冷却时计数，由
 //     NoteSuccess/reviveCoolingLocked 清零（既有恢复语义）。
@@ -453,7 +455,13 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 	if e, ok := p.byUID[uid]; ok {
 		now := time.Now()
 		if !resetAt.IsZero() {
-			e.until = p.cappedSoftUntilLocked(now, resetAt)
+			until := p.cappedSoftUntilLocked(now, resetAt)
+			// 只延长不缩短：已有仍生效的 CoolSoft（真值/更早写入的长上限）优先于
+			// 本次较短的 resetAt。非 CoolSoft（Hard/熔断恢复）或已过期的 until 不保护。
+			if e.coolKind == CoolSoft && now.Before(e.until) && e.until.After(until) {
+				until = e.until
+			}
+			e.until = until
 		} else if e.coolKind != CoolSoft || !now.Before(e.until) {
 			// 新限流（不在有效软冷却中）：推进有界退避；兜底探测（仍在软冷却中）不翻倍。
 			d := p.softDurationLocked(base, e.softStreak+1)

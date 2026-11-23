@@ -1603,6 +1603,17 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 			status = http.StatusTooManyRequests
 			code = "rate_limit_exceeded"
 			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
+			// 用户侧可操作指引：报出本域账号级软冷却的最近解禁时刻，并明确
+			// 「等待解禁后重试（无需重新登录）」——限流是临时状态，重登无效。
+			// 只补 gateway_hint，不动 msg：上游原文（ue.Msg）在下方优先透传。
+			if h.cfg.Pool != nil {
+				if until := h.cfg.Pool.EarliestSoftCooldownUntil(realm); !until.IsZero() {
+					hint += "; earliest rate-limit unlock at " + until.Format(time.RFC3339) +
+						" — wait until unlock and retry (no re-login needed)"
+				} else {
+					hint += "; rate limited temporarily — wait and retry (no re-login needed)"
+				}
+			}
 		case upstream.ErrWafBlock:
 			if h.wafIP.active() {
 				// IP 级拦截措辞（fail-fast 终止路径）：网关出口 IP 被 WAF 拦截、
@@ -1646,7 +1657,12 @@ func (h *Handler) chatCore(w http.ResponseWriter, r *http.Request, body []byte, 
 		if !upstreamMsgPassed {
 			msg = "model is unavailable on every account (per-model cooldown), try another model"
 		}
-		hint = fmt.Sprintf("model_blocked: %d account(s) cooling down this model", modelBlock.Count)
+		// 保留上面已写入的限流/上游 hint，再追加模型级阻塞信息（此前整段覆盖，
+		// 会把 ErrSoftRate 分支刚补的解禁时刻+指引丢掉）。
+		if hint != "" {
+			hint += "; "
+		}
+		hint += fmt.Sprintf("model_blocked: %d account(s) cooling down this model", modelBlock.Count)
 		if !modelBlock.Until.IsZero() {
 			hint += "; earliest unblock at " + modelBlock.Until.Format(time.RFC3339)
 		}

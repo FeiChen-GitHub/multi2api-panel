@@ -358,6 +358,30 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 	p.dirty.Store(true)
 }
 
+// EarliestSoftCooldownUntil 返回 realm 内仍处于账号级软冷却（CoolSoft）的账号中
+// 最早的解禁墙钟（零值 = 当前没有软冷却账号）。realm 为空表示不限域。
+//
+// 用途：限流错误给用户一个可操作的「最近什么时候能重试」。只读，不改状态、
+// 不触碰 modelCooldowns —— 模型级限流由 ModelBlockedForRealm 另报。
+// 复用 List() 的 statusOf 冷却判据（now.Before(until) + CoolKind），确保与
+// /status 面板口径一致；熔断期（breaker）不算限流解禁。
+func (p *Pool) EarliestSoftCooldownUntil(realm string) time.Time {
+	now := time.Now()
+	var earliest time.Time
+	for _, st := range p.List() {
+		if realm != "" && st.Realm != realm {
+			continue
+		}
+		if !st.Cooling || st.CoolKind != CoolSoft.String() || !now.Before(st.Until) {
+			continue
+		}
+		if earliest.IsZero() || st.Until.Before(earliest) {
+			earliest = st.Until
+		}
+	}
+	return earliest
+}
+
 // Status 查询单账号状态。
 func (p *Pool) Status(uid string) (Status, bool) {
 	p.mu.RLock()

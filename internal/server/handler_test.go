@@ -561,6 +561,48 @@ func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 	}
 }
 
+// TestSoftRateHintCarriesUnlockTimeAndGuidance 端到端：账号级 429（带上游重置
+// 文案）在单号池里无号可换 → 回 429，error.message 保留上游原文，gateway_hint
+// 补上最近解禁时刻 + 「等待解禁后重试（无需重新登录）」的可操作指引。
+func TestSoftRateHintCarriesUnlockTimeAndGuidance(t *testing.T) {
+	// 重置时间设为 ~10 分钟后（UTC+8 文案，中文句式），上游错误原文原样回传。
+	resetAt := time.Now().In(upstream.SoftRateResetLoc()).Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	body := `{"code":429,"msg":"rate limited, 将在 ` + resetAt + ` 重置"}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 429, body, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"wb:glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s want 429", rec.Code, rec.Body)
+	}
+	var out struct {
+		Error struct {
+			Message      string `json:"message"`
+			Code         string `json:"code"`
+			GatewayHint  string `json:"gateway_hint"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("error body must be JSON: %v", err)
+	}
+	if out.Error.Code != "rate_limit_exceeded" {
+		t.Errorf("code=%q want rate_limit_exceeded", out.Error.Code)
+	}
+	if !strings.Contains(out.Error.Message, "rate limited") {
+		t.Errorf("message=%q want 上游原文", out.Error.Message)
+	}
+	if !strings.Contains(out.Error.GatewayHint, "earliest rate-limit unlock at ") {
+		t.Errorf("gateway_hint=%q want 最近解禁时刻", out.Error.GatewayHint)
+	}
+	if !strings.Contains(out.Error.GatewayHint, "no re-login needed") {
+		t.Errorf("gateway_hint=%q want 无需重新登录指引", out.Error.GatewayHint)
+	}
+}
+
 // TestChatStickyFollowsFinalSuccess 端到端验证 D4：粘性号失败换号成功后，会话绑定收敛到成功号。
 func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 	st := newBindStore()

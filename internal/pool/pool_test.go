@@ -698,6 +698,39 @@ func expireCooldown(p *Pool, uid string) {
 	p.mu.Unlock()
 }
 
+// TestCooldownSoftRateResetAtNeverShortens 验证账号级软冷却的 resetAt 分支
+// 「只延长、不缩短」：并发/兜底探测里后到的短重置时间（甚至解析失败回落到
+// now+1ms）不得把先写入的真实长冷却覆盖掉——否则前端倒计时结束后又弹回。
+func TestCooldownSoftRateResetAtNeverShortens(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(2 * time.Hour)
+	now := time.Now()
+
+	// 先写入真实长冷却（上游带长 resetAt）。
+	longUntil := now.Add(50 * time.Minute)
+	p.CooldownSoftRate("u1", time.Minute, longUntil, "429 rate limit")
+	if st, _ := p.Status("u1"); st.Until.Before(longUntil.Add(-2*time.Second)) || st.Until.After(longUntil.Add(2*time.Second)) {
+		t.Fatalf("initial until=%v want ~%v", st.Until, longUntil)
+	}
+
+	// 后到较短 resetAt（晚于 now、但早于 longUntil）→ 不得缩短。
+	shortUntil := now.Add(5 * time.Minute)
+	p.CooldownSoftRate("u1", time.Minute, shortUntil, "429 rate limit (fallback)")
+	st, _ := p.Status("u1")
+	if st.Until.Before(longUntil.Add(-2 * time.Second)) {
+		t.Errorf("shorter resetAt shortened until to %v, want >= ~%v", st.Until, longUntil)
+	}
+
+	// 更长的 resetAt 仍须能延长（不能被"只延长"误写成不可更新）。
+	longerUntil := now.Add(80 * time.Minute)
+	p.CooldownSoftRate("u1", time.Minute, longerUntil, "429 rate limit")
+	st, _ = p.Status("u1")
+	if st.Until.Before(longerUntil.Add(-2 * time.Second)) || st.Until.After(longerUntil.Add(2*time.Second)) {
+		t.Errorf("longer resetAt did not extend until: got %v want ~%v", st.Until, longerUntil)
+	}
+}
+
 func TestCooldownSoftExponentialBackoff(t *testing.T) {
 	// 同一账号**跨冷却期**连续软限流 → 时长按 2 倍指数增长（吸收上游：冷却中的
 	// 兜底探测不再堆加，堆加只发生在到期后的新一轮限流）。
