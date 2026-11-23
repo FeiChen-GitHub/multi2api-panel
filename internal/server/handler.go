@@ -530,13 +530,13 @@ func (h *Handler) modelList() []map[string]any {
 			out = append(out, entry)
 		}
 	}
-	// Trae 模型名单：池里有 cn 的 Trae 账号时才列出（纯动态 + 静态兜底，
+	// Trae 模型名单：池里有 cn 的 Trae 账号时才列出（在线 get_detail_param 拉取，
 	// 与 trae2api 的 modelList 同口径）；id 统一带 "trae:" 前缀，channel 取自模型名。
 	if keys := h.cfg.Pool.AvailableKeysForProviderModelRealm(auth.ProviderTrae, "", "cn"); len(keys) > 0 {
 		acct := h.cfg.Pool.AuthByKey(keys[0])
 		if acct != nil {
 			if ml, ok := h.clientFor(auth.ProviderTrae).(upstream.ModelLister); ok {
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				infos, err := ml.FetchModels(ctx, acct)
 				cancel()
 				if err != nil {

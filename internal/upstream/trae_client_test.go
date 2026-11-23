@@ -187,7 +187,7 @@ func TestTraeCreditPackagesMapsRealFields(t *testing.T) {
 			return
 		}
 		_, _ = w.Write([]byte(`{"user_entitlement_pack_list":[` +
-			`{"display_desc":"签到奖励","entitlement_base_info":{"product_id":208,"start_time":1791855046,"end_time":1794533446,"quota":{"credits_limit":100}},"usage":{"credits_amount":30}},` +
+			`{"display_desc":"签到奖励","entitlement_base_info":{"product_id":208,"start_time":1791855046,"end_time":1924992000,"quota":{"credits_limit":100}},"usage":{"credits_amount":30}},` +
 			`{"display_desc":"免费","entitlement_base_info":{"quota":{"credits_limit":0}},"usage":{}}]}`))
 	}))
 	defer srv.Close()
@@ -210,7 +210,7 @@ func TestTraeCreditPackagesMapsRealFields(t *testing.T) {
 	if packs[0].CreatedAt == "" || packs[0].EndTime == "" {
 		t.Errorf("created_at/end_time 不应为空: %+v", packs[0])
 	}
-	if packs[0].ExpiresAt != 1794533446*1000 {
+	if packs[0].ExpiresAt != 1924992000*1000 {
 		t.Errorf("expires_at = %d, want 毫秒时间戳", packs[0].ExpiresAt)
 	}
 	if remain != 70 || total != 100 {

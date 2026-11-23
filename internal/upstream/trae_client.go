@@ -41,13 +41,12 @@ const (
 
 	traeIdeVersion     = "0.1.52"
 	traeIdeVersionCode = "20260811"
-	// 模型发现的 get_detail_param 用 3.4.4 头：3.4.4 的 solo_agent 返回 44 条
-	// 真实可用的 agent 模型（glm-5.x、DeepSeek-V4、minimax-m3、kimi-k2 等）。
-	// 注意对话端点 llm_utils_chat 必须仍用 0.1.52 头——实测 3.4.4 头打对话
-	// 会返回 SSE code:4001 "param is invalid"（app_id+app_version_code 查不到配置），
-	// 故模型发现与对话走两套版本头。
-	traeModelIdeVersion     = "3.4.4"
-	traeModelIdeVersionCode = "20260212"
+	// 模型发现的 get_detail_param 用 0.1.52 头：真机验证 0.1.52 头返回 74 条
+	// 含最新前端模型（Doubao-Seed-2.1 / glm-5.3 / kimi-k3.1-pro / qwen4-max 等），
+	// 而 3.4.4 头只返回 47 条旧配置（glm-5.2 / minimax-m2 / advisor 变体）。
+	// 注意对话端点 llm_utils_chat 同样用 0.1.52 头，二者版本一致。
+	traeModelIdeVersion     = traeIdeVersion
+	traeModelIdeVersionCode = traeIdeVersionCode
 	traeOSVersion           = "macOS 15.7.4"
 	traeDeviceBrand         = "Apple"
 
@@ -73,7 +72,8 @@ type TraeClient struct {
 	OAuthHost string
 	ClientID  string
 
-	// ModelCachePath Trae 桌面端 state.vscdb 路径；空 = 不读取本地缓存。
+	// ModelCachePath 兼容保留字段：旧版本曾用于读 state.vscdb 本地缓存，
+	// 现已弃用（模型列表改为在线拉取），赋值不再产生任何效果。
 	ModelCachePath string
 }
 
@@ -86,13 +86,12 @@ func NewTraeClient() *TraeClient {
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
 	return &TraeClient{
-		HTTP:           &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		StreamHTTP:     &http.Client{Transport: tr},
-		AgentHost:      TraeAgentHost,
-		UgHost:         TraeUgHost,
-		OAuthHost:      TraeOAuthHost,
-		ClientID:       TraeClientID,
-		ModelCachePath: DefaultTraeModelCachePath(),
+		HTTP:       &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		StreamHTTP: &http.Client{Transport: tr},
+		AgentHost:  TraeAgentHost,
+		UgHost:     TraeUgHost,
+		OAuthHost:  TraeOAuthHost,
+		ClientID:   TraeClientID,
 	}
 }
 
@@ -104,13 +103,12 @@ func traeSOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
 	traeSOLOHeadersWith(req, a, stream, traeIdeVersion, traeIdeVersionCode)
 }
 
-// traeModelHeaders 设置 get_detail_param 模型发现端点所需头，用 3.4.4
-// 版本（solo_agent 返回 44 条真实 agent 模型）。与对话头分离以避免影响对话。
+// traeModelHeaders 设置 get_detail_param 模型发现端点所需头，与对话头一致（0.1.52）。
 func traeModelHeaders(req *http.Request, a *auth.Auth) {
 	traeSOLOHeadersWith(req, a, false, traeModelIdeVersion, traeModelIdeVersionCode)
 }
 
-// traeSOLOHeadersWith 公共头组序，参数化版本/版本码：对话传 0.1.52，模型传 3.4.4。
+// traeSOLOHeadersWith 公共头组序，参数化版本/版本码：对话与模型目录均传 0.1.52/20260811。
 func traeSOLOHeadersWith(req *http.Request, a *auth.Auth, stream bool, ideVer, ideVerCode string) {
 	req.Header.Set("Content-Type", "application/json")
 	if stream {

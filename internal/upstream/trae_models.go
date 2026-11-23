@@ -1,20 +1,50 @@
-// trae_models.go TRAE 模型目录：优先读取 Trae 本地 state.vscdb 缓存，
-// 缓存缺失/损坏时回落到代码内置的 21 个模型，并始终额外暴露 Auto 模式。
+// trae_models.go TRAE 模型目录：在线从 get_detail_param(solo_agent) 拉取，
+// 按前端可见性字段过滤出可选模型，并始终追加 Auto。
+// 不再读取 Trae 桌面端 state.vscdb 本地缓存，也不内置静态表。
+// 拉取结果做进程内 TTL 缓存；失败时回退上次成功结果，冷启动失败仅返回 Auto。
 package upstream
 
 import (
+	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
-	"os"
-	"path/filepath"
+	"fmt"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
-
-	_ "modernc.org/sqlite"
+	"sync"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
+
+// traeModelCacheTTL 成功拉取的模型目录在进程内缓存时长；期内 /v1/models 不再打上游。
+const traeModelCacheTTL = 5 * time.Minute
+
+// traeModelCache 进程内模型目录缓存。key 为账号指纹（uid+token 摘要），
+// 避免多账号互相污染；value 为已过滤、已追加 Auto 的列表。
+var traeModelCache = struct {
+	sync.Mutex
+	entries map[string]traeModelCacheEntry
+}{entries: make(map[string]traeModelCacheEntry)}
+
+type traeModelCacheEntry struct {
+	models    []ModelInfo
+	fetchedAt time.Time
+}
+
+// traeAuthFingerprint 生成账号指纹。只取 token 末 12 字符，避免把完整凭证写进日志。
+func traeAuthFingerprint(a *auth.Auth) string {
+	if a == nil {
+		return "anonymous"
+	}
+	tail := a.AccessTokenValue()
+	if len(tail) > 12 {
+		tail = tail[len(tail)-12:]
+	}
+	return a.UID + "|" + tail
+}
 
 // TraeChannelForModel 判定模型走哪条通道。口径对照 trae2api 的 isWorkModel：
 // 小写含 "work"，或原名含 "Flash-Official" → Work 通道；其余 SOLO。
@@ -26,215 +56,179 @@ func TraeChannelForModel(id string) Channel {
 	return ChannelSOLO
 }
 
-// DefaultTraeModelCachePath 返回 Trae 桌面端保存模型列表的 SQLite 路径。
-// Windows: %AppData%\Trae CN\User\globalStorage\state.vscdb。
-func DefaultTraeModelCachePath() string {
-	base, err := os.UserConfigDir()
-	if err != nil || base == "" {
-		return ""
-	}
-	return filepath.Join(base, "Trae CN", "User", "globalStorage", "state.vscdb")
+// ---- 在线 get_detail_param 响应解析 ----
+
+// traeDetailResponse 是 get_detail_param 的响应信封。
+// 实测响应顶层即含 config_info_list（无 data 包裹），这里兼容两种形态。
+type traeDetailResponse struct {
+	ConfigInfoList []traeDetailConfig `json:"config_info_list"`
+	Data           struct {
+		ConfigInfoList []traeDetailConfig `json:"config_info_list"`
+	} `json:"data"`
 }
 
-// traeStaticModels 是 Trae 3.4.4 solo_agent 的固定目录。字段来自 Trae 本地缓存；
-// 仅作为本地缓存不可用时的兜底，不在运行时访问任何 Trae RPC。
-var traeStaticModels = []ModelInfo{
-	{ID: "Doubao-Seed-2.1-Turbo", Name: "Seed-2.1-Turbo", ContextWindow: 256000, MaxTokens: 32000, Credits: "x0.2", SupportsImages: true, SupportsReasoning: true, Efforts: []string{"light", "high"}, DefaultEffort: "high"},
-	{ID: "Doubao-Seed-2.1-Pro", Name: "Seed-2.1-Pro-0915", ContextWindow: 256000, MaxTokens: 64000, Credits: "x0.8", SupportsImages: true, SupportsReasoning: true, Efforts: []string{"light", "high"}, DefaultEffort: "high"},
-	{ID: "Doubao-Seed-Evolving", Name: "Seed-Evolving", ContextWindow: 256000, MaxTokens: 64000, Credits: "x0.8", SupportsImages: true},
-	{ID: "Doubao-Seed-Code", Name: "Seed-Code", ContextWindow: 256000, MaxTokens: 32000, Credits: "x0.06", IsDefault: true, SupportsImages: true, SupportsReasoning: true, Efforts: []string{"light", "high"}, DefaultEffort: "high"},
-	{ID: "glm-5.3-flash", Name: "GLM-5.3-Flash", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.08", SupportsImages: true, SupportsReasoning: true, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "extra_high"},
-	{ID: "glm-5.3-flashx", Name: "GLM-5.3-FlashX", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.31", SupportsImages: true, SupportsReasoning: true, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "extra_high"},
-	{ID: "glm-5.3", Name: "GLM-5.3", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.78", SupportsReasoning: true, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "extra_high"},
-	{ID: "glm-5.2", Name: "GLM-5.2", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.78", SupportsReasoning: true, Efforts: []string{"high", "extra_high"}, DefaultEffort: "high"},
-	{ID: "deepseek-v4.1-flash", Name: "DeepSeek-V4.1-Flash", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.12", SupportsImages: true, SupportsReasoning: true, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "high"},
-	{ID: "DeepSeek-V4-Flash-Official", Name: "DeepSeek-V4-Flash", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.2", SupportsReasoning: true, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "high"},
-	{ID: "DeepSeek-V4-Pro-Official", Name: "DeepSeek-V4-Pro", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.72", SupportsReasoning: true, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "high"},
-	{ID: "kimi-k3", Name: "Kimi-K3", ContextWindow: 200000, MaxTokens: 64000, Credits: "x1.83", SupportsImages: true, SupportsReasoning: true, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "extra_high"},
-	{ID: "kimi-k2.8-preview", Name: "Kimi-K2.8-Preview", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.98", SupportsImages: true, SupportsReasoning: true, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "extra_high"},
-	{ID: "mimo-v2.6-flash", Name: "MiMo-V2.6-Flash", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.06", SupportsImages: true},
-	{ID: "mimo-v2.6-pro", Name: "MiMo-V2.6-Pro", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.15", SupportsImages: true},
-	{ID: "minimax-m3.1-flash", Name: "MiniMax-M3.1-Flash", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.09", SupportsImages: true, SupportsReasoning: true, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "extra_high"},
-	{ID: "minimax-m3", Name: "MiniMax-M3", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.26", SupportsImages: true},
-	{ID: "step-5-preview", Name: "Step-5-Preview", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.48", SupportsImages: true, SupportsReasoning: true, Efforts: []string{"light", "high"}, DefaultEffort: "high"},
-	{ID: "qwen3.8-flash", Name: "Qwen3.8-Flash", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.08", SupportsImages: true, SupportsReasoning: true, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "high"},
-	{ID: "qwen3.8-max", Name: "Qwen3.8-Max", ContextWindow: 200000, MaxTokens: 64000, Credits: "x1.5", SupportsImages: true, SupportsReasoning: true, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "high"},
-	{ID: "qwen-3.7-plus", Name: "Qwen3.7-Plus", ContextWindow: 200000, MaxTokens: 64000, Credits: "x0.25", SupportsImages: true},
-}
-
-// traeStaticModelInfos 返回静态目录副本，避免调用方修改包级数据。
-func traeStaticModelInfos() []ModelInfo {
-	out := make([]ModelInfo, len(traeStaticModels))
-	for i, m := range traeStaticModels {
-		out[i] = cloneTraeModelInfo(m)
-	}
-	return out
-}
-
-func cloneTraeModelInfo(m ModelInfo) ModelInfo {
-	m.Efforts = append([]string(nil), m.Efforts...)
-	m.Tags = append([]string(nil), m.Tags...)
-	return m
-}
-
-// traeCachedModel Trae state.vscdb 中 model_list_map.solo_agent 的条目形态。
-type traeCachedModel struct {
-	Name              string `json:"name"`
-	DisplayName       string `json:"display_name"`
-	IsDefault         bool   `json:"is_default"`
-	Multimodal        bool   `json:"multimodal"`
-	ModelType         string `json:"model_type"`
-	ContextWindowSize struct {
-		Max     []int64 `json:"max"`
-		Default int64   `json:"default"`
-	} `json:"context_window_size"`
-	MaxTokens int64 `json:"max_tokens"`
-	Features  struct {
-		ConsumptionRate struct {
-			Data struct {
-				Rate any `json:"rate"`
-			} `json:"data"`
-		} `json:"consumption_rate"`
-	} `json:"features"`
-	ReasoningEffortConfig struct {
+type traeDetailConfig struct {
+	ConfigName    string `json:"config_name"`
+	Usage         string `json:"usage"`
+	ConfigSwitch  *bool  `json:"config_switch"`
+	Invisible     bool   `json:"is_invisible_to_user"`
+	IsDefault     bool   `json:"is_default"`
+	ContextTokens struct {
+		Dev int64 `json:"dev"`
+		Max int64 `json:"max"`
+	} `json:"context_window_tokens"`
+	Display struct {
+		DisplayName     string `json:"display_name"`
+		Multimodal      bool   `json:"multimodal"`
+		ModelCapability string `json:"model_capability"`
+		IsCustomModel   bool   `json:"is_custom_model"`
+	} `json:"display_config"`
+	// display_contact_config 是 JSON 字符串，内含 consumption_rate.data.rate（积分倍率）。
+	DisplayContactConfig string `json:"display_contact_config"`
+	Reasoning            struct {
 		SupportThinking bool     `json:"support_thinking"`
 		Options         []string `json:"options"`
 		DefaultLevel    string   `json:"default_level"`
 	} `json:"reasoning_effort_config"`
-	ProviderOfflineStatus string `json:"provider_offline_status"`
-	Status                *bool  `json:"status"`
-	Selectable            *bool  `json:"selectable"`
+	ModelDetailList []struct {
+		MaxTokens       int64 `json:"max_tokens"`
+		PromptMaxTokens int64 `json:"prompt_max_tokens"`
+	} `json:"model_detail_list"`
 }
 
-// traeParseCachedModels 把 model_list_map JSON 转成 ModelInfo；无效条目跳过。
-func traeParseCachedModels(raw []byte) []ModelInfo {
-	var root struct {
-		SoloAgent []traeCachedModel `json:"solo_agent"`
+// traeConsumptionRate 从 display_contact_config 的 JSON 字符串里取积分倍率。
+func traeConsumptionRate(raw string) float64 {
+	if raw == "" {
+		return 0
 	}
-	if err := json.Unmarshal(raw, &root); err != nil {
-		return nil
+	var cfg struct {
+		ConsumptionRate struct {
+			Data struct {
+				Rate float64 `json:"rate"`
+			} `json:"data"`
+		} `json:"consumption_rate"`
 	}
-	out := make([]ModelInfo, 0, len(root.SoloAgent))
-	seen := make(map[string]bool, len(root.SoloAgent))
-	for _, m := range root.SoloAgent {
-		id := strings.TrimSpace(m.Name)
-		if id == "" || seen[id] || strings.EqualFold(id, "auto") {
-			continue
-		}
-		if m.Status != nil && !*m.Status {
-			continue
-		}
-		if m.Selectable != nil && !*m.Selectable {
-			continue
-		}
-		if strings.EqualFold(strings.TrimSpace(m.ProviderOfflineStatus), "hard") {
-			continue
-		}
-		ctx := m.ContextWindowSize.Default
-		if ctx <= 0 && len(m.ContextWindowSize.Max) > 0 {
-			ctx = m.ContextWindowSize.Max[0]
-		}
-		name := strings.TrimSpace(m.DisplayName)
-		if name == "" {
-			name = id
-		}
-		efforts := append([]string(nil), m.ReasoningEffortConfig.Options...)
-		defaultEffort := strings.TrimSpace(m.ReasoningEffortConfig.DefaultLevel)
-		if !containsEffort(efforts, defaultEffort) {
-			defaultEffort = ""
-		}
-		out = append(out, ModelInfo{
-			ID:                id,
-			Name:              name,
-			ContextWindow:     ctx,
-			MaxTokens:         m.MaxTokens,
-			Credits:           traeRateString(m.Features.ConsumptionRate.Data.Rate),
-			IsDefault:         m.IsDefault,
-			SupportsImages:    m.Multimodal,
-			SupportsReasoning: m.ReasoningEffortConfig.SupportThinking,
-			Efforts:           efforts,
-			DefaultEffort:     defaultEffort,
-		})
-		seen[id] = true
+	if json.Unmarshal([]byte(raw), &cfg) != nil {
+		return 0
 	}
-	return out
+	return cfg.ConsumptionRate.Data.Rate
 }
 
-func traeRateString(v any) string {
-	var n float64
-	switch x := v.(type) {
-	case float64:
-		n = x
-	case json.Number:
-		n, _ = x.Float64()
-	case string:
-		n, _ = strconv.ParseFloat(strings.TrimPrefix(strings.TrimSpace(x), "x"), 64)
-	default:
-		return ""
+// traeConfigCallable 按前端可见性规则判定一条配置是否可作为可选模型。
+// 真机验证：74 条原始配置 → 三重过滤 → 20 条可见集，两账号一致。
+func traeConfigCallable(c traeDetailConfig) bool {
+	name := strings.TrimSpace(c.ConfigName)
+	if name == "" || strings.EqualFold(name, "auto") {
+		return false
 	}
-	if n <= 0 {
-		return ""
+	// 自定义模型、内部/辅助配置（title_generation/summary/search_agent 等）usage 非 chat_completion。
+	if !strings.EqualFold(c.Usage, "chat_completion") {
+		return false
 	}
-	return "x" + strconv.FormatFloat(n, 'f', -1, 64)
+	// 前端隐藏的内部变体（-auto、_advisor、glm-5.1、minimax-m2 等）。
+	if c.Invisible {
+		return false
+	}
+	// 显式关闭的配置。
+	if c.ConfigSwitch != nil && !*c.ConfigSwitch {
+		return false
+	}
+	if c.Display.IsCustomModel {
+		return false
+	}
+	// custom_model_* 前缀一律排除（即便 usage 伪装成 chat_completion）。
+	if strings.HasPrefix(strings.ToLower(name), "custom_model_") {
+		return false
+	}
+	return true
 }
 
-// traeReadCachedModels 从 state.vscdb 读取当前账号优先的 model_list_map。
-// 无匹配 UID 时依次尝试 undefined 缓存和任意有效缓存；任何错误都返回 nil。
-func traeReadCachedModels(path, uid string) []ModelInfo {
-	if strings.TrimSpace(path) == "" {
-		return nil
+// traeParseDetailModels 把 get_detail_param 响应解析为可见模型列表（不含 Auto）。
+func traeParseDetailModels(raw []byte) ([]ModelInfo, error) {
+	var resp traeDetailResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("decode get_detail_param: %w", err)
 	}
-	if _, err := os.Stat(path); err != nil {
-		return nil
+	list := resp.ConfigInfoList
+	if len(list) == 0 {
+		list = resp.Data.ConfigInfoList
 	}
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil
-	}
-	defer db.Close()
-	rows, err := db.Query(`SELECT key, value FROM ItemTable WHERE key LIKE '%AI.agent.model.model_list_map'`)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	type candidate struct {
-		key   string
-		value []byte
-	}
-	var all []candidate
-	for rows.Next() {
-		var key string
-		var value []byte
-		if err := rows.Scan(&key, &value); err != nil {
+	out := make([]ModelInfo, 0, len(list))
+	for _, c := range list {
+		if !traeConfigCallable(c) {
 			continue
 		}
-		all = append(all, candidate{key: key, value: value})
-	}
-	if err := rows.Err(); err != nil {
-		return nil
-	}
-	order := func(c candidate) int {
-		switch {
-		case uid != "" && (strings.HasPrefix(c.key, uid+":") || strings.HasPrefix(c.key, uid+"_")):
-			return 0
-		case strings.HasPrefix(c.key, "undefined_"):
-			return 1
-		default:
-			return 2
+		info := ModelInfo{
+			ID:                c.ConfigName,
+			Name:              strings.TrimSpace(c.Display.DisplayName),
+			ContextWindow:     c.ContextTokens.Dev,
+			IsDefault:         c.IsDefault,
+			SupportsImages:    c.Display.Multimodal,
+			SupportsReasoning: c.Display.ModelCapability == "reasoning_model" || c.Reasoning.SupportThinking,
+			Efforts:           append([]string(nil), c.Reasoning.Options...),
+			DefaultEffort:     c.Reasoning.DefaultLevel,
 		}
-	}
-	// 按优先级逐条解析，避免选中的损坏缓存遮蔽后面的有效缓存。
-	for priority := 0; priority <= 2; priority++ {
-		for _, c := range all {
-			if order(c) != priority {
-				continue
-			}
-			if infos := traeParseCachedModels(c.value); len(infos) > 0 {
-				return infos
+		if info.Name == "" {
+			info.Name = c.ConfigName
+		}
+		if len(c.ModelDetailList) > 0 {
+			info.MaxTokens = c.ModelDetailList[0].MaxTokens
+			if info.MaxTokens == 0 {
+				info.MaxTokens = c.ModelDetailList[0].PromptMaxTokens
 			}
 		}
+		if rate := traeConsumptionRate(c.DisplayContactConfig); rate != 0 {
+			info.Credits = "x" + strconv.FormatFloat(rate, 'f', -1, 64)
+		}
+		out = append(out, info)
 	}
-	return nil
+	if len(out) == 0 {
+		return nil, fmt.Errorf("get_detail_param returned no callable models")
+	}
+	return out, nil
+}
+
+// fetchTraeModelsOnline 从 get_detail_param(solo_agent) 在线拉取模型目录。
+func (c *TraeClient) fetchTraeModelsOnline(ctx context.Context, a *auth.Auth) ([]ModelInfo, error) {
+	if a == nil || strings.TrimSpace(a.AccessTokenValue()) == "" {
+		return nil, fmt.Errorf("missing Trae access token")
+	}
+	body := map[string]interface{}{
+		"function":                  "solo_agent",
+		"agent_type":                "",
+		"current_config_info":       map[string]interface{}{"config_name": "", "is_custom_model": false},
+		"mode_type":                 0,
+		"access_type":               0,
+		"ab_force_vids":             "",
+		"ab_autotest_advanced_mode": 0,
+		"show_custom_model":         true,
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	host := strings.TrimRight(c.AgentHost, "/")
+	if host == "" {
+		host = TraeAgentHost
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, host+TraeEpModels, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	traeModelHeaders(req, a)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("get_detail_param: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read get_detail_param: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("get_detail_param HTTP %d: %s", resp.StatusCode, string(raw))
+	}
+	return traeParseDetailModels(raw)
 }
 
 func traeModelsWithAuto(infos []ModelInfo) []ModelInfo {
@@ -243,26 +237,43 @@ func traeModelsWithAuto(infos []ModelInfo) []ModelInfo {
 		if strings.EqualFold(strings.TrimSpace(m.ID), "auto") {
 			continue
 		}
-		out = append(out, cloneTraeModelInfo(m))
+		out = append(out, m)
 	}
 	out = append(out, ModelInfo{ID: "Auto", Name: "Auto"})
 	return out
 }
 
-// FetchModels 返回本地缓存中的 solo_agent 模型；缓存不可用时返回固定 21 个模型。
-// 两种情况都在末尾追加 Auto，供网关以 trae:Auto 暴露给调用方。
+// FetchModels 返回在线拉取的前端可见模型，末尾追加 Auto。
+// 成功结果按账号缓存 5 分钟；失败回退上次成功结果；冷启动失败仅返回 Auto（不报错，保 /v1/models 可用）。
 func (c *TraeClient) FetchModels(ctx context.Context, a *auth.Auth) ([]ModelInfo, error) {
-	_ = ctx
-	uid := ""
-	if a != nil {
-		uid = a.UID
+	fp := traeAuthFingerprint(a)
+
+	// 命中未过期缓存直接返回（返回副本，避免调用方修改污染缓存）。
+	traeModelCache.Lock()
+	if entry, ok := traeModelCache.entries[fp]; ok && time.Since(entry.fetchedAt) < traeModelCacheTTL {
+		cached := append([]ModelInfo(nil), entry.models...)
+		traeModelCache.Unlock()
+		return cached, nil
 	}
-	path := DefaultTraeModelCachePath()
-	if c.ModelCachePath != "" {
-		path = c.ModelCachePath
+	traeModelCache.Unlock()
+
+	infos, err := c.fetchTraeModelsOnline(ctx, a)
+	if err == nil {
+		withAuto := traeModelsWithAuto(infos)
+		traeModelCache.Lock()
+		traeModelCache.entries[fp] = traeModelCacheEntry{models: withAuto, fetchedAt: time.Now()}
+		traeModelCache.Unlock()
+		return append([]ModelInfo(nil), withAuto...), nil
 	}
-	if infos := traeReadCachedModels(path, uid); len(infos) > 0 {
-		return traeModelsWithAuto(infos), nil
+
+	// 拉取失败：回退上次成功结果（哪怕已过期）。
+	traeModelCache.Lock()
+	stale, ok := traeModelCache.entries[fp]
+	traeModelCache.Unlock()
+	if ok && len(stale.models) > 0 {
+		return append([]ModelInfo(nil), stale.models...), nil
 	}
-	return traeModelsWithAuto(traeStaticModelInfos()), nil
+
+	// 冷启动失败：仅返回 Auto，不让 /v1/models 报错。
+	return traeModelsWithAuto(nil), nil
 }

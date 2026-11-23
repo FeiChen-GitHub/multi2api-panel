@@ -507,7 +507,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	if keys := p.cfg.Pool.AvailableKeysForProviderModelRealm(auth.ProviderTrae, "", "cn"); len(keys) > 0 {
 		if acct := p.cfg.Pool.AuthByKey(keys[0]); acct != nil {
 			if ml, ok := p.clientFor(auth.ProviderTrae).(upstream.ModelLister); ok {
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				infos, err := ml.FetchModels(ctx, acct)
 				cancel()
 				if err != nil {

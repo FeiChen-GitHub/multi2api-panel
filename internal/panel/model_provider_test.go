@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -33,7 +32,14 @@ func TestPanelModelsTraeOnlyPoolSkipsWorkBuddyEndpoint(t *testing.T) {
 	var traeHits int32
 	traeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&traeHits, 1)
-		http.Error(w, "unexpected upstream request", http.StatusInternalServerError)
+		// 模型目录已改为在线拉取：返回 get_detail_param 形态的可见模型。
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"config_info_list":[` +
+			`{"config_name":"glm-5.3","usage":"chat_completion","config_switch":true,"is_invisible_to_user":false,"display_config":{"display_name":"GLM-5.3","multimodal":false,"model_capability":"reasoning_model"},"display_contact_config":"{\"consumption_rate\":{\"data\":{\"rate\":0.78}}}","context_window_tokens":{"dev":200000,"max":1000000},"reasoning_effort_config":{"support_thinking":true,"options":["light","high","extra_high"],"default_level":"extra_high"},"model_detail_list":[{"max_tokens":64000}]},` +
+			`{"config_name":"DeepSeek-V4-Flash-Official","usage":"chat_completion","config_switch":true,"display_config":{"display_name":"DS-V4-Flash","multimodal":false,"model_capability":"reasoning_model"},"context_window_tokens":{"dev":200000},"model_detail_list":[{"max_tokens":32000}]},` +
+			`{"config_name":"Doubao-Seed-Code","usage":"chat_completion","config_switch":true,"is_default":true,"display_config":{"display_name":"Seed-Code","multimodal":true,"model_capability":"reasoning_model"},"context_window_tokens":{"dev":256000},"model_detail_list":[{"max_tokens":32000}]},` +
+			`{"config_name":"qwen-3.7-plus","usage":"chat_completion","config_switch":true,"display_config":{"display_name":"Qwen3.7-Plus","multimodal":false,"model_capability":"chat"},"context_window_tokens":{"dev":200000},"model_detail_list":[{"max_tokens":32000}]}` +
+			`]}`))
 	}))
 	defer traeSrv.Close()
 
@@ -56,7 +62,6 @@ func TestPanelModelsTraeOnlyPoolSkipsWorkBuddyEndpoint(t *testing.T) {
 
 	up := &upstream.Client{HTTP: wbSrv.Client(), ChatBaseCN: wbSrv.URL}
 	tc := &upstream.TraeClient{HTTP: traeSrv.Client(), AgentHost: traeSrv.URL}
-	tc.ModelCachePath = filepath.Join(t.TempDir(), "missing.vscdb")
 	p := New(Config{
 		Version:    "test",
 		AuthDir:    t.TempDir(),
@@ -75,10 +80,9 @@ func TestPanelModelsTraeOnlyPoolSkipsWorkBuddyEndpoint(t *testing.T) {
 	if n := atomic.LoadInt32(&wbHits); n != 0 {
 		t.Fatalf("WorkBuddy models endpoint hit %d time(s); Trae token must not be sent there", n)
 	}
-	// ② Trae 端点确实被查了（否则上面是"什么都没查"的假通过）。
-	// 3.4.4 UI 目录是本机静态权威表，不应再请求 get_detail_param。
-	if n := atomic.LoadInt32(&traeHits); n != 0 {
-		t.Fatalf("Trae models endpoint hits = %d, want 0", n)
+	// ② Trae 端点确实被查了（模型目录已改为在线拉取，必须命中 get_detail_param）。
+	if n := atomic.LoadInt32(&traeHits); n < 1 {
+		t.Fatalf("Trae models endpoint hits = %d, want >= 1", n)
 	}
 
 	var out struct {
@@ -87,8 +91,8 @@ func TestPanelModelsTraeOnlyPoolSkipsWorkBuddyEndpoint(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
 		t.Fatalf("decode: %v (%s)", err, rr.Body.String())
 	}
-	if len(out.Models) != 22 {
-		t.Fatalf("models = %d, want 21 static + Auto: %s", len(out.Models), rr.Body.String())
+	if len(out.Models) != 5 {
+		t.Fatalf("models = %d, want 4 online + Auto: %s", len(out.Models), rr.Body.String())
 	}
 	byID := map[string]map[string]any{}
 	for _, m := range out.Models {
@@ -148,7 +152,8 @@ func TestPanelModelsMixedPoolSplitsByProvider(t *testing.T) {
 	}))
 	defer wbSrv.Close()
 	traeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "unexpected upstream request", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"config_info_list":[{"config_name":"glm-5.3","usage":"chat_completion","config_switch":true,"display_config":{"display_name":"GLM-5.3","multimodal":false,"model_capability":"reasoning_model"},"context_window_tokens":{"dev":200000},"model_detail_list":[{"max_tokens":64000}]}]}`))
 	}))
 	defer traeSrv.Close()
 
@@ -179,7 +184,6 @@ func TestPanelModelsMixedPoolSplitsByProvider(t *testing.T) {
 
 	up := &upstream.Client{HTTP: wbSrv.Client(), ChatBaseCN: wbSrv.URL}
 	tc := &upstream.TraeClient{HTTP: traeSrv.Client(), AgentHost: traeSrv.URL}
-	tc.ModelCachePath = filepath.Join(t.TempDir(), "missing.vscdb")
 	p := New(Config{
 		Version:    "test",
 		AuthDir:    t.TempDir(),

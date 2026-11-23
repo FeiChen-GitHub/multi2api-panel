@@ -155,8 +155,15 @@ func TestModelsIncludesTraeEntries(t *testing.T) {
 	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
 	tc := upstream.NewTraeClient()
 	tc.AgentHost = "https://trae.fake"
-	tc.ModelCachePath = filepath.Join(t.TempDir(), "missing.vscdb")
+	modelFixture := `{"config_info_list":[` +
+		`{"config_name":"glm-5.3","usage":"chat_completion","config_switch":true,"is_invisible_to_user":false,"display_config":{"display_name":"GLM-5.3","multimodal":false,"model_capability":"reasoning_model"},"display_contact_config":"{\"consumption_rate\":{\"data\":{\"rate\":0.78}}}","context_window_tokens":{"dev":200000,"max":1000000},"reasoning_effort_config":{"support_thinking":true,"options":["light","high","extra_high"],"default_level":"extra_high"},"model_detail_list":[{"max_tokens":64000}]},` +
+		`{"config_name":"DeepSeek-V4-Flash-Official","usage":"chat_completion","config_switch":true,"display_config":{"display_name":"DS-V4-Flash","multimodal":false,"model_capability":"reasoning_model"},"context_window_tokens":{"dev":200000},"model_detail_list":[{"max_tokens":32000}]},` +
+		`{"config_name":"qwen-3.7-plus","usage":"chat_completion","config_switch":true,"display_config":{"display_name":"Qwen3.7-Plus","multimodal":true,"model_capability":"chat"},"display_contact_config":"{\"consumption_rate\":{\"data\":{\"rate\":0.25}}}","context_window_tokens":{"dev":200000},"model_detail_list":[{"max_tokens":32000}]}` +
+		`]}`
 	tc.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "get_detail_param") {
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(modelFixture)), Header: http.Header{}}, nil
+		}
 		return &http.Response{StatusCode: 500, Body: io.NopCloser(strings.NewReader("unexpected upstream request")), Header: http.Header{}}, nil
 	})}
 	tc.StreamHTTP = tc.HTTP
@@ -185,8 +192,8 @@ func TestModelsIncludesTraeEntries(t *testing.T) {
 			byID[id] = m
 		}
 	}
-	if len(resp.Data) != 22 {
-		t.Fatalf("Trae models = %d, want 21 + Auto; ids=%v", len(resp.Data), keysOf(byID))
+	if len(resp.Data) != 4 {
+		t.Fatalf("Trae models = %d, want 3 online + Auto; ids=%v", len(resp.Data), keysOf(byID))
 	}
 	solo, ok := byID["trae:glm-5.3"]
 	if !ok {
