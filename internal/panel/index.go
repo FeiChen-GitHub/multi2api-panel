@@ -55,6 +55,10 @@ func setSecurityHeaders(w http.ResponseWriter) {
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
+	// 静态资产随二进制走：重编译换资产后浏览器必须回源拿新版，禁止用本地旧副本。
+	// no-cache（而非 no-store）：允许缓存，但每次使用前必须重新验证——资产无
+	// ETag/Last-Modified，验证即全量回源，等于「永远拿最新」。
+	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(indexHTML)
@@ -63,6 +67,7 @@ func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
+	w.Header().Set("Cache-Control", "no-cache") // 同上：重编译换资产后浏览器必须回源
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(appJS)
@@ -72,6 +77,7 @@ func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
 // 单独成文而非写进 index.html：上游频繁改 index.html，独立文件可避免同步上游时反复冲突。
 func (p *Panel) mobileStyle(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
+	w.Header().Set("Cache-Control", "no-cache") // 同上：重编译换资产后浏览器必须回源
 	w.Header().Set("Content-Type", "text/css; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(mobileCSS)
@@ -80,6 +86,7 @@ func (p *Panel) mobileStyle(w http.ResponseWriter, r *http.Request) {
 // mobileScript 输出手机端联动逻辑（同源脚本，须在 app.js 之后加载）。
 func (p *Panel) mobileScript(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
+	w.Header().Set("Cache-Control", "no-cache") // 同上：重编译换资产后浏览器必须回源
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(mobileJS)

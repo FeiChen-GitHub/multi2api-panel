@@ -275,7 +275,10 @@ function rateLimitMeta(row, now) {
       ' · 上游称 ' + fmtLocalDateTime(resetAt) + ' 恢复';
     title.push('网关最早重试：' + fmtLocalDateTime(until));
   } else {
-    detail = resetAt
+    // detail 必须显式声明：本文件顶层 'use strict'，裸赋值在浏览器（严格模式）
+    // 直接抛 ReferenceError，renderAccounts 被炸掉且被 loadOverview 的 catch 吞掉
+    // → 首页账号池/锁池/到期卡全空（2026-11-23 事故，上游 0eeab98 引入）。
+    var detail = resetAt
       ? '预计 ' + fmtLocalDateTime(resetAt) + ' 解封' + (remaining ? '（剩余 ' + dur(remaining) + '）' : '')
       : (until ? '预计 ' + fmtLocalDateTime(until) + ' 恢复（剩余 ' + dur(remaining) + '）' : '预计解封时间未知');
   }
